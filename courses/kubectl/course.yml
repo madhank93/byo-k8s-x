@@ -46,3 +46,15 @@ stages:
   - slug: output-wide
     name: Wider columns
     difficulty: easy
+  - slug: label-selector
+    name: Filter by label
+    difficulty: medium
+  - slug: field-selector
+    name: Filter by field
+    difficulty: medium
+  - slug: sorted-output
+    name: A stable order
+    difficulty: easy
+  - slug: watch
+    name: Keep watching
+    difficulty: hard

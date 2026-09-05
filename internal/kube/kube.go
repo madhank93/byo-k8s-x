@@ -221,3 +221,17 @@ func (e *Env) SeedConfigMap(ctx context.Context, name string) error {
 	}
 	return nil
 }
+
+// SeedLabeledPod creates one pod carrying labels, for the selector stages.
+func (e *Env) SeedLabeledPod(ctx context.Context, name string, labels map[string]string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: e.Namespace, Labels: labels},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	if _, err := e.Client.CoreV1().Pods(e.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
+}

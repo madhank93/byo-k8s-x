@@ -16,9 +16,6 @@
 // Stage 14: get anything, through the dynamic client.
 // Stage 15: -o wide adds the columns that resource can offer.
 // Stage 16: -l filters by label, on the server.
-// Stage 17: --field-selector filters on the object itself.
-// Stage 18: print rows in a stable order.
-// Stage 19: -w keeps printing as things change.
 
 package main
 
@@ -28,7 +25,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -53,9 +49,6 @@ func main() {
 	fs.StringVar(output, "o", "", "output format (shorthand)")
 	selector := fs.String("selector", "", "label selector, e.g. app=web")
 	fs.StringVar(selector, "l", "", "label selector (shorthand)")
-	fieldSelector := fs.String("field-selector", "", "field selector, e.g. metadata.name=web")
-	watch := fs.Bool("watch", false, "keep printing as objects change")
-	fs.BoolVar(watch, "w", false, "keep printing as objects change (shorthand)")
 	allNS := fs.Bool("all-namespaces", false, "list across every namespace")
 	fs.BoolVar(allNS, "A", false, "list across every namespace (shorthand)")
 
@@ -81,7 +74,7 @@ func main() {
 			// a list whose path carries no namespace is a cluster-wide list.
 			ns = ""
 		}
-		err = get(cfg, ns, arg(args, 1), arg(args, 2), *output, *selector, *fieldSelector, *allNS, *watch)
+		err = get(cfg, ns, arg(args, 1), arg(args, 2), *output, *selector, *allNS)
 	default:
 		fmt.Println(cfg.Host)
 	}
@@ -169,12 +162,12 @@ func printVersion(cfg *rest.Config) error {
 	return nil
 }
 
-func get(cfg *rest.Config, ns, resource, name, output, selector, fieldSelector string, allNS, watch bool) error {
+func get(cfg *rest.Config, ns, resource, name, output, selector string, allNS bool) error {
 	gvr, err := mapResource(cfg, resource)
 	if err != nil {
 		return err
 	}
-	list, err := fetch(cfg, gvr, ns, name, selector, fieldSelector)
+	list, err := fetch(cfg, gvr, ns, name, selector)
 	if err != nil {
 		return err
 	}
@@ -207,17 +200,6 @@ func get(cfg *rest.Config, ns, resource, name, output, selector, fieldSelector s
 	// one in each column. Computing widths by hand works until a name is long.
 	wide := output == "wide"
 
-	// The API returns items in whatever order etcd hands them over, which is
-	// stable enough to look sorted and not stable enough to rely on. Sorting
-	// by name here is what makes two runs of the same command diffable, and
-	// what makes a script that greps line 3 mean anything.
-	sort.Slice(list.Items, func(i, j int) bool {
-		if a, b := list.Items[i].GetNamespace(), list.Items[j].GetNamespace(); a != b {
-			return a < b
-		}
-		return list.Items[i].GetName() < list.Items[j].GetName()
-	})
-
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	var header []string
 	if allNS {
@@ -242,60 +224,7 @@ func get(cfg *rest.Config, ns, resource, name, output, selector, fieldSelector s
 		}
 		fmt.Fprintln(w, strings.Join(row, "\t"))
 	}
-	if err := w.Flush(); err != nil {
-		return err
-	}
-	if !watch {
-		return nil
-	}
-	return streamChanges(cfg, gvr, ns, selector, fieldSelector, list.GetResourceVersion(), allNS, wide)
-}
-
-// streamChanges prints objects as they change, starting exactly where the list
-// ended.
-//
-// The resourceVersion of the *list* is the seam. Starting a watch without it
-// would replay from wherever the server felt like, showing objects already
-// printed or missing ones changed in the gap; passing it means the stream
-// begins at the instant the snapshot was taken. List-then-watch from the
-// list's own version is the pattern every informer is built on.
-func streamChanges(cfg *rest.Config, gvr schema.GroupVersionResource, ns, selector, fieldSelector, since string, allNS, wide bool) error {
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return err
-	}
-	w, err := dyn.Resource(gvr).Namespace(ns).Watch(context.Background(), metav1.ListOptions{
-		LabelSelector:   selector,
-		FieldSelector:   fieldSelector,
-		ResourceVersion: since,
-	})
-	if err != nil {
-		return err
-	}
-	defer w.Stop()
-
-	out := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	for event := range w.ResultChan() {
-		obj, ok := event.Object.(*unstructured.Unstructured)
-		if !ok {
-			// An Error event carries a Status, not the object — a watch that
-			// assumes otherwise panics on the first expiry.
-			continue
-		}
-		row := []string{}
-		if allNS {
-			row = append(row, obj.GetNamespace())
-		}
-		row = append(row, obj.GetName(), age(obj.GetCreationTimestamp().Time))
-		if wide {
-			row = append(row, wideValues(gvr, *obj)...)
-		}
-		fmt.Fprintln(out, strings.Join(row, "\t"))
-		if err := out.Flush(); err != nil {
-			return err
-		}
-	}
-	return nil
+	return w.Flush()
 }
 
 // wideHeaders and wideValues are the extra columns -o wide adds.
@@ -429,7 +358,7 @@ func apiResources(cfg *rest.Config) error {
 // letting it surface is right: "there is no such pod" and "there are no pods"
 // are different answers, and a script that cannot tell them apart deletes the
 // wrong thing.
-func fetch(cfg *rest.Config, gvr schema.GroupVersionResource, ns, name, selector, fieldSelector string) (*unstructured.UnstructuredList, error) {
+func fetch(cfg *rest.Config, gvr schema.GroupVersionResource, ns, name, selector string) (*unstructured.UnstructuredList, error) {
 	dyn, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -440,16 +369,7 @@ func fetch(cfg *rest.Config, gvr schema.GroupVersionResource, ns, name, selector
 		// here would give the same answer on a toy cluster and fall over on a
 		// real one — the point of a selector is that the rows you do not want
 		// are never sent.
-		// Labels and fields are different axes. Labels are yours to invent;
-		// fields are the object's own, and only a few are indexed —
-		// metadata.name and status.phase are, spec.nodeName is on some
-		// versions, and asking for anything else is rejected rather than
-		// silently scanned. That refusal is deliberate: an unindexed filter
-		// would look fast and cost the apiserver a full scan.
-		return ri.List(context.Background(), metav1.ListOptions{
-			LabelSelector: selector,
-			FieldSelector: fieldSelector,
-		})
+		return ri.List(context.Background(), metav1.ListOptions{LabelSelector: selector})
 	}
 	obj, err := ri.Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {

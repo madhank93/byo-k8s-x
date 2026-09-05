@@ -56,6 +56,10 @@ func init() {
 	register(Stage{Slug: "rest-mapper", Run: stageRESTMapper})
 	register(Stage{Slug: "dynamic-client", Run: stageDynamicClient})
 	register(Stage{Slug: "output-wide", Run: stageOutputWide})
+	register(Stage{Slug: "label-selector", Run: stageLabelSelector})
+	register(Stage{Slug: "field-selector", Run: stageFieldSelector})
+	register(Stage{Slug: "sorted-output", Run: stageSortedOutput})
+	register(Stage{Slug: "watch", Run: stageWatch})
 }
 
 // stageServerURL — the program prints the API server it would talk to,
@@ -524,6 +528,133 @@ func stageOutputWide(ctx context.Context, env *kube.Env, bin string) error {
 	joined := strings.Join(header, " ")
 	if !strings.Contains(joined, "NODE") {
 		return fmt.Errorf("expected a NODE column with -o wide, got %q", lines[0])
+	}
+	return nil
+}
+
+// stageLabelSelector — -l filters on the server, not here.
+func stageLabelSelector(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := env.SeedLabeledPod(ctx, "web-one", map[string]string{"app": "web"}); err != nil {
+		return err
+	}
+	if err := env.SeedLabeledPod(ctx, "db-one", map[string]string{"app": "db"}); err != nil {
+		return err
+	}
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods", "-l", "app=web")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	if !strings.Contains(res.Stdout, "web-one") {
+		return fmt.Errorf("expected the matching pod, got:\n%s", tail(res.Stdout))
+	}
+	if strings.Contains(res.Stdout, "db-one") {
+		return fmt.Errorf("the selector did not filter — db-one should not appear:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// stageFieldSelector — a different axis, and one the server indexes.
+func stageFieldSelector(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "xi", "omicron")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods", "--field-selector", "metadata.name=xi")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	if !strings.Contains(res.Stdout, "xi") {
+		return fmt.Errorf("expected the matching pod, got:\n%s", tail(res.Stdout))
+	}
+	if strings.Contains(res.Stdout, "omicron") {
+		return fmt.Errorf("the field selector did not filter:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// stageSortedOutput — the same command twice must print the same order.
+func stageSortedOutput(ctx context.Context, env *kube.Env, bin string) error {
+	// Seeded deliberately out of order: creation order is not name order.
+	kc, cleanup, err := scoped(ctx, env, "zulu", "alpha", "mike")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	lines := nonEmptyLines(res.Stdout)
+	var names []string
+	for _, l := range lines[1:] {
+		names = append(names, wsRun.Split(strings.TrimSpace(l), -1)[0])
+	}
+	want := []string{"alpha", "mike", "zulu"}
+	if len(names) != len(want) {
+		return fmt.Errorf("expected %d rows, got %d:\n%s", len(want), len(names), tail(res.Stdout))
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			return fmt.Errorf("expected rows sorted by name %v, got %v", want, names)
+		}
+	}
+	return nil
+}
+
+// stageWatch — the program prints what exists, then keeps printing as things
+// change.
+//
+// It never exits on its own, so the harness bounds it and creates an object
+// while it is running. The exit code is meaningless here: we are the ones who
+// stopped it.
+func stageWatch(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "rho")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	created := make(chan error, 1)
+	go func() {
+		select {
+		case <-time.After(4 * time.Second):
+			created <- env.SeedPods(ctx, "sigma")
+		case <-ctx.Done():
+			created <- ctx.Err()
+		}
+	}()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, 20*time.Second, "get", "pods", "-w")
+	if err != nil {
+		return err
+	}
+	if err := <-created; err != nil {
+		return fmt.Errorf("seeding the pod the watch should have seen: %w", err)
+	}
+	if !strings.Contains(res.Stdout, "rho") {
+		return fmt.Errorf("expected the existing pod before the stream starts, got:\n%s", tail(res.Stdout))
+	}
+	if !strings.Contains(res.Stdout, "sigma") {
+		return fmt.Errorf("a pod created while watching never appeared — the program listed and stopped:\n%s", tail(res.Stdout))
 	}
 	return nil
 }
