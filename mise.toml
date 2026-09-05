@@ -1,0 +1,35 @@
+[tools]
+go = "1.25.1"
+kind = "0.31.0"
+kubectl = "1.36.1"
+
+[env]
+_.path = ["{{config_root}}/bin"]
+
+[tasks.build]
+description = "Build the byok8s CLI and the tester"
+run = "go build -o bin/byok8s ./cmd/byok8s && go build -o bin/tester ./cmd/tester"
+
+[tasks.up]
+description = "Create the kind cluster the courses run against"
+run = "go run ./cmd/byok8s up"
+
+[tasks.down]
+description = "Delete the kind cluster"
+run = "go run ./cmd/byok8s down"
+
+[tasks.doctor]
+description = "Check the environment can run a course"
+run = "go run ./cmd/byok8s doctor"
+
+[tasks.test]
+description = "Unit tests for the harness itself"
+run = "go test ./internal/..."
+
+[tasks.lint]
+description = "Vet and formatting"
+run = "go vet ./... && test -z \"$(gofmt -l cmd internal)\""
+
+[tasks.sweep]
+description = "Fail if any stage snapshot is identical to the one before it"
+run = "./hack/sweep.sh"

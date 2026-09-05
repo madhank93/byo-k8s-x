@@ -1,0 +1,12 @@
+slug: kubectl
+name: Build your own kubectl
+stages:
+  - slug: server-url
+    name: Find the cluster
+    difficulty: easy
+  - slug: context-override
+    name: Choose a context
+    difficulty: easy
+  - slug: server-version
+    name: Ask the server what it is
+    difficulty: medium

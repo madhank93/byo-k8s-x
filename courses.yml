@@ -1,0 +1,5 @@
+# Every course this repo ships. A course is a directory under courses/
+# holding its own course.yml, the learner's app/, and its reference stages.
+entries:
+  - slug: kubectl
+    name: Build your own kubectl

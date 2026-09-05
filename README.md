@@ -1,0 +1,49 @@
+# byo-k8s-x
+
+Build your own Kubernetes tooling, one stage at a time, against a real cluster.
+
+Each course is a single program you grow. A stage adds one visible thing, and
+running a stage re-verifies every stage before it, so the tool you finish with
+is one you wrote every line of.
+
+**Build your own kubectl** is the first course: find the cluster, choose a
+context, ask the server what it is, list and print objects, resolve any
+resource through discovery and the RESTMapper, select, watch, apply with
+server-side apply, describe, and finally stream logs, exec and port-forward.
+
+## Getting started
+
+```sh
+mise install          # go, kind, kubectl
+byok8s up             # create the local kind cluster
+byok8s doctor         # check everything is ready
+byok8s list           # the stages
+byok8s run 1          # verify stage 1
+```
+
+Your program lives in `courses/kubectl/app/main.go` and grows for the whole
+course. Stuck on a stage and want to move on? `byok8s reset --to N` replaces it
+with the verified reference for stage N.
+
+## How verification works
+
+A real kind cluster, not a fake client — so `create deployment` really does
+produce pods, and `logs` really does stream from a container. Each stage runs
+in its own namespace, and the verdict is your program's exit code and stdout.
+Nothing inspects your source: any correct implementation passes.
+
+## Repo layout
+
+```
+courses/kubectl/
+  course.yml              the stage list
+  app/                    your program
+  reference/work/         the authoring copy (solutions are written here first)
+  reference/stages/NN-*/  a verified snapshot per stage
+internal/cluster          kind lifecycle
+internal/kube             namespace isolation and cluster guards
+internal/runner           builds and invokes your program
+internal/stages/kubectl   the assertions, one function per stage
+hack/vsnap.sh             verify 1..N, snapshot only on a full pass
+hack/sweep.sh             fail if a stage's snapshot repeats the one before it
+```

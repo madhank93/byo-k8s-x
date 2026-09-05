@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Everything that needs no cluster. Fast, and the gate most pushes hit.
+  static:
+    name: vet, format, sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+      - run: go test ./internal/...
+      # Every stage must show its own step. See hack/sweep.sh for why this
+      # exists from the first stage rather than being added later.
+      - run: ./hack/sweep.sh
+
+  # The real thing: a kind cluster, and every reference stage graded against it
+  # cumulatively. This is the check that would catch a stage whose assertions
+  # drifted from its reference solution.
+  course:
+    name: verify reference stages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: byok8s
+      - name: Verify every stage
+        run: |
+          count=$(grep -c '^  - slug: ' courses/kubectl/course.yml)
+          ./hack/vsnap.sh "$count"
+      - name: The snapshots must be unchanged by verification
+        run: git diff --exit-code courses/kubectl/reference/stages
