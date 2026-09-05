@@ -12,9 +12,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
 	"github.com/madhank93/byo-k8s-x/internal/runner"
@@ -60,6 +63,12 @@ func init() {
 	register(Stage{Slug: "field-selector", Run: stageFieldSelector})
 	register(Stage{Slug: "sorted-output", Run: stageSortedOutput})
 	register(Stage{Slug: "watch", Run: stageWatch})
+	register(Stage{Slug: "delete", Run: stageDelete})
+	register(Stage{Slug: "create-from-file", Run: stageCreateFromFile})
+	register(Stage{Slug: "apply-ssa", Run: stageApplySSA})
+	register(Stage{Slug: "apply-conflict", Run: stageApplyConflict})
+	register(Stage{Slug: "patch", Run: stagePatch})
+	register(Stage{Slug: "scale", Run: stageScale})
 }
 
 // stageServerURL — the program prints the API server it would talk to,
@@ -655,6 +664,274 @@ func stageWatch(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if !strings.Contains(res.Stdout, "sigma") {
 		return fmt.Errorf("a pod created while watching never appeared — the program listed and stopped:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// writeFile drops a manifest in a temp dir and returns its path.
+func writeFile(dir, name, body string) (string, error) {
+	path := filepath.Join(dir, name)
+	return path, os.WriteFile(path, []byte(body), 0o644)
+}
+
+// stageDelete — the object goes away, and asking for one that is not there is
+// an error rather than a shrug.
+func stageDelete(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "tau")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "delete", "pod", "tau")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	if err := kube.WaitFor(ctx, "the pod to go away", func(ctx context.Context) (bool, error) {
+		return env.Gone(ctx, "tau")
+	}); err != nil {
+		return fmt.Errorf("the command exited 0 but the pod is still there: %w", err)
+	}
+
+	missing, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "delete", "pod", "never-existed")
+	if err != nil {
+		return err
+	}
+	if missing.ExitCode == 0 {
+		return fmt.Errorf("deleting something that does not exist should fail, got exit 0")
+	}
+	return nil
+}
+
+// stageCreateFromFile — a manifest becomes an object.
+func stageCreateFromFile(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	dir, err := os.MkdirTemp("", "byok8s-manifest-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	path, err := writeFile(dir, "cm.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: from-file
+data:
+  greeting: hello
+`)
+	if err != nil {
+		return err
+	}
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "create", "-f", path)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	cm, err := env.ConfigMap(ctx, "from-file")
+	if err != nil {
+		return fmt.Errorf("the command exited 0 but no ConfigMap was created: %w", err)
+	}
+	if cm.Data["greeting"] != "hello" {
+		return fmt.Errorf("expected the data from the manifest, got %v", cm.Data)
+	}
+
+	// The manifest names no namespace, so the object must land in the one the
+	// context selected rather than in default.
+	if cm.Namespace != env.Namespace {
+		return fmt.Errorf("expected the ConfigMap in %s, found it in %s", env.Namespace, cm.Namespace)
+	}
+	return nil
+}
+
+// stageApplySSA — apply is idempotent where create is not, and it records who
+// owns each field.
+func stageApplySSA(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	dir, err := os.MkdirTemp("", "byok8s-manifest-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	path, err := writeFile(dir, "cm.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: applied
+data:
+  greeting: hello
+`)
+	if err != nil {
+		return err
+	}
+
+	for i := 1; i <= 2; i++ {
+		res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "apply", "-f", path)
+		if err != nil {
+			return err
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("apply #%d: expected exit 0, got %d — apply on an object that exists is not an error, which is the difference from create\nstderr:\n%s",
+				i, res.ExitCode, tail(res.Stderr))
+		}
+	}
+
+	cm, err := env.ConfigMap(ctx, "applied")
+	if err != nil {
+		return fmt.Errorf("no ConfigMap after two applies: %w", err)
+	}
+	if cm.Data["greeting"] != "hello" {
+		return fmt.Errorf("expected the manifest's data, got %v", cm.Data)
+	}
+	var applied bool
+	for _, mf := range cm.ManagedFields {
+		if mf.Operation == "Apply" {
+			applied = true
+		}
+	}
+	if !applied {
+		return fmt.Errorf("the object has no Apply entry in managedFields — that means it was created or updated, not applied; managers seen: %v", managers(cm.ManagedFields))
+	}
+	return nil
+}
+
+// stageApplyConflict — someone else owns the field, and taking it is a
+// decision the user makes.
+func stageApplyConflict(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// Another manager gets there first and owns data.greeting.
+	if err := env.ApplyAs(ctx, "other-tool", "contested", "greeting", "theirs"); err != nil {
+		return err
+	}
+
+	dir, err := os.MkdirTemp("", "byok8s-manifest-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	path, err := writeFile(dir, "cm.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: contested
+data:
+  greeting: ours
+`)
+	if err != nil {
+		return err
+	}
+
+	clash, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "apply", "-f", path)
+	if err != nil {
+		return err
+	}
+	if clash.ExitCode == 0 {
+		return fmt.Errorf("applying over another manager's field should conflict, got exit 0 — the server reports this, so the program must not swallow it")
+	}
+
+	forced, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "apply", "-f", path, "--force-conflicts")
+	if err != nil {
+		return err
+	}
+	if forced.ExitCode != 0 {
+		return fmt.Errorf("--force-conflicts should succeed, got %d\nstderr:\n%s", forced.ExitCode, tail(forced.Stderr))
+	}
+	cm, err := env.ConfigMap(ctx, "contested")
+	if err != nil {
+		return err
+	}
+	if cm.Data["greeting"] != "ours" {
+		return fmt.Errorf("after forcing, the value should be ours, got %q", cm.Data["greeting"])
+	}
+	return nil
+}
+
+func managers(fields []metav1.ManagedFieldsEntry) []string {
+	var out []string
+	for _, f := range fields {
+		out = append(out, fmt.Sprintf("%s/%s", f.Manager, f.Operation))
+	}
+	return out
+}
+
+// stagePatch — change one field without sending the whole object.
+func stagePatch(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := env.SeedConfigMap(ctx, "settings"); err != nil {
+		return err
+	}
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout,
+		"patch", "configmap", "settings", "-p", `{"data":{"colour":"blue"}}`)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	cm, err := env.ConfigMap(ctx, "settings")
+	if err != nil {
+		return err
+	}
+	if cm.Data["colour"] != "blue" {
+		return fmt.Errorf("expected the patched key, got %v", cm.Data)
+	}
+	// The seeded key must survive: a merge patch changes what it names and
+	// leaves the rest, which is the whole difference from an update.
+	if cm.Data["greeting"] != "hello" {
+		return fmt.Errorf("the patch replaced the object instead of merging into it — greeting is gone: %v", cm.Data)
+	}
+	return nil
+}
+
+// stageScale — the /scale subresource, not the whole Deployment.
+func stageScale(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := env.SeedDeployment(ctx, "web", 1); err != nil {
+		return err
+	}
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "scale", "deployment", "web", "--replicas", "3")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	dep, err := env.Deployment(ctx, "web")
+	if err != nil {
+		return err
+	}
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 3 {
+		return fmt.Errorf("expected spec.replicas 3, got %v", dep.Spec.Replicas)
 	}
 	return nil
 }

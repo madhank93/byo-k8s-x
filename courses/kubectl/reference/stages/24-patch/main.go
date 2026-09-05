@@ -24,7 +24,6 @@
 // Stage 22: apply, which is create-or-update and records who owns what.
 // Stage 23: a conflict is a question, and --force-conflicts is the answer.
 // Stage 24: patch changes a field without sending the object.
-// Stage 25: scale, through a subresource of its own.
 
 package main
 
@@ -65,7 +64,6 @@ func main() {
 	fieldSelector := fs.String("field-selector", "", "field selector, e.g. metadata.name=web")
 	watch := fs.Bool("watch", false, "keep printing as objects change")
 	fs.BoolVar(watch, "w", false, "keep printing as objects change (shorthand)")
-	replicas := fs.Int("replicas", -1, "how many replicas to scale to")
 	patchBody := fs.String("patch", "", "a merge patch")
 	fs.StringVar(patchBody, "p", "", "a merge patch (shorthand)")
 	force := fs.Bool("force-conflicts", false, "take ownership of fields another manager owns")
@@ -94,8 +92,6 @@ func main() {
 		err = create(cfg, ns, *filename)
 	case "apply":
 		err = apply(cfg, ns, *filename, *force)
-	case "scale":
-		err = scale(cfg, ns, arg(args, 1), arg(args, 2), *replicas)
 	case "patch":
 		err = patch(cfg, ns, arg(args, 1), arg(args, 2), *patchBody)
 	case "delete":
@@ -450,41 +446,6 @@ func apply(cfg *rest.Config, ns, filename string, force bool) error {
 		return err
 	}
 	fmt.Printf("%s \"%s\" applied\n", mapping.Resource.Resource, applied.GetName())
-	return nil
-}
-
-// scale sets the replica count through /scale.
-//
-// The subresource is a separate endpoint on the same object, and it exists so
-// that "may change the replica count" can be granted without "may change the
-// pod template" — RBAC is written against resources, and a subresource is
-// addressable in its own right. It also means an autoscaler and a deploy
-// pipeline write to different endpoints and stop fighting over the parent.
-//
-// Scale has a shared shape across Deployments, StatefulSets and anything else
-// that implements it, so this works without knowing which kind it is.
-func scale(cfg *rest.Config, ns, resource, name string, replicas int) error {
-	if name == "" || replicas < 0 {
-		return fmt.Errorf("scale: need a name and --replicas")
-	}
-	gvr, err := mapResource(cfg, resource)
-	if err != nil {
-		return err
-	}
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return err
-	}
-	// The patch goes to the scale subresource, so the body is a Scale object
-	// rather than a Deployment — spec.replicas here is Scale's field, not the
-	// Deployment's, even though setting it moves the same number.
-	body := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
-	if _, err := dyn.Resource(gvr).Namespace(ns).Patch(
-		context.Background(), name, types.MergePatchType, []byte(body),
-		metav1.PatchOptions{}, "scale"); err != nil {
-		return err
-	}
-	fmt.Printf("%s \"%s\" scaled\n", gvr.Resource, name)
 	return nil
 }
 

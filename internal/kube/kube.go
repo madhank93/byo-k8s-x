@@ -14,9 +14,11 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -235,3 +237,59 @@ func (e *Env) SeedLabeledPod(ctx context.Context, name string, labels map[string
 	}
 	return nil
 }
+
+// ConfigMap fetches one, for stages that assert on what a write did.
+func (e *Env) ConfigMap(ctx context.Context, name string) (*corev1.ConfigMap, error) {
+	return e.Client.CoreV1().ConfigMaps(e.Namespace).Get(ctx, name, metav1.GetOptions{})
+}
+
+// Gone reports whether a pod has finished being deleted.
+func (e *Env) Gone(ctx context.Context, pod string) (bool, error) {
+	_, err := e.Client.CoreV1().Pods(e.Namespace).Get(ctx, pod, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// ApplyAs performs a server-side apply as some other field manager, so a stage
+// can set up the conflict the learner's program has to resolve.
+func (e *Env) ApplyAs(ctx context.Context, manager, name, key, value string) error {
+	body := fmt.Sprintf(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":%q},"data":{%q:%q}}`, name, key, value)
+	_, err := e.Client.CoreV1().ConfigMaps(e.Namespace).Patch(ctx, name,
+		types.ApplyPatchType, []byte(body),
+		metav1.PatchOptions{FieldManager: manager, Force: ptr(true)})
+	if err != nil {
+		return fmt.Errorf("apply as %s: %w", manager, err)
+	}
+	return nil
+}
+
+// SeedDeployment creates a Deployment, for the scale stage.
+func (e *Env) SeedDeployment(ctx context.Context, name string, replicas int32) error {
+	labels := map[string]string{"app": name}
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: e.Namespace},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+				},
+			},
+		},
+	}
+	if _, err := e.Client.AppsV1().Deployments(e.Namespace).Create(ctx, dep, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("seed deployment %s: %w", name, err)
+	}
+	return nil
+}
+
+// Deployment fetches one.
+func (e *Env) Deployment(ctx context.Context, name string) (*appsv1.Deployment, error) {
+	return e.Client.AppsV1().Deployments(e.Namespace).Get(ctx, name, metav1.GetOptions{})
+}
+
+func ptr[T any](v T) *T { return &v }

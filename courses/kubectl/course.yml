@@ -58,3 +58,21 @@ stages:
   - slug: watch
     name: Keep watching
     difficulty: hard
+  - slug: delete
+    name: Delete an object
+    difficulty: easy
+  - slug: create-from-file
+    name: Create from a manifest
+    difficulty: hard
+  - slug: apply-ssa
+    name: Apply, not create
+    difficulty: hard
+  - slug: apply-conflict
+    name: Two managers, one field
+    difficulty: hard
+  - slug: patch
+    name: Change one field
+    difficulty: medium
+  - slug: scale
+    name: Scale through a subresource
+    difficulty: medium

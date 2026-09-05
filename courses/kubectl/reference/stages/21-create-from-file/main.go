@@ -21,10 +21,6 @@
 // Stage 19: -w keeps printing as things change.
 // Stage 20: delete an object.
 // Stage 21: create from a manifest.
-// Stage 22: apply, which is create-or-update and records who owns what.
-// Stage 23: a conflict is a question, and --force-conflicts is the answer.
-// Stage 24: patch changes a field without sending the object.
-// Stage 25: scale, through a subresource of its own.
 
 package main
 
@@ -39,12 +35,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -65,10 +59,6 @@ func main() {
 	fieldSelector := fs.String("field-selector", "", "field selector, e.g. metadata.name=web")
 	watch := fs.Bool("watch", false, "keep printing as objects change")
 	fs.BoolVar(watch, "w", false, "keep printing as objects change (shorthand)")
-	replicas := fs.Int("replicas", -1, "how many replicas to scale to")
-	patchBody := fs.String("patch", "", "a merge patch")
-	fs.StringVar(patchBody, "p", "", "a merge patch (shorthand)")
-	force := fs.Bool("force-conflicts", false, "take ownership of fields another manager owns")
 	filename := fs.String("filename", "", "a manifest to send")
 	fs.StringVar(filename, "f", "", "a manifest to send (shorthand)")
 	allNS := fs.Bool("all-namespaces", false, "list across every namespace")
@@ -92,12 +82,6 @@ func main() {
 		err = apiResources(cfg)
 	case "create":
 		err = create(cfg, ns, *filename)
-	case "apply":
-		err = apply(cfg, ns, *filename, *force)
-	case "scale":
-		err = scale(cfg, ns, arg(args, 1), arg(args, 2), *replicas)
-	case "patch":
-		err = patch(cfg, ns, arg(args, 1), arg(args, 2), *patchBody)
 	case "delete":
 		err = deleteObject(cfg, ns, arg(args, 1), arg(args, 2))
 	case "get":
@@ -375,151 +359,6 @@ func create(cfg *rest.Config, ns, filename string) error {
 		return err
 	}
 	fmt.Printf("%s \"%s\" created\n", mapping.Resource.Resource, created.GetName())
-	return nil
-}
-
-// apply sends the manifest as a declaration of intent rather than an
-// instruction.
-//
-// The difference from create is not "create if missing". An apply says "these
-// fields should look like this, and I am the one saying so" — the server
-// records the field manager against every field the request set, and a later
-// apply that omits a field it used to set means "I no longer manage this",
-// so the server removes it. That is why apply can converge state that a
-// create-or-update loop cannot: it knows the difference between a field
-// someone else set and a field you removed.
-//
-// The patch type carries the whole mechanism; the body is the manifest itself,
-// unchanged.
-func apply(cfg *rest.Config, ns, filename string, force bool) error {
-	if filename == "" {
-		return fmt.Errorf("apply: which file? (-f)")
-	}
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return err
-	}
-	obj := &unstructured.Unstructured{}
-	if err := yaml.Unmarshal(data, &obj.Object); err != nil {
-		return fmt.Errorf("parsing %s: %w", filename, err)
-	}
-	gvk := obj.GroupVersionKind()
-	if gvk.Kind == "" {
-		return fmt.Errorf("%s has no kind", filename)
-	}
-
-	mapper, err := newMapper(cfg)
-	if err != nil {
-		return err
-	}
-	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
-	if err != nil {
-		return fmt.Errorf("the server has no %s: %w", gvk.Kind, err)
-	}
-
-	target := ns
-	if in := obj.GetNamespace(); in != "" {
-		target = in
-	}
-	obj.SetNamespace(target)
-
-	body, err := json.Marshal(obj.Object)
-	if err != nil {
-		return err
-	}
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return err
-	}
-	applied, err := dyn.Resource(mapping.Resource).Namespace(target).Patch(
-		context.Background(), obj.GetName(), types.ApplyPatchType, body,
-		// The field manager is an identity, not a label: it is what the server
-		// records ownership against, so two tools sharing a name share fields
-		// and neither can tell.
-		metav1.PatchOptions{FieldManager: "byok8s", Force: &force})
-	if err != nil {
-		// A conflict is the server saying another manager owns a field this
-		// apply is setting. It is a question, not a fault: forcing is
-		// sometimes right and sometimes stamps on a controller that will
-		// immediately set it back, so the choice belongs to whoever ran the
-		// command rather than to this function.
-		if apierrors.IsConflict(err) {
-			return fmt.Errorf("%w\n\nanother field manager owns a field this manifest sets."+
-				"\nre-run with --force-conflicts to take ownership", err)
-		}
-		return err
-	}
-	fmt.Printf("%s \"%s\" applied\n", mapping.Resource.Resource, applied.GetName())
-	return nil
-}
-
-// scale sets the replica count through /scale.
-//
-// The subresource is a separate endpoint on the same object, and it exists so
-// that "may change the replica count" can be granted without "may change the
-// pod template" — RBAC is written against resources, and a subresource is
-// addressable in its own right. It also means an autoscaler and a deploy
-// pipeline write to different endpoints and stop fighting over the parent.
-//
-// Scale has a shared shape across Deployments, StatefulSets and anything else
-// that implements it, so this works without knowing which kind it is.
-func scale(cfg *rest.Config, ns, resource, name string, replicas int) error {
-	if name == "" || replicas < 0 {
-		return fmt.Errorf("scale: need a name and --replicas")
-	}
-	gvr, err := mapResource(cfg, resource)
-	if err != nil {
-		return err
-	}
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return err
-	}
-	// The patch goes to the scale subresource, so the body is a Scale object
-	// rather than a Deployment — spec.replicas here is Scale's field, not the
-	// Deployment's, even though setting it moves the same number.
-	body := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
-	if _, err := dyn.Resource(gvr).Namespace(ns).Patch(
-		context.Background(), name, types.MergePatchType, []byte(body),
-		metav1.PatchOptions{}, "scale"); err != nil {
-		return err
-	}
-	fmt.Printf("%s \"%s\" scaled\n", gvr.Resource, name)
-	return nil
-}
-
-// patch changes named fields and leaves the rest alone.
-//
-// A merge patch is the smallest of the write verbs: the body names only what
-// changes, so nothing has to be read first and there is no resourceVersion to
-// conflict on. That is its appeal and its danger — two patches to different
-// fields never conflict, which is what you want, and a patch that races a
-// controller silently wins, which is not always.
-//
-// The type matters. A JSON merge patch replaces whole values, so patching one
-// element of a list replaces the list; a strategic merge patch knows the
-// API's own merge keys and can add a container to a pod without dropping the
-// others. Strategic only works on built-in types, because the merge keys come
-// from their Go struct tags — which is why a CRD accepts merge and not
-// strategic.
-func patch(cfg *rest.Config, ns, resource, name, body string) error {
-	if name == "" || body == "" {
-		return fmt.Errorf("patch: need a name and a patch (-p)")
-	}
-	gvr, err := mapResource(cfg, resource)
-	if err != nil {
-		return err
-	}
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return err
-	}
-	patched, err := dyn.Resource(gvr).Namespace(ns).Patch(
-		context.Background(), name, types.MergePatchType, []byte(body), metav1.PatchOptions{})
-	if err != nil {
-		return err
-	}
-	fmt.Printf("%s \"%s\" patched\n", gvr.Resource, patched.GetName())
 	return nil
 }
 
