@@ -10,3 +10,24 @@ stages:
   - slug: server-version
     name: Ask the server what it is
     difficulty: medium
+  - slug: list-pods
+    name: List the pods
+    difficulty: easy
+  - slug: namespace-flag
+    name: Choose a namespace
+    difficulty: medium
+  - slug: table-output
+    name: Print a table
+    difficulty: medium
+  - slug: age-column
+    name: Humanise the age
+    difficulty: medium
+  - slug: output-json
+    name: Print the object as JSON
+    difficulty: medium
+  - slug: output-yaml
+    name: Print the object as YAML
+    difficulty: medium
+  - slug: all-namespaces
+    name: Look everywhere at once
+    difficulty: medium

@@ -55,10 +55,20 @@ type Result struct {
 // stderr on its own. client-go logs warnings to stderr on entirely successful
 // runs, so a harness that treats stderr as failure fails everything.
 func Invoke(ctx context.Context, bin string, timeout time.Duration, args ...string) (*Result, error) {
+	return InvokeEnv(ctx, bin, nil, timeout, args...)
+}
+
+// InvokeEnv is Invoke with extra environment entries, which is how a stage
+// points the program at a scoped kubeconfig without the program knowing it is
+// being tested.
+func InvokeEnv(ctx context.Context, bin string, env []string, timeout time.Duration, args ...string) (*Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, bin, args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	var stdout, stderr capped
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 

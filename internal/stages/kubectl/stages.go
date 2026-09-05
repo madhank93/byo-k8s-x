@@ -9,7 +9,9 @@ package kubectl
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -42,6 +44,13 @@ func init() {
 	register(Stage{Slug: "server-url", Run: stageServerURL})
 	register(Stage{Slug: "context-override", Run: stageContextOverride})
 	register(Stage{Slug: "server-version", Run: stageServerVersion})
+	register(Stage{Slug: "list-pods", Run: stageListPods})
+	register(Stage{Slug: "namespace-flag", Run: stageNamespaceFlag})
+	register(Stage{Slug: "table-output", Run: stageTableOutput})
+	register(Stage{Slug: "age-column", Run: stageAgeColumn})
+	register(Stage{Slug: "output-json", Run: stageOutputJSON})
+	register(Stage{Slug: "output-yaml", Run: stageOutputYAML})
+	register(Stage{Slug: "all-namespaces", Run: stageAllNamespaces})
 }
 
 // stageServerURL — the program prints the API server it would talk to,
@@ -114,4 +123,254 @@ func tail(s string) string {
 		lines = append([]string{"…"}, lines[len(lines)-12:]...)
 	}
 	return "  " + strings.Join(lines, "\n  ")
+}
+
+// scoped seeds pods and hands back the env entry pointing the program at a
+// kubeconfig whose context carries this stage's namespace.
+func scoped(ctx context.Context, env *kube.Env, pods ...string) ([]string, func(), error) {
+	dir, err := os.MkdirTemp("", "byok8s-stage-")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() { os.RemoveAll(dir) }
+
+	if err := env.SeedPods(ctx, pods...); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	path, err := env.KubeconfigScoped(dir)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return []string{"KUBECONFIG=" + path}, cleanup, nil
+}
+
+// stageListPods — the program lists pods in the namespace its context names.
+func stageListPods(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "alpha", "beta")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	for _, want := range []string{"alpha", "beta"} {
+		if !strings.Contains(res.Stdout, want) {
+			return fmt.Errorf("expected pod %q in the output, got:\n%s", want, tail(res.Stdout))
+		}
+	}
+	return nil
+}
+
+// stageNamespaceFlag — -n beats the context, and its absence does not.
+func stageNamespaceFlag(ctx context.Context, env *kube.Env, bin string) error {
+	if err := env.SeedPods(ctx, "gamma"); err != nil {
+		return err
+	}
+
+	// With the flag, the program must look where it was told.
+	with, err := runner.Invoke(ctx, bin, StageTimeout, "get", "pods", "-n", env.Namespace)
+	if err != nil {
+		return err
+	}
+	if with.ExitCode != 0 {
+		return fmt.Errorf("with -n %s: expected exit 0, got %d\nstderr:\n%s", env.Namespace, with.ExitCode, tail(with.Stderr))
+	}
+	if !strings.Contains(with.Stdout, "gamma") {
+		return fmt.Errorf("with -n %s: expected pod \"gamma\", got:\n%s", env.Namespace, tail(with.Stdout))
+	}
+
+	// Without it, the default namespace — where that pod is not.
+	without, err := runner.Invoke(ctx, bin, StageTimeout, "get", "pods")
+	if err != nil {
+		return err
+	}
+	if without.ExitCode != 0 {
+		return fmt.Errorf("without -n: expected exit 0, got %d\nstderr:\n%s", without.ExitCode, tail(without.Stderr))
+	}
+	if strings.Contains(without.Stdout, "gamma") {
+		return fmt.Errorf("without -n the program listed %s's pods; it should have used the default namespace:\n%s", env.Namespace, tail(without.Stdout))
+	}
+	return nil
+}
+
+var wsRun = regexp.MustCompile(`\s+`)
+
+// stageTableOutput — a header and one aligned row per pod.
+func stageTableOutput(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "delta")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	lines := nonEmptyLines(res.Stdout)
+	if len(lines) < 2 {
+		return fmt.Errorf("expected a header and at least one row, got:\n%s", tail(res.Stdout))
+	}
+	header := wsRun.Split(strings.TrimSpace(lines[0]), -1)
+	if len(header) < 2 || header[0] != "NAME" || header[1] != "AGE" {
+		return fmt.Errorf("expected a header starting NAME then AGE, got %q", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "delta") {
+		return fmt.Errorf("expected the row to start with the pod name, got %q", lines[1])
+	}
+	return nil
+}
+
+var ageRE = regexp.MustCompile(`^\d+[smhd]$`)
+
+// stageAgeColumn — the age is humanised, not a timestamp.
+//
+// Asserted by shape rather than value: the pod is seconds old when the stage
+// runs and any exact number would be a race.
+func stageAgeColumn(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "epsilon")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	lines := nonEmptyLines(res.Stdout)
+	if len(lines) < 2 {
+		return fmt.Errorf("expected a header and a row, got:\n%s", tail(res.Stdout))
+	}
+	cols := wsRun.Split(strings.TrimSpace(lines[1]), -1)
+	if len(cols) < 2 {
+		return fmt.Errorf("expected a NAME and an AGE column, got %q", lines[1])
+	}
+	if !ageRE.MatchString(cols[1]) {
+		return fmt.Errorf("expected an age like 5s, 3m or 2d; got %q in row %q", cols[1], lines[1])
+	}
+	return nil
+}
+
+func nonEmptyLines(s string) []string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		if strings.TrimSpace(l) != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// stageOutputJSON — -o json emits the API's own object, not a summary of it.
+//
+// Asserted by decoding rather than by string match: any valid encoding of the
+// list passes, which leaves the learner free to marshal it however they like.
+func stageOutputJSON(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "zeta")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods", "-o", "json")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+
+	var out struct {
+		Kind  string `json:"kind"`
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(res.Stdout), &out); err != nil {
+		return fmt.Errorf("stdout is not valid JSON (%v), got:\n%s", err, tail(res.Stdout))
+	}
+	if out.Kind != "PodList" {
+		return fmt.Errorf("expected kind PodList, got %q — the list object carries its own kind", out.Kind)
+	}
+	if len(out.Items) != 1 || out.Items[0].Metadata.Name != "zeta" {
+		return fmt.Errorf("expected one item named zeta, got %d items", len(out.Items))
+	}
+	return nil
+}
+
+// stageOutputYAML — the same object through the YAML serializer.
+func stageOutputYAML(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "eta")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods", "-o", "yaml")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	if strings.HasPrefix(strings.TrimSpace(res.Stdout), "{") {
+		return fmt.Errorf("that is JSON, not YAML — the serializer differs, the object does not:\n%s", tail(res.Stdout))
+	}
+	for _, want := range []string{"kind: PodList", "name: eta"} {
+		if !strings.Contains(res.Stdout, want) {
+			return fmt.Errorf("expected %q in the YAML, got:\n%s", want, tail(res.Stdout))
+		}
+	}
+	return nil
+}
+
+// stageAllNamespaces — -A changes both the request and the shape of the table.
+func stageAllNamespaces(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "theta")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods", "-A")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	lines := nonEmptyLines(res.Stdout)
+	if len(lines) < 2 {
+		return fmt.Errorf("expected a header and rows, got:\n%s", tail(res.Stdout))
+	}
+	header := wsRun.Split(strings.TrimSpace(lines[0]), -1)
+	if len(header) < 3 || header[0] != "NAMESPACE" {
+		return fmt.Errorf("expected NAMESPACE as the first column with -A, got %q", lines[0])
+	}
+	if !strings.Contains(res.Stdout, "theta") {
+		return fmt.Errorf("expected the seeded pod in the output, got:\n%s", tail(res.Stdout))
+	}
+	// kube-system always has pods; seeing only our namespace means the request
+	// was still scoped.
+	if !strings.Contains(res.Stdout, "kube-system") {
+		return fmt.Errorf("expected pods from other namespaces too — -A must drop the namespace from the request, got:\n%s", tail(res.Stdout))
+	}
+	return nil
 }

@@ -10,6 +10,7 @@ package kube
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -155,3 +156,55 @@ func WaitFor(ctx context.Context, what string, cond wait.ConditionWithContextFun
 // ServerURL is the API server address the learner's program should discover
 // from the kubeconfig, and what stage 1 asserts against.
 func (e *Env) ServerURL() string { return e.Config.Host }
+
+// KubeconfigScoped writes a kubeconfig identical to the real one except that
+// the context carries this stage's namespace, and returns its path.
+//
+// A context's namespace is the third thing kubectl consults, after the --namespace
+// flag and before "default". Handing the program one of these lets a stage
+// isolate itself without the program needing a flag it has not learned yet —
+// and it exercises real behaviour rather than a test seam.
+func (e *Env) KubeconfigScoped(dir string) (string, error) {
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	raw, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		rules, &clientcmd.ConfigOverrides{}).RawConfig()
+	if err != nil {
+		return "", fmt.Errorf("read kubeconfig: %w", err)
+	}
+	kctx, ok := raw.Contexts[cluster.Context]
+	if !ok {
+		return "", fmt.Errorf("context %s missing from kubeconfig", cluster.Context)
+	}
+	kctx.Namespace = e.Namespace
+	raw.CurrentContext = cluster.Context
+
+	path := filepath.Join(dir, "kubeconfig")
+	if err := clientcmd.WriteToFile(raw, path); err != nil {
+		return "", fmt.Errorf("write scoped kubeconfig: %w", err)
+	}
+	return path, nil
+}
+
+// SeedPods creates pods in the stage's namespace and returns their names.
+//
+// They are never waited on: a pod that exists is enough to be listed, and
+// waiting for the image to pull would add half a minute to every stage that
+// only needs something to print.
+func (e *Env) SeedPods(ctx context.Context, names ...string) error {
+	for _, name := range names {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: e.Namespace},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:    "app",
+					Image:   "registry.k8s.io/pause:3.9",
+					Command: nil,
+				}},
+			},
+		}
+		if _, err := e.Client.CoreV1().Pods(e.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("seed pod %s: %w", name, err)
+		}
+	}
+	return nil
+}
