@@ -14,7 +14,6 @@
 // Stage 12: api-resources asks the server what it serves.
 // Stage 13: any spelling of a resource resolves to the same thing.
 // Stage 14: get anything, through the dynamic client.
-// Stage 15: -o wide adds the columns that resource can offer.
 
 package main
 
@@ -188,74 +187,29 @@ func get(cfg *rest.Config, ns, resource, name, output string, allNS bool) error 
 		fmt.Print(string(y))
 		return nil
 	}
-	if output != "" && output != "wide" {
+	if output != "" {
 		return fmt.Errorf("unknown output format %q", output)
 	}
 
 	// tabwriter does the column alignment kubectl's printer does: write the
 	// cells separated by tabs and let it choose a width that fits the widest
 	// one in each column. Computing widths by hand works until a name is long.
-	wide := output == "wide"
-
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	var header []string
 	if allNS {
 		// Rows can now come from anywhere, so the namespace stops being
 		// context and becomes data.
-		header = append(header, "NAMESPACE")
+		fmt.Fprintln(w, "NAMESPACE\tNAME\tAGE")
+	} else {
+		fmt.Fprintln(w, "NAME\tAGE")
 	}
-	header = append(header, "NAME", "AGE")
-	if wide {
-		header = append(header, wideHeaders(gvr)...)
-	}
-	fmt.Fprintln(w, strings.Join(header, "\t"))
-
 	for _, o := range list.Items {
-		var row []string
 		if allNS {
-			row = append(row, o.GetNamespace())
+			fmt.Fprintf(w, "%s\t%s\t%s\n", o.GetNamespace(), o.GetName(), age(o.GetCreationTimestamp().Time))
+			continue
 		}
-		row = append(row, o.GetName(), age(o.GetCreationTimestamp().Time))
-		if wide {
-			row = append(row, wideValues(gvr, o)...)
-		}
-		fmt.Fprintln(w, strings.Join(row, "\t"))
+		fmt.Fprintf(w, "%s\t%s\n", o.GetName(), age(o.GetCreationTimestamp().Time))
 	}
 	return w.Flush()
-}
-
-// wideHeaders and wideValues are the extra columns -o wide adds.
-//
-// They are per-resource by nature: a Pod has a node and an IP, a Service has a
-// cluster IP and ports, and a CRD has whatever its author declared. Real
-// kubectl asks the server for these — the API can return a Table with the
-// columns already chosen, which is how it prints resources it has never seen.
-// Deciding here keeps the program readable, at the cost of only knowing about
-// the resources it has been taught.
-func wideHeaders(gvr schema.GroupVersionResource) []string {
-	if gvr.Group == "" && gvr.Resource == "pods" {
-		return []string{"NODE", "IP"}
-	}
-	return nil
-}
-
-func wideValues(gvr schema.GroupVersionResource, o unstructured.Unstructured) []string {
-	if gvr.Group != "" || gvr.Resource != "pods" {
-		return nil
-	}
-	// Nested lookups report "found" separately from "wrong type", and an
-	// unscheduled pod has neither field — so absent becomes <none> rather
-	// than an empty cell that misaligns the row.
-	node, _, _ := unstructured.NestedString(o.Object, "spec", "nodeName")
-	ip, _, _ := unstructured.NestedString(o.Object, "status", "podIP")
-	return []string{orNone(node), orNone(ip)}
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return "<none>"
-	}
-	return s
 }
 
 // mapResource turns whatever the user typed into the resource the API is

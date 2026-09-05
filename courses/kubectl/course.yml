@@ -31,3 +31,18 @@ stages:
   - slug: all-namespaces
     name: Look everywhere at once
     difficulty: medium
+  - slug: get-by-name
+    name: Ask for one object
+    difficulty: easy
+  - slug: api-resources
+    name: Ask what the server serves
+    difficulty: medium
+  - slug: rest-mapper
+    name: Resolve any spelling
+    difficulty: hard
+  - slug: dynamic-client
+    name: Get anything at all
+    difficulty: hard
+  - slug: output-wide
+    name: Wider columns
+    difficulty: easy

@@ -12,9 +12,6 @@
 // Stage 10: -A looks in every namespace.
 // Stage 11: get one object by name.
 // Stage 12: api-resources asks the server what it serves.
-// Stage 13: any spelling of a resource resolves to the same thing.
-// Stage 14: get anything, through the dynamic client.
-// Stage 15: -o wide adds the columns that resource can offer.
 
 package main
 
@@ -28,13 +25,11 @@ import (
 	"text/tabwriter"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/yaml"
 )
@@ -160,15 +155,23 @@ func printVersion(cfg *rest.Config) error {
 }
 
 func get(cfg *rest.Config, ns, resource, name, output string, allNS bool) error {
-	gvr, err := mapResource(cfg, resource)
+	if resource != "pods" && resource != "pod" && resource != "po" {
+		return fmt.Errorf("get: unknown resource %q", resource)
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return err
 	}
-	list, err := fetch(cfg, gvr, ns, name)
+	list, err := fetch(cs, ns, name)
 	if err != nil {
 		return err
 	}
 	if output == "json" || output == "yaml" {
+		// The list is an API object in its own right, not a bare array — it
+		// carries its own Kind, which is what lets this output be fed back to
+		// the server later. The server does not send those fields on a list
+		// read, so they are set here.
+		list.Kind, list.APIVersion = "PodList", "v1"
 		data, err := json.MarshalIndent(list, "", "    ")
 		if err != nil {
 			return err
@@ -188,116 +191,29 @@ func get(cfg *rest.Config, ns, resource, name, output string, allNS bool) error 
 		fmt.Print(string(y))
 		return nil
 	}
-	if output != "" && output != "wide" {
+	if output != "" {
 		return fmt.Errorf("unknown output format %q", output)
 	}
 
 	// tabwriter does the column alignment kubectl's printer does: write the
 	// cells separated by tabs and let it choose a width that fits the widest
 	// one in each column. Computing widths by hand works until a name is long.
-	wide := output == "wide"
-
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	var header []string
 	if allNS {
 		// Rows can now come from anywhere, so the namespace stops being
 		// context and becomes data.
-		header = append(header, "NAMESPACE")
+		fmt.Fprintln(w, "NAMESPACE\tNAME\tAGE")
+	} else {
+		fmt.Fprintln(w, "NAME\tAGE")
 	}
-	header = append(header, "NAME", "AGE")
-	if wide {
-		header = append(header, wideHeaders(gvr)...)
-	}
-	fmt.Fprintln(w, strings.Join(header, "\t"))
-
-	for _, o := range list.Items {
-		var row []string
+	for _, p := range list.Items {
 		if allNS {
-			row = append(row, o.GetNamespace())
+			fmt.Fprintf(w, "%s\t%s\t%s\n", p.Namespace, p.Name, age(p.CreationTimestamp.Time))
+			continue
 		}
-		row = append(row, o.GetName(), age(o.GetCreationTimestamp().Time))
-		if wide {
-			row = append(row, wideValues(gvr, o)...)
-		}
-		fmt.Fprintln(w, strings.Join(row, "\t"))
+		fmt.Fprintf(w, "%s\t%s\n", p.Name, age(p.CreationTimestamp.Time))
 	}
 	return w.Flush()
-}
-
-// wideHeaders and wideValues are the extra columns -o wide adds.
-//
-// They are per-resource by nature: a Pod has a node and an IP, a Service has a
-// cluster IP and ports, and a CRD has whatever its author declared. Real
-// kubectl asks the server for these — the API can return a Table with the
-// columns already chosen, which is how it prints resources it has never seen.
-// Deciding here keeps the program readable, at the cost of only knowing about
-// the resources it has been taught.
-func wideHeaders(gvr schema.GroupVersionResource) []string {
-	if gvr.Group == "" && gvr.Resource == "pods" {
-		return []string{"NODE", "IP"}
-	}
-	return nil
-}
-
-func wideValues(gvr schema.GroupVersionResource, o unstructured.Unstructured) []string {
-	if gvr.Group != "" || gvr.Resource != "pods" {
-		return nil
-	}
-	// Nested lookups report "found" separately from "wrong type", and an
-	// unscheduled pod has neither field — so absent becomes <none> rather
-	// than an empty cell that misaligns the row.
-	node, _, _ := unstructured.NestedString(o.Object, "spec", "nodeName")
-	ip, _, _ := unstructured.NestedString(o.Object, "status", "podIP")
-	return []string{orNone(node), orNone(ip)}
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return "<none>"
-	}
-	return s
-}
-
-// mapResource turns whatever the user typed into the resource the API is
-// addressed by.
-//
-// "po", "pods", "pod" and "Pod" are four spellings of one thing, and only the
-// server knows the mapping — shortnames are declared by whoever defined the
-// resource, including a CRD added at runtime. A hardcoded table would work for
-// core types and break on the first custom one, which is the whole reason the
-// RESTMapper exists.
-func mapResource(cfg *rest.Config, resource string) (schema.GroupVersionResource, error) {
-	if resource == "" {
-		return schema.GroupVersionResource{}, fmt.Errorf("get: which resource?")
-	}
-	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
-	if err != nil {
-		return schema.GroupVersionResource{}, err
-	}
-	groups, err := restmapper.GetAPIGroupResources(dc)
-	if err != nil {
-		return schema.GroupVersionResource{}, err
-	}
-	// The plain mapper knows resources and kinds but not shortnames: "po" is
-	// a client-side convenience expanded from the shortNames discovery
-	// reports, so it needs the shortcut expander wrapped around it. Without
-	// this "pods" works and "po" does not, which is a confusing way to fail.
-	mapper := restmapper.NewShortcutExpander(
-		restmapper.NewDiscoveryRESTMapper(groups), dc, func(string) {})
-
-	// ParseResourceArg understands "pods", "pods.v1.", and friends; falling
-	// back to a bare resource-or-kind covers "Pod" and "po".
-	fullySpecified, gr := schema.ParseResourceArg(strings.ToLower(resource))
-	if fullySpecified != nil {
-		if m, err := mapper.ResourceFor(*fullySpecified); err == nil {
-			return m, nil
-		}
-	}
-	m, err := mapper.ResourceFor(gr.WithVersion(""))
-	if err != nil {
-		return schema.GroupVersionResource{}, fmt.Errorf("the server has no resource called %q", resource)
-	}
-	return m, nil
 }
 
 // apiResources lists everything this server serves.
@@ -342,33 +258,23 @@ func apiResources(cfg *rest.Config) error {
 	return w.Flush()
 }
 
-// fetch returns the objects to print, whatever they are.
+// fetch returns the pods to print: one when a name was given, all otherwise.
 //
-// This is the moment the program stops being a pod client. The dynamic client
-// speaks in GroupVersionResource and unstructured maps rather than Go types,
-// so one code path serves pods, ConfigMaps and a CRD nobody had written when
-// this was compiled. A typed client is still the better choice when the type
-// is known at compile time — fields instead of map lookups — but a tool like
-// this one does not know.
+// A Get for a missing object returns a NotFound error rather than an empty
+// result, and letting it surface is the right behaviour — "there is no such
+// pod" and "there are no pods" are different answers, and a script that
+// cannot tell them apart is a script that deletes the wrong thing.
 //
-// A Get for a missing object returns NotFound rather than an empty result, and
-// letting it surface is right: "there is no such pod" and "there are no pods"
-// are different answers, and a script that cannot tell them apart deletes the
-// wrong thing.
-func fetch(cfg *rest.Config, gvr schema.GroupVersionResource, ns, name string) (*unstructured.UnstructuredList, error) {
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-	ri := dyn.Resource(gvr).Namespace(ns)
+// Wrapping the single object in a list keeps one printing path for both cases.
+func fetch(cs *kubernetes.Clientset, ns, name string) (*corev1.PodList, error) {
 	if name == "" {
-		return ri.List(context.Background(), metav1.ListOptions{})
+		return cs.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{})
 	}
-	obj, err := ri.Get(context.Background(), name, metav1.GetOptions{})
+	pod, err := cs.CoreV1().Pods(ns).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
-	return &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*obj}}, nil
+	return &corev1.PodList{Items: []corev1.Pod{*pod}}, nil
 }
 
 // age renders a duration the way kubectl does: one unit, the largest that

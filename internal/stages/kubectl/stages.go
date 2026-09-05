@@ -51,6 +51,11 @@ func init() {
 	register(Stage{Slug: "output-json", Run: stageOutputJSON})
 	register(Stage{Slug: "output-yaml", Run: stageOutputYAML})
 	register(Stage{Slug: "all-namespaces", Run: stageAllNamespaces})
+	register(Stage{Slug: "get-by-name", Run: stageGetByName})
+	register(Stage{Slug: "api-resources", Run: stageAPIResources})
+	register(Stage{Slug: "rest-mapper", Run: stageRESTMapper})
+	register(Stage{Slug: "dynamic-client", Run: stageDynamicClient})
+	register(Stage{Slug: "output-wide", Run: stageOutputWide})
 }
 
 // stageServerURL — the program prints the API server it would talk to,
@@ -371,6 +376,154 @@ func stageAllNamespaces(ctx context.Context, env *kube.Env, bin string) error {
 	// was still scoped.
 	if !strings.Contains(res.Stdout, "kube-system") {
 		return fmt.Errorf("expected pods from other namespaces too — -A must drop the namespace from the request, got:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// stageGetByName — one object, and a real error when it is not there.
+func stageGetByName(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "iota", "kappa")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	one, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pod", "iota")
+	if err != nil {
+		return err
+	}
+	if one.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", one.ExitCode, tail(one.Stderr))
+	}
+	if !strings.Contains(one.Stdout, "iota") {
+		return fmt.Errorf("expected pod \"iota\" in the output, got:\n%s", tail(one.Stdout))
+	}
+	if strings.Contains(one.Stdout, "kappa") {
+		return fmt.Errorf("asking for one pod listed the others too:\n%s", tail(one.Stdout))
+	}
+
+	missing, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pod", "nope")
+	if err != nil {
+		return err
+	}
+	if missing.ExitCode == 0 {
+		return fmt.Errorf("a pod that does not exist should be an error, got exit 0 and:\n%s", tail(missing.Stdout))
+	}
+	return nil
+}
+
+// stageAPIResources — ask the server what it serves, rather than assuming.
+func stageAPIResources(ctx context.Context, env *kube.Env, bin string) error {
+	res, err := runner.Invoke(ctx, bin, StageTimeout, "api-resources")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	lines := nonEmptyLines(res.Stdout)
+	if len(lines) < 2 {
+		return fmt.Errorf("expected a header and rows, got:\n%s", tail(res.Stdout))
+	}
+	header := wsRun.Split(strings.TrimSpace(lines[0]), -1)
+	if len(header) < 3 || header[0] != "NAME" {
+		return fmt.Errorf("expected a header starting with NAME, got %q", lines[0])
+	}
+	// A resource from the core group, one from a named group, and a shortname:
+	// enough to show discovery walked more than one groupVersion.
+	for _, want := range []string{"pods", "configmaps", "deployments", "po"} {
+		if !strings.Contains(res.Stdout, want) {
+			return fmt.Errorf("expected %q in the output — discovery should cover every served group, got:\n%s", want, tail(res.Stdout))
+		}
+	}
+	return nil
+}
+
+// stageRESTMapper — every spelling of a resource resolves to the same thing.
+func stageRESTMapper(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "lambda")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	for _, spelling := range []string{"po", "pods", "pod", "Pod"} {
+		res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", spelling)
+		if err != nil {
+			return err
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("get %s: expected exit 0, got %d\nstderr:\n%s", spelling, res.ExitCode, tail(res.Stderr))
+		}
+		if !strings.Contains(res.Stdout, "lambda") {
+			return fmt.Errorf("get %s: expected the pod, got:\n%s", spelling, tail(res.Stdout))
+		}
+	}
+	return nil
+}
+
+// stageDynamicClient — a resource the program has no compiled-in type for.
+func stageDynamicClient(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := env.SeedConfigMap(ctx, "settings"); err != nil {
+		return err
+	}
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "configmaps")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	if !strings.Contains(res.Stdout, "settings") {
+		return fmt.Errorf("expected the ConfigMap \"settings\", got:\n%s", tail(res.Stdout))
+	}
+
+	// And the same command must still work for pods, through the same path.
+	if err := env.SeedPods(ctx, "mu"); err != nil {
+		return err
+	}
+	pods, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods")
+	if err != nil {
+		return err
+	}
+	if pods.ExitCode != 0 || !strings.Contains(pods.Stdout, "mu") {
+		return fmt.Errorf("pods stopped working once any resource did:\n%s", tail(pods.Stdout+pods.Stderr))
+	}
+	return nil
+}
+
+// stageOutputWide — more columns, same objects.
+func stageOutputWide(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "nu")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "get", "pods", "-o", "wide")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	lines := nonEmptyLines(res.Stdout)
+	if len(lines) < 2 {
+		return fmt.Errorf("expected a header and a row, got:\n%s", tail(res.Stdout))
+	}
+	header := wsRun.Split(strings.TrimSpace(lines[0]), -1)
+	if len(header) < 4 {
+		return fmt.Errorf("expected -o wide to add columns beyond NAME and AGE, got %q", lines[0])
+	}
+	joined := strings.Join(header, " ")
+	if !strings.Contains(joined, "NODE") {
+		return fmt.Errorf("expected a NODE column with -o wide, got %q", lines[0])
 	}
 	return nil
 }

@@ -208,3 +208,16 @@ func (e *Env) SeedPods(ctx context.Context, names ...string) error {
 	}
 	return nil
 }
+
+// SeedConfigMap creates a ConfigMap, for stages that need a resource the
+// program has no compiled-in type for.
+func (e *Env) SeedConfigMap(ctx context.Context, name string) error {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: e.Namespace},
+		Data:       map[string]string{"greeting": "hello"},
+	}
+	if _, err := e.Client.CoreV1().ConfigMaps(e.Namespace).Create(ctx, cm, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("seed configmap %s: %w", name, err)
+	}
+	return nil
+}
