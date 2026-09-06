@@ -76,3 +76,18 @@ stages:
   - slug: scale
     name: Scale through a subresource
     difficulty: medium
+  - slug: describe
+    name: Describe one object
+    difficulty: medium
+  - slug: describe-events
+    name: Attach its events
+    difficulty: hard
+  - slug: logs
+    name: Stream a container's logs
+    difficulty: hard
+  - slug: exec
+    name: Run a command inside
+    difficulty: hard
+  - slug: port-forward
+    name: Forward a local port
+    difficulty: hard

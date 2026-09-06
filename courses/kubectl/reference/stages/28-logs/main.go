@@ -28,8 +28,6 @@
 // Stage 26: describe one object.
 // Stage 27: attach the events that belong to it.
 // Stage 28: stream a container's logs.
-// Stage 29: run a command inside the container.
-// Stage 30: forward a local port into the cluster.
 
 package main
 
@@ -39,9 +37,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
-	"os/signal"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -58,13 +54,9 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/portforward"
-	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/client-go/transport/spdy"
 	"sigs.k8s.io/yaml"
 )
 
@@ -113,10 +105,6 @@ func main() {
 		err = create(cfg, ns, *filename)
 	case "apply":
 		err = apply(cfg, ns, *filename, *force)
-	case "port-forward":
-		err = portForward(cfg, ns, arg(args, 1), arg(args, 2))
-	case "exec":
-		err = execute(cfg, ns, arg(args, 1), *container, afterDoubleDash(os.Args))
 	case "logs":
 		err = logs(cfg, ns, arg(args, 1), *container, *follow)
 	case "describe":
@@ -477,105 +465,6 @@ func apply(cfg *rest.Config, ns, filename string, force bool) error {
 		return err
 	}
 	fmt.Printf("%s \"%s\" applied\n", mapping.Resource.Resource, applied.GetName())
-	return nil
-}
-
-// portForward opens a local port that tunnels to one in the pod.
-//
-// Same SPDY upgrade as exec, and for the same reason: many streams over one
-// connection, a pair per forwarded port. The traffic is proxied by the
-// apiserver, so this reaches a pod with no Service, no Ingress and no route
-// from your machine — which is why it is the debugging tool of choice and
-// also why it is not a way to expose anything.
-//
-// ForwardPorts blocks until stopCh closes, so the caller stops it rather than
-// it returning on its own.
-func portForward(cfg *rest.Config, ns, pod, ports string) error {
-	if pod == "" || ports == "" {
-		return fmt.Errorf("port-forward: need a pod and a local:remote port pair")
-	}
-	cs, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return err
-	}
-	req := cs.CoreV1().RESTClient().Post().
-		Resource("pods").Namespace(ns).Name(pod).SubResource("portforward")
-
-	transport, upgrader, err := spdy.RoundTripperFor(cfg)
-	if err != nil {
-		return err
-	}
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", req.URL())
-
-	stopCh := make(chan struct{})
-	readyCh := make(chan struct{})
-
-	// Ctrl-C should close the tunnel rather than kill the process mid-stream.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
-	go func() {
-		<-sig
-		close(stopCh)
-	}()
-
-	fw, err := portforward.New(dialer, []string{ports}, stopCh, readyCh, os.Stdout, os.Stderr)
-	if err != nil {
-		return err
-	}
-	go func() {
-		<-readyCh
-		fmt.Printf("forwarding %s to pod %s\n", ports, pod)
-	}()
-	return fw.ForwardPorts()
-}
-
-// execute runs a command inside a container.
-//
-// This is the one call that does not go over ordinary HTTP. Exec needs several
-// independent byte streams — stdin, stdout, stderr, and a resize channel —
-// multiplexed over one connection, so the request is upgraded to SPDY, and
-// building it means constructing the URL by hand rather than through a typed
-// client method.
-//
-// The subresource is part of the path: pods/<name>/exec is addressable in its
-// own right, which is also how RBAC grants exec without granting edit.
-func execute(cfg *rest.Config, ns, pod, container string, command []string) error {
-	if pod == "" || len(command) == 0 {
-		return fmt.Errorf("exec: need a pod and a command after --")
-	}
-	cs, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return err
-	}
-	req := cs.CoreV1().RESTClient().Post().
-		Resource("pods").Namespace(ns).Name(pod).SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: container,
-			Command:   command,
-			Stdout:    true,
-			Stderr:    true,
-		}, scheme.ParameterCodec)
-
-	// SPDY is the older of the two transports and still the one every
-	// apiserver accepts; newer clusters also offer WebSocket.
-	exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", req.URL())
-	if err != nil {
-		return err
-	}
-	return exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
-	})
-}
-
-// afterDoubleDash returns the words following "--", which is how a command
-// meant for somewhere else is kept away from this program's flag parser.
-func afterDoubleDash(argv []string) []string {
-	for i, a := range argv {
-		if a == "--" {
-			return argv[i+1:]
-		}
-	}
 	return nil
 }
 

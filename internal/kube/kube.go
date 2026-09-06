@@ -293,3 +293,79 @@ func (e *Env) Deployment(ctx context.Context, name string) (*appsv1.Deployment, 
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// WaitForScheduled waits until a pod has a node and at least one event.
+//
+// The describe stages need a pod the scheduler has touched: an unscheduled one
+// has no node, no conditions and no events, so asserting on it would test the
+// program against an empty object rather than a real one.
+func (e *Env) WaitForScheduled(ctx context.Context, name string) error {
+	return WaitFor(ctx, "the pod to be scheduled", func(ctx context.Context) (bool, error) {
+		pod, err := e.Client.CoreV1().Pods(e.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		return pod.Spec.NodeName != "", nil
+	})
+}
+
+// SeedRunningPod creates a pod that prints a marker and stays up, then waits
+// for it to be Running.
+//
+// This is the fixture the last three stages need, and the reason the course
+// grades against a real cluster: logs, exec and port-forward all go through
+// the kubelet, so a fake client or an apiserver without nodes cannot host
+// them at all.
+func (e *Env) SeedRunningPod(ctx context.Context, name, marker string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: e.Namespace},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:    "app",
+				Image:   "busybox:1.36",
+				Command: []string{"sh", "-c", "echo " + marker + "; sleep 3600"},
+			}},
+		},
+	}
+	if _, err := e.Client.CoreV1().Pods(e.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("seed running pod %s: %w", name, err)
+	}
+	return WaitFor(ctx, "pod "+name+" to be Running", func(ctx context.Context) (bool, error) {
+		p, err := e.Client.CoreV1().Pods(e.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		return p.Status.Phase == corev1.PodRunning, nil
+	})
+}
+
+// SeedServingPod creates a pod serving HTTP on port 80, for port-forward.
+func (e *Env) SeedServingPod(ctx context.Context, name string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: e.Namespace},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Image: "busybox:1.36",
+				Command: []string{"sh", "-c",
+					`echo byok8s-served > /tmp/index.html && httpd -f -p 80 -h /tmp`},
+				Ports: []corev1.ContainerPort{{ContainerPort: 80}},
+			}},
+		},
+	}
+	if _, err := e.Client.CoreV1().Pods(e.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("seed serving pod %s: %w", name, err)
+	}
+	return WaitFor(ctx, "pod "+name+" to be ready", func(ctx context.Context) (bool, error) {
+		p, err := e.Client.CoreV1().Pods(e.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		for _, c := range p.Status.ContainerStatuses {
+			if c.Ready {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+}

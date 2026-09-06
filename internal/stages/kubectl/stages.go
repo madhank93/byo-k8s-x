@@ -11,6 +11,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -69,6 +71,11 @@ func init() {
 	register(Stage{Slug: "apply-conflict", Run: stageApplyConflict})
 	register(Stage{Slug: "patch", Run: stagePatch})
 	register(Stage{Slug: "scale", Run: stageScale})
+	register(Stage{Slug: "describe", Run: stageDescribe})
+	register(Stage{Slug: "describe-events", Run: stageDescribeEvents})
+	register(Stage{Slug: "logs", Run: stageLogs})
+	register(Stage{Slug: "exec", Run: stageExec})
+	register(Stage{Slug: "port-forward", Run: stagePortForward})
 }
 
 // stageServerURL — the program prints the API server it would talk to,
@@ -932,6 +939,190 @@ func stageScale(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 3 {
 		return fmt.Errorf("expected spec.replicas 3, got %v", dep.Spec.Replicas)
+	}
+	return nil
+}
+
+// stageDescribe — the block layout, not a table.
+func stageDescribe(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "upsilon")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := env.WaitForScheduled(ctx, "upsilon"); err != nil {
+		return err
+	}
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "describe", "pod", "upsilon")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	// Label: value lines, not columns — describe answers "tell me about this
+	// one object" where get answers "show me these objects".
+	for _, want := range []string{"Name:", "Namespace:", "Node:", "Status:"} {
+		if !strings.Contains(res.Stdout, want) {
+			return fmt.Errorf("expected a %q line in the description, got:\n%s", want, tail(res.Stdout))
+		}
+	}
+	if !strings.Contains(res.Stdout, "upsilon") {
+		return fmt.Errorf("expected the pod's name in the output, got:\n%s", tail(res.Stdout))
+	}
+	if strings.Contains(res.Stdout, "NAME   AGE") {
+		return fmt.Errorf("that is the table printer — describe is a different shape:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// stageDescribeEvents — the events belonging to this object, and no others.
+func stageDescribeEvents(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env, "phi", "quebec")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := env.WaitForScheduled(ctx, "phi"); err != nil {
+		return err
+	}
+	if err := env.WaitForScheduled(ctx, "quebec"); err != nil {
+		return err
+	}
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, StageTimeout, "describe", "pod", "phi")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	if !strings.Contains(res.Stdout, "Events:") {
+		return fmt.Errorf("expected an Events section, got:\n%s", tail(res.Stdout))
+	}
+	if !strings.Contains(res.Stdout, "Scheduled") {
+		return fmt.Errorf("expected the Scheduled event the scheduler emits, got:\n%s", tail(res.Stdout))
+	}
+	// Events live in their own collection keyed by involvedObject; fetching
+	// them all and printing them would show the other pod's too.
+	//
+	// Matched as a whole word: the scheduler's own messages contain words like
+	// "machine", and a substring check on a short name passes or fails on the
+	// wrong thing.
+	if regexp.MustCompile(`\bquebec\b`).MatchString(res.Stdout) {
+		return fmt.Errorf("the events are not filtered to this pod — quebec's events appeared:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// stageLogs — a container's output, streamed.
+//
+// The first stage that needs a pod actually running: logs come from the
+// kubelet, not from the API object.
+func stageLogs(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	const marker = "byok8s-was-here"
+	if err := env.SeedRunningPod(ctx, "talker", marker); err != nil {
+		return err
+	}
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, 60*time.Second, "logs", "talker")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	if !strings.Contains(res.Stdout, marker) {
+		return fmt.Errorf("expected the container's output %q, got:\n%s", marker, tail(res.Stdout))
+	}
+	return nil
+}
+
+// stageExec — run something inside the container and read what it said.
+func stageExec(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := env.SeedRunningPod(ctx, "shell", "ready"); err != nil {
+		return err
+	}
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, 60*time.Second, "exec", "shell", "--", "echo", "from-inside")
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("expected exit 0, got %d\nstderr:\n%s", res.ExitCode, tail(res.Stderr))
+	}
+	if !strings.Contains(res.Stdout, "from-inside") {
+		return fmt.Errorf("expected the command's output from inside the container, got:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// stagePortForward — a local port that reaches into the cluster.
+//
+// The program never exits, so the harness bounds it and connects from outside
+// while it runs. What is asserted is that something answered on the local
+// port, which can only happen if the tunnel was actually built.
+func stagePortForward(ctx context.Context, env *kube.Env, bin string) error {
+	kc, cleanup, err := scoped(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := env.SeedServingPod(ctx, "server"); err != nil {
+		return err
+	}
+
+	const local = "18080"
+	fetched := make(chan string, 1)
+	go func() {
+		// Give the forwarder a moment to bind before knocking.
+		select {
+		case <-time.After(3 * time.Second):
+		case <-ctx.Done():
+			fetched <- ""
+			return
+		}
+		client := &http.Client{Timeout: 5 * time.Second}
+		for i := 0; i < 5; i++ {
+			resp, err := client.Get("http://127.0.0.1:" + local + "/")
+			if err == nil {
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				fetched <- string(body)
+				return
+			}
+			time.Sleep(2 * time.Second)
+		}
+		fetched <- ""
+	}()
+
+	res, err := runner.InvokeEnv(ctx, bin, kc, 30*time.Second,
+		"port-forward", "server", local+":80")
+	if err != nil {
+		return err
+	}
+	body := <-fetched
+	if body == "" {
+		return fmt.Errorf("nothing answered on localhost:%s — the tunnel was never established\nprogram output:\n%s", local, tail(res.Stdout+res.Stderr))
+	}
+	if !strings.Contains(body, "byok8s") {
+		return fmt.Errorf("the local port answered, but not from the pod: %q", body)
 	}
 	return nil
 }
