@@ -18,6 +18,8 @@ mise install          # go, kind, kubectl
 byok8s up             # create the local kind cluster
 byok8s doctor         # check everything is ready
 byok8s list           # the stages
+byok8s learn          # the course primer — the background, before stage 1
+byok8s learn 1        # the concept note for stage 1 (-hints for the ladder)
 byok8s run 1          # verify stage 1
 ```
 
@@ -32,6 +34,20 @@ produce pods, and `logs` really does stream from a container. Each stage runs
 in its own namespace, and the verdict is your program's exit code and stdout.
 Nothing inspects your source: any correct implementation passes.
 
+## The teaching layer
+
+A stage says whether your program behaves; it never says why. That lives in
+`courses/kubectl/learn/` — a primer to read before stage 1, and one note per
+stage covering the concept, the client-go you will reach for, a hint ladder
+scaled to the difficulty, and links to the primary sources. Hints stay behind
+`-hints`, because a hint you did not ask for is a spoiler.
+
+```sh
+byok8s learn            # the primer
+byok8s learn 22         # what server-side apply actually is
+byok8s learn 22 -hints  # and how to get there
+```
+
 ## Repo layout
 
 ```
@@ -40,7 +56,10 @@ courses/kubectl/
   app/                    your program
   reference/work/         the authoring copy (solutions are written here first)
   reference/stages/NN-*/  a verified snapshot per stage
+  learn/index.md          the course primer
+  learn/NN-*.md           one concept note per stage
 internal/cluster          kind lifecycle
+internal/learn            loads the primer and the stage notes
 internal/kube             namespace isolation and cluster guards
 internal/runner           builds and invokes your program
 internal/stages/kubectl   the assertions, one function per stage

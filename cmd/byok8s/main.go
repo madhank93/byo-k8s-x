@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/madhank93/byo-k8s-x/internal/cluster"
 	"github.com/madhank93/byo-k8s-x/internal/course"
+	learnpkg "github.com/madhank93/byo-k8s-x/internal/learn"
 )
 
 const defaultCourse = "kubectl"
@@ -36,6 +38,7 @@ func usage() {
   byok8s doctor             check the environment can run a course
   byok8s list               show the stages and where you are
   byok8s run [N]            verify stages 1..N (default: the next unfinished one)
+  byok8s learn [N] [-hints] the course primer, or the concept note for stage N
   byok8s reset --to N       replace your program with the stage N reference
 `)
 }
@@ -55,6 +58,8 @@ func dispatch(cmd string, args []string) error {
 		return list()
 	case "run":
 		return runStages(ctx, args)
+	case "learn":
+		return learn(args)
 	case "reset":
 		return reset(args)
 	default:
@@ -201,5 +206,63 @@ func reset(args []string) error {
 		return err
 	}
 	fmt.Printf("your program is now the stage %d reference (%s)\n", n, c.StageDir(n))
+	return nil
+}
+
+// learn prints the teaching layer: the primer with no argument, a stage's
+// concept note with one. Hints stay behind -hints, because a hint you did not
+// ask for is a spoiler.
+func learn(args []string) error {
+	c, err := loadCourse()
+	if err != nil {
+		return err
+	}
+
+	fs := flag.NewFlagSet("learn", flag.ContinueOnError)
+	hints := fs.Bool("hints", false, "show the hint ladder as well")
+
+	// flag stops at the first positional, so "learn 13 -hints" would leave the
+	// flag unparsed — the same trap stage 5 is about. Take a flag run, take one
+	// positional, repeat.
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return err
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		positional = append(positional, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
+
+	if len(positional) == 0 {
+		primer, ok := learnpkg.Primer(c.Dir())
+		if !ok {
+			return fmt.Errorf("this course has no primer yet")
+		}
+		fmt.Println(primer)
+		return nil
+	}
+
+	n, err := strconv.Atoi(positional[0])
+	if err != nil || n < 1 || n > len(c.Stages) {
+		return fmt.Errorf("stage must be between 1 and %d", len(c.Stages))
+	}
+	note, ok := learnpkg.Note(c.Dir(), c.StageDir(n))
+	if !ok {
+		return fmt.Errorf("stage %d has no note yet", n)
+	}
+
+	body, ladder := learnpkg.SplitHints(note)
+	fmt.Printf("Stage %d: %s\n\n%s\n", n, c.Stages[n-1].Name, body)
+	if ladder == "" {
+		return nil
+	}
+	if !*hints {
+		fmt.Println("\n(hints available: byok8s learn " + strconv.Itoa(n) + " -hints)")
+		return nil
+	}
+	fmt.Printf("\n## Hints\n\n%s\n", ladder)
 	return nil
 }
