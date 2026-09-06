@@ -48,6 +48,20 @@ byok8s learn 22         # what server-side apply actually is
 byok8s learn 22 -hints  # and how to get there
 ```
 
+## The website
+
+Everything the CLI shows is also published at
+**[byok8s.madhan.app](https://byok8s.madhan.app)** — the primer, all 30 stage
+notes, a concept index, and a catalog of every stage with the diff its
+reference solution adds. Nothing there is written twice: `web/gen` derives it
+all from `courses.yml`, each `course.yml`, the notes and the snapshots, so a
+new stage appears on the site the moment it lands.
+
+```sh
+mise run gen              # regenerate the catalog data and lesson pages
+mise run site             # and serve it locally
+```
+
 ## Repo layout
 
 ```
@@ -65,4 +79,6 @@ internal/runner           builds and invokes your program
 internal/stages/kubectl   the assertions, one function per stage
 hack/vsnap.sh             verify 1..N, snapshot only on a full pass
 hack/sweep.sh             fail if a stage's snapshot repeats the one before it
+web/                      the published site (Astro + Starlight)
+web/gen                   renders the catalog and lesson pages from the repo
 ```
