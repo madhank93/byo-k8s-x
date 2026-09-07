@@ -3,7 +3,7 @@ title: Describe one object
 concepts: [output formats, unstructured, api semantics]
 ---
 
-## What this stage teaches
+## Core concept
 
 Describe answers a different question from get, and the difference explains the
 format. A table compares many objects, so every row must fit one line and the
@@ -23,7 +23,7 @@ Missing fields are normal. An unscheduled pod has no node and no IP, and
 `unstructured.NestedString` reports "not found" separately from "wrong type" so
 you can render `<none>` rather than an empty line.
 
-## Go you'll reach for
+## Go APIs
 
 - `unstructured.NestedString(obj.Object, "spec", "nodeName")`.
 - `tabwriter` again, this time with padding 1 — two columns, not a grid.
@@ -45,6 +45,6 @@ Print `Name`, `Namespace`, `Labels` for any resource, then branch on
 Leave room at the bottom: stage 27 appends events here.
 </details>
 
-## Going deeper
+## Further reading
 
 - [kubectl describe](https://kubernetes.io/docs/reference/generated/kubectl/kubectl-commands#describe)

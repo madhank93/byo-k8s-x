@@ -3,7 +3,7 @@ title: Forward a local port
 concepts: [spdy, streaming, networking, goroutines]
 ---
 
-## What this stage teaches
+## Core concept
 
 Port-forward is the same upgrade as exec put to a different use: a local
 listener whose connections are tunnelled, one stream pair per forwarded port,
@@ -27,7 +27,7 @@ signalling ready (the port is bound; anything you print before this is a lie)
 and the ordinary Go pattern of a signal handler that closes the stop channel so
 Ctrl-C tears the tunnel down instead of killing the process mid-stream.
 
-## Go you'll reach for
+## Go APIs
 
 - `spdy.RoundTripperFor(cfg)` then `spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", req.URL())`.
 - `portforward.New(dialer, []string{"8080:80"}, stopCh, readyCh, os.Stdout, os.Stderr)`.
@@ -50,7 +50,7 @@ line from a goroutine waiting on `readyCh`; printing it before the port is
 bound tells the user to connect to something that is not listening yet.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 req := cs.CoreV1().RESTClient().Post().
@@ -65,7 +65,7 @@ return fw.ForwardPorts() // blocks until stopCh closes
 ```
 </details>
 
-## Going deeper
+## Further reading
 
 - [portforward](https://pkg.go.dev/k8s.io/client-go/tools/portforward)
 - [Use port forwarding to access applications](https://kubernetes.io/docs/tasks/access-application-cluster/port-forward-access-application-in-a-cluster/)

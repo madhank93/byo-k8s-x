@@ -3,7 +3,7 @@ title: Scale through a subresource
 concepts: [subresources, rbac, api design]
 ---
 
-## What this stage teaches
+## Core concept
 
 `/scale` is a **subresource**: a separate endpoint on the same object, with its
 own tiny schema.
@@ -28,7 +28,7 @@ path scale things it knows nothing about. The `spec.replicas` in your patch
 body is *Scale's* field, not the Deployment's, even though setting it moves the
 same number.
 
-## Go you'll reach for
+## Go APIs
 
 - The dynamic resource interface takes trailing subresource names:
   `Patch(ctx, name, types.MergePatchType, body, opts, "scale")`.
@@ -52,7 +52,7 @@ with `kubectl get deploy` that the parent object's replica count moved — same
 number, different endpoint.
 </details>
 
-## Going deeper
+## Further reading
 
 - [Scale subresource](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/deployment-v1/#DeploymentSpec)
 - [RBAC on subresources](https://kubernetes.io/docs/reference/access-authn-authz/rbac/#referring-to-resources)

@@ -3,7 +3,7 @@ title: Create from a manifest
 concepts: [manifests, gvk vs gvr, restmapper, write verbs]
 ---
 
-## What this stage teaches
+## Core concept
 
 A manifest is **self-describing**: it carries `apiVersion` and `kind`, which is
 why `kubectl create -f` needs no flag saying what is in the file. Your program
@@ -29,7 +29,7 @@ and quietly relocating someone's object is worse than refusing.
 Create is not idempotent. Running it twice gives **409 AlreadyExists**, which
 is the correct behaviour and the thing stage 22 changes.
 
-## Go you'll reach for
+## Go APIs
 
 - `yaml.Unmarshal(data, &obj.Object)` from `sigs.k8s.io/yaml`, into
   `unstructured.Unstructured`.
@@ -54,7 +54,7 @@ Unmarshal into `&obj.Object` (the map), not into `obj` itself. Then check
 confusing mapper error otherwise.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 gvk := obj.GroupVersionKind()
@@ -69,7 +69,7 @@ created, err := dyn.Resource(mapping.Resource).Namespace(target).
 ```
 </details>
 
-## Going deeper
+## Further reading
 
 - [Understanding Kubernetes objects](https://kubernetes.io/docs/concepts/overview/working-with-objects/)
 - [meta.RESTMapping](https://pkg.go.dev/k8s.io/apimachinery/pkg/api/meta#RESTMapping)

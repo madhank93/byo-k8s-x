@@ -3,7 +3,7 @@ title: Delete an object
 concepts: [write verbs, api semantics, finalizers]
 ---
 
-## What this stage teaches
+## Core concept
 
 The first write, and the lesson is that delete is **asynchronous**. The call
 returns when the server has accepted the request and marked the object — not
@@ -19,7 +19,7 @@ Deleting something that does not exist is a **404**, and it should stay an
 error rather than being smoothed into success — the same distinction stage 11
 made for Get.
 
-## Go you'll reach for
+## Go APIs
 
 - `dyn.Resource(gvr).Namespace(ns).Delete(ctx, name, metav1.DeleteOptions{})`.
 - `metav1.DeleteOptions` is where grace period, propagation policy and
@@ -33,7 +33,7 @@ You already resolve a GVR and build a dynamic client; this is one more verb on
 the same resource interface.
 </details>
 
-## Going deeper
+## Further reading
 
 - [Object deletion and garbage collection](https://kubernetes.io/docs/concepts/architecture/garbage-collection/)
 - [Finalizers](https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/)

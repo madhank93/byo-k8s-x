@@ -3,7 +3,7 @@ title: List the pods
 concepts: [typed clients, listing, namespaces]
 ---
 
-## What this stage teaches
+## Core concept
 
 The first real read. A typed clientset gives you a method per resource —
 `CoreV1().Pods(ns).List(...)` — which returns `*corev1.PodList` with real Go
@@ -18,7 +18,7 @@ string means a path without one.
 Every call takes a `context.Context`. It is not decoration: it is the timeout
 and the cancellation for a network request that can hang.
 
-## Go you'll reach for
+## Go APIs
 
 - `kubernetes.NewForConfig(cfg)` — the typed clientset.
 - `cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})`.
@@ -33,6 +33,6 @@ and the cancellation for a network request that can hang.
 pods are `v1` in the core group, which client-go spells `CoreV1()`.
 </details>
 
-## Going deeper
+## Further reading
 
 - [client-go clientset](https://pkg.go.dev/k8s.io/client-go/kubernetes)

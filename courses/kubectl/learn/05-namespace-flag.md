@@ -3,7 +3,7 @@ title: Choose a namespace
 concepts: [namespaces, precedence, cli parsing]
 ---
 
-## What this stage teaches
+## Core concept
 
 Namespace resolution has three steps and the middle one is the trap:
 `--namespace`, then whatever the **current context** carries, then `"default"`.
@@ -20,7 +20,7 @@ program acts in the wrong namespace with no error at all. kubectl accepts flags
 before, between and after its positional arguments. Getting that right needs a
 small loop: parse a run of flags, take one positional, repeat.
 
-## Go you'll reach for
+## Go APIs
 
 - `overrides.Context.Namespace = flagValue` — only when the flag was set;
   an empty override must not beat the context.
@@ -46,6 +46,6 @@ For the parsing: loop while `fs.NArg() > 0` — append `fs.Arg(0)` to your
 positionals, then re-parse `fs.Args()[1:]`.
 </details>
 
-## Going deeper
+## Further reading
 
 - [Namespaces](https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/)

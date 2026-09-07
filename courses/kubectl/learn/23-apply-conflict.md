@@ -3,7 +3,7 @@ title: Two managers, one field
 concepts: [server-side apply, conflicts, errors, ownership]
 ---
 
-## What this stage teaches
+## Core concept
 
 When your apply sets a field another manager already owns, the server answers
 **409 Conflict** and changes nothing. This is the payoff of stage 22: without
@@ -26,7 +26,7 @@ teaches the flag is worth more than one that dumps the status object.
 Forcing means `Force: &true` in the patch options: the server transfers
 ownership of the disputed fields to you.
 
-## Go you'll reach for
+## Go APIs
 
 - `apierrors.IsConflict(err)` from `k8s.io/apimachinery/pkg/api/errors`.
 - `metav1.PatchOptions{FieldManager: "byok8s", Force: &force}` — a `*bool`,
@@ -49,7 +49,7 @@ Add the flag, thread it into `PatchOptions.Force`, and special-case
 automatic force is a policy your caller did not choose.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 if apierrors.IsConflict(err) {
@@ -62,6 +62,6 @@ To see one, have another manager set the field first:
 `kubectl patch ... --field-manager=someone-else`.
 </details>
 
-## Going deeper
+## Further reading
 
 - [Conflicts in server-side apply](https://kubernetes.io/docs/reference/using-api/server-side-apply/#conflicts)

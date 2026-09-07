@@ -176,7 +176,7 @@ Stages 28–30 are different in kind. Everything before them is a JSON request
 against etcd-backed state; those three open a *stream* the apiserver proxies to
 a node. That is why they need a real cluster, and why they are last.
 
-## Going deeper
+## Further reading
 
 - [Kubernetes API concepts](https://kubernetes.io/docs/reference/using-api/api-concepts/)
 - [client-go](https://pkg.go.dev/k8s.io/client-go) and its [examples](https://github.com/kubernetes/client-go/tree/master/examples)
