@@ -69,8 +69,8 @@ byok8s down               # delete the cluster
 
 A stage tells you whether your program behaves; it never tells you why. That
 lives in `courses/kubectl/learn/`: a primer to read before stage 1, and one
-note per stage covering the concept, the client-go you will reach for, a hint
-ladder scaled to the stage's difficulty, and links to the primary sources.
+note per stage covering the core concept, the Go APIs it needs, a hint ladder
+scaled to the stage's difficulty, and further reading.
 
 Hints stay behind `-hints`, because a hint you didn't ask for is a spoiler.
 

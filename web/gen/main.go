@@ -265,7 +265,7 @@ func writePrimer(root, courseDir string, ci courseInfo) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "---\ntitle: %s\ndescription: %s\nsidebar:\n  order: 0\n  label: %s\n---\n\n",
 		js(ci.Name+" — primer"),
-		js("The background behind "+ci.Name+": what the API actually is, and the Go you reach for."),
+		js("The background behind "+ci.Name+": what the API actually is, and the Go APIs it needs."),
 		js("Primer"))
 	fmt.Fprintf(&b, "_Read this before stage 1. Each of the %d stages has its own note — open any row in the [catalog](/catalog/) to read it._\n\n", ci.Total)
 	b.WriteString(body)
