@@ -3,7 +3,7 @@ title: Apply, not create
 concepts: [server-side apply, field managers, declarative config]
 ---
 
-## What this stage teaches
+## Core concept
 
 Apply is not "create if missing, update if present". It is a different claim:
 *these fields should look like this, and I am the one saying so.* The server
@@ -33,7 +33,7 @@ whole mechanism.
 The field manager string is an **identity**, not a label. Two tools that share
 a name share ownership and neither can tell.
 
-## Go you'll reach for
+## Go APIs
 
 - `types.ApplyPatchType` from `k8s.io/apimachinery/pkg/types`.
 - `dyn.Resource(gvr).Namespace(ns).Patch(ctx, name, types.ApplyPatchType, body, metav1.PatchOptions{FieldManager: "byok8s"})`.
@@ -57,7 +57,7 @@ and the body is the whole manifest. Run it twice and diff `managedFields` in
 `-o yaml`; that is the stage's real output.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 body, err := json.Marshal(obj.Object)
@@ -67,7 +67,7 @@ applied, err := dyn.Resource(gvr).Namespace(target).Patch(
 ```
 </details>
 
-## Going deeper
+## Further reading
 
 - [Server-Side Apply](https://kubernetes.io/docs/reference/using-api/server-side-apply/)
 - [managedFields](https://kubernetes.io/docs/reference/using-api/server-side-apply/#field-management)

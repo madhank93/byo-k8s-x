@@ -3,7 +3,7 @@ title: Filter by label
 concepts: [selectors, labels, rest api]
 ---
 
-## What this stage teaches
+## Core concept
 
 Labels are the identifying metadata everything in Kubernetes coordinates
 through: a Service finds its pods by selector, a Deployment owns its
@@ -20,7 +20,7 @@ The syntax is richer than equality: `app=web`, `app!=web`, `tier in (a,b)`,
 `app` (exists), `!app` (does not), comma-separated for AND. You can pass the
 string straight through; client-go parses it server-side.
 
-## Go you'll reach for
+## Go APIs
 
 - `metav1.ListOptions{LabelSelector: s}`.
 - `labels.Parse(s)` if you want to validate before sending.
@@ -39,6 +39,6 @@ Thread the selector down to the `List` call and leave the printing untouched.
 Note that it is only meaningful for List — a Get already names one object.
 </details>
 
-## Going deeper
+## Further reading
 
 - [Labels and selectors](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/)

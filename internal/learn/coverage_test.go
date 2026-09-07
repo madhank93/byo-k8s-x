@@ -43,7 +43,7 @@ func TestEveryStageHasANote(t *testing.T) {
 			t.Errorf("%s: no note", stage)
 			continue
 		}
-		for _, section := range []string{"## What this stage teaches", "## Going deeper"} {
+		for _, section := range []string{"## Core concept", "## Further reading"} {
 			if !strings.Contains(note, section) {
 				t.Errorf("%s: missing %q", stage, section)
 			}

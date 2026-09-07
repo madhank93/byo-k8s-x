@@ -3,7 +3,7 @@ title: Find the cluster
 concepts: [kubeconfig, rest config, clients]
 ---
 
-## What this stage teaches
+## Core concept
 
 Before a client can do anything it has to answer "which server, as whom?", and
 the answer is never hardcoded. A kubeconfig is a merge of files, each holding
@@ -15,7 +15,7 @@ you a tool that works on your laptop and nowhere else.
 `$KUBECONFIG` is the part people miss. It is colon-separated and merged left to
 right, which is how anyone juggling several clusters actually works.
 
-## Go you'll reach for
+## Go APIs
 
 - `clientcmd.NewDefaultClientConfigLoadingRules()` — the rules themselves.
 - `clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)` —
@@ -31,7 +31,7 @@ You need `k8s.io/client-go/tools/clientcmd`, and you need exactly two calls
 from it before you have something with a `.Host` on it.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 rules := clientcmd.NewDefaultClientConfigLoadingRules()
@@ -40,7 +40,7 @@ cfg, err := cc.ClientConfig() // *rest.Config
 ```
 </details>
 
-## Going deeper
+## Further reading
 
 - [Organizing cluster access with kubeconfig](https://kubernetes.io/docs/concepts/configuration/organize-cluster-access-kubeconfig/)
 - [clientcmd](https://pkg.go.dev/k8s.io/client-go/tools/clientcmd)

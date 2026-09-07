@@ -3,7 +3,7 @@ title: Keep watching
 concepts: [watch, resourceversion, controllers, streaming]
 ---
 
-## What this stage teaches
+## Core concept
 
 A watch is a long-lived HTTP response the server keeps appending to, one JSON
 event per change: `ADDED`, `MODIFIED`, `DELETED`, `BOOKMARK`, `ERROR`. The
@@ -34,7 +34,7 @@ One more sharp edge: an `ERROR` event's `Object` is a `*metav1.Status`, not
 your resource. A type assertion that assumes otherwise panics the first time a
 watch expires — which is exactly the moment you were not watching.
 
-## Go you'll reach for
+## Go APIs
 
 - `dyn.Resource(gvr).Namespace(ns).Watch(ctx, metav1.ListOptions{ResourceVersion: rv})`.
 - `list.GetResourceVersion()` — the collection's version, not any item's.
@@ -57,7 +57,7 @@ Print the list as usual, then pass `list.GetResourceVersion()` into the watch's
 match the snapshot.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 obj, ok := event.Object.(*unstructured.Unstructured)
@@ -70,7 +70,7 @@ For production code you would also handle `410 Gone` by relisting; here,
 noticing why it happens is enough.
 </details>
 
-## Going deeper
+## Further reading
 
 - [Efficient detection of changes](https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes)
 - [watch.Interface](https://pkg.go.dev/k8s.io/apimachinery/pkg/watch#Interface)

@@ -3,7 +3,7 @@ title: Ask the server what it is
 concepts: [discovery, rest api, clients]
 ---
 
-## What this stage teaches
+## Core concept
 
 This is the first request that leaves your machine, and it deliberately goes
 through the **discovery client** rather than a typed one. `/version` belongs to
@@ -15,7 +15,7 @@ It doubles as a connectivity check. If credentials are wrong or the server is
 unreachable, you find out here, on a call that reads nothing and needs no
 permissions beyond being authenticated.
 
-## Go you'll reach for
+## Go APIs
 
 - `discovery.NewDiscoveryClientForConfig(cfg)` — a client built from the config
   you already resolved.
@@ -30,7 +30,7 @@ The client you want is not `kubernetes.NewForConfig`. Ask yourself what typed
 object `/version` would even return.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 dc, err := discovery.NewDiscoveryClientForConfig(cfg)
@@ -39,7 +39,7 @@ fmt.Printf("Server Version: %s\n", v.GitVersion)
 ```
 </details>
 
-## Going deeper
+## Further reading
 
 - [discovery](https://pkg.go.dev/k8s.io/client-go/discovery)
 - [API concepts](https://kubernetes.io/docs/reference/using-api/api-concepts/)

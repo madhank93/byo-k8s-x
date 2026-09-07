@@ -3,7 +3,7 @@ title: Attach its events
 concepts: [events, field selectors, object references]
 ---
 
-## What this stage teaches
+## Core concept
 
 Events are the cluster's explanation of *why*, and the surprise is that they
 are not part of the object they describe. An Event is its own resource in its
@@ -31,7 +31,7 @@ events — a genuinely misleading bug, since the events would look plausible.
 Sort by timestamp: events are a narrative, and a narrative out of order is
 worse than none.
 
-## Go you'll reach for
+## Go APIs
 
 - `fields.AndSelectors(fields.OneTermEqualSelector("involvedObject.name", n), ...)`
   and `.String()` to render it for the request.
@@ -53,7 +53,7 @@ Build the selector from name AND uid, list, sort by `LastTimestamp`, and print
 `<none>` when the list is empty rather than an empty table.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 selector := fields.AndSelectors(
@@ -66,7 +66,7 @@ To generate some, create a pod with an image that does not exist and describe
 it.
 </details>
 
-## Going deeper
+## Further reading
 
 - [Event v1 core](https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/event-v1/)
 - [fields](https://pkg.go.dev/k8s.io/apimachinery/pkg/fields)

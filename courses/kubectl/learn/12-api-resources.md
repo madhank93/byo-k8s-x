@@ -3,7 +3,7 @@ title: Ask what the server serves
 concepts: [discovery, api groups, resources]
 ---
 
-## What this stage teaches
+## Core concept
 
 This is the request that makes a client *general*. Nothing in your program
 knows what a Pod is: the server reports its groups, the versions in each, and
@@ -25,7 +25,7 @@ Subresources come back in this list too, spelled `pods/log`, `pods/exec`. They
 are addressed through their parent and are not resources in their own right, so
 filter out anything containing a slash.
 
-## Go you'll reach for
+## Go APIs
 
 - `dc.ServerPreferredResources()` — `([]*metav1.APIResourceList, error)`, and
   yes, both can be non-empty.
@@ -52,7 +52,7 @@ if err != nil {
 Then one row per resource whose `Name` has no `/` in it.
 </details>
 
-## Going deeper
+## Further reading
 
 - [API groups and versioning](https://kubernetes.io/docs/reference/using-api/#api-groups)
 - [discovery.DiscoveryInterface](https://pkg.go.dev/k8s.io/client-go/discovery#DiscoveryInterface)

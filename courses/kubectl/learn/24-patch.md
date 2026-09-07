@@ -3,7 +3,7 @@ title: Change one field
 concepts: [patch types, write verbs, concurrency]
 ---
 
-## What this stage teaches
+## Core concept
 
 Patch is the smallest write verb: the body names only what changes, so nothing
 has to be read first and there is no `resourceVersion` to conflict on. Two
@@ -25,7 +25,7 @@ keys come from the Go struct tags of the built-in types, so the apiserver has
 no strategy for a CRD — a strategic patch against a custom resource is
 rejected, and merge patch is what works there.
 
-## Go you'll reach for
+## Go APIs
 
 - `types.MergePatchType`, `types.StrategicMergePatchType`, `types.JSONPatchType`.
 - `dyn.Resource(gvr).Namespace(ns).Patch(ctx, name, types.MergePatchType, []byte(body), metav1.PatchOptions{})`.
@@ -46,7 +46,7 @@ single container in a multi-container pod to see the list-replacement footgun
 first-hand.
 </details>
 
-## Going deeper
+## Further reading
 
 - [Update API objects in place using kubectl patch](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/update-api-object-kubectl-patch/)
 - [RFC 7386 — JSON Merge Patch](https://datatracker.ietf.org/doc/html/rfc7386)
