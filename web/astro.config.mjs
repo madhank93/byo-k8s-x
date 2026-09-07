@@ -48,8 +48,8 @@ export default defineConfig({
 			],
 			sidebar: [
 				{ label: 'Getting started', slug: 'getting-started' },
+				{ label: 'Primer', link: '/learn/kubectl/' },
 				{ label: 'Catalog', link: '/catalog/' },
-				{ label: 'Learn', items: [{ autogenerate: { directory: 'learn' } }] },
 			],
 		}),
 	],

@@ -41,8 +41,9 @@ const multiCourse = courseSlugs.length > 1;
   }}
 >
   <p class="cat-intro">
-    All {total} stages in one place — filter by difficulty or verification status, or search. Click
-    any row for the stage's concept note and the diff the reference solution adds at that stage.
+    All {total} stages in one place — filter by difficulty or verification status, or search by
+    stage, description or the concept it teaches. Click any row for the stage's note and the diff
+    the reference solution adds at that stage.
   </p>
 
   <ul class="cat-stats" role="list">
@@ -87,6 +88,7 @@ const multiCourse = courseSlugs.length > 1;
       <label class="fl" for="searchBox">Search</label>
       <input id="searchBox" type="search" placeholder="stage, concept, description…" autocomplete="off" spellcheck="false" />
     </div>
+    <button class="pill" id="foldAll" aria-label="Collapse every course">Collapse all</button>
     <span class="rc" id="rc">{total} of {total}</span>
   </div>
 
@@ -109,23 +111,24 @@ const multiCourse = courseSlugs.length > 1;
             if (e.course !== last) {
               last = e.course;
               rows.push(
-                <tr class="course-row" data-course={e.course} data-label={c.name} data-learn={c.learn}
-                    tabindex="0" role="button" aria-expanded="false">
+                <tr class="course-row" data-course={e.course}
+                    tabindex="0" role="button" aria-expanded="true">
                   <td colspan="4">
+                    <span class="texp" aria-hidden="true">▾</span>
                     <span class="tdot" style={`background:${c.color}`}></span>
                     {c.name}
                     <span class="ttier">{verifiedCountFor(e.course)}/{countFor(e.course)} verified</span>
-                    <span class="texp">▸</span>
                   </td>
                 </tr>
               );
             }
             const slug = `${e.course}-${e.slug}`;
-            const search = `${e.course} ${c.name} ${e.title} ${e.slug} ${e.difficulty} ${e.description}`.toLowerCase();
+            const search = `${e.course} ${c.name} ${e.title} ${e.slug} ${e.difficulty} ${e.description} ${e.concepts.join(' ')}`.toLowerCase();
             rows.push(
               <tr class="ex-row" data-i={i} data-slug={slug} data-course={e.course}
                   data-verified={e.verified ? '1' : '0'} data-diff={e.difficulty} data-search={search}
                   data-desc={e.description} data-source={e.sourcePath}
+                  data-concepts={e.concepts.join('|')}
                   data-index={e.index} data-title={e.title}
                   tabindex="0" role="button">
                 <td><span class={`badge ${e.verified ? 'b-yes' : 'b-no'}`}>{e.verified ? '✓' : '—'}</span></td>
@@ -142,14 +145,6 @@ const multiCourse = courseSlugs.length > 1;
     <div class="cat-empty" id="catEmpty" hidden>No stages match — clear the search or change filters.</div>
   </div>
 
-  <!-- Floating "what this course teaches" panel. Fixed-positioned so it shows
-       even when its course header row is pinned by position:sticky. -->
-  <div id="coursePop" class="topic-pop" hidden role="dialog" aria-label="Course details">
-    <button class="topic-pop-x" id="coursePopX" aria-label="Close">✕</button>
-    <h3 id="coursePopTitle"></h3>
-    <p id="coursePopLearn"></p>
-  </div>
-
   <dialog id="catModal" class="cat-modal" aria-labelledby="mTitle">
     <article>
       <header>
@@ -161,6 +156,7 @@ const multiCourse = courseSlugs.length > 1;
         <button class="m-close" id="mClose" aria-label="Close">✕</button>
       </header>
       <div class="m-body">
+        <ul class="m-tags" id="mTags" role="list"></ul>
         <p class="m-desc" id="mDesc"></p>
         <div class="m-run">
           <span class="m-run-l">▶ Run it</span>
@@ -243,21 +239,10 @@ const multiCourse = courseSlugs.length > 1;
     .course-row:hover td { background: var(--sl-color-gray-5); }
     .tdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 0.5rem; }
     .ttier { margin-left: 0.6rem; font-weight: 400; color: var(--sl-color-gray-3); text-transform: none; letter-spacing: 0; }
-    .texp { float: right; color: var(--sl-color-gray-3); transition: transform 0.12s; }
-    .course-row[aria-expanded="true"] .texp { transform: rotate(90deg); color: var(--sl-color-accent-high); }
+    .texp { display: inline-block; width: 0.9rem; color: var(--sl-color-gray-3);
+      transition: transform 0.12s; }
+    .course-row[aria-expanded="false"] .texp { transform: rotate(-90deg); }
 
-    .topic-pop { position: fixed; z-index: 5; box-sizing: border-box;
-      background: var(--sl-color-bg); border: 1px solid var(--sl-color-accent);
-      border-radius: 0.5rem; box-shadow: 0 12px 32px rgb(0 0 0 / 0.4);
-      padding: 0.75rem 2.2rem 0.85rem 0.9rem;
-      max-height: min(22rem, 55vh); overflow-y: auto; }
-    .topic-pop h3 { margin: 0 0 0.35rem; font-size: 0.8rem; text-transform: uppercase;
-      letter-spacing: 0.05em; color: var(--sl-color-accent-high); }
-    .topic-pop p { margin: 0; font-size: 0.84rem; color: var(--sl-color-gray-1); line-height: 1.6; }
-    .topic-pop code { font-size: 0.78rem; }
-    .topic-pop-x { position: absolute; top: 0.5rem; right: 0.6rem; background: none; border: 0;
-      color: var(--sl-color-gray-3); font-size: 0.9rem; cursor: pointer; line-height: 1; padding: 0.2rem; }
-    .topic-pop-x:hover { color: var(--sl-color-white); }
 
     .tchip { display: inline-block; font-size: 0.66rem; font-weight: 700; padding: 0.12rem 0.4rem; border-radius: 0.3rem; color: #fff; }
     .slug { font-family: var(--sl-font-mono, monospace); font-size: 0.82rem; color: var(--sl-color-gray-1); }
@@ -295,6 +280,11 @@ const multiCourse = courseSlugs.length > 1;
     .cat-modal .m-close:hover { color: var(--sl-color-white); background: var(--sl-color-gray-6); }
 
     .cat-modal .m-body { overflow-y: auto; padding: 1.1rem 1.4rem 1.4rem; }
+    .cat-modal .m-tags { display: flex; flex-wrap: wrap; gap: 0.3rem; list-style: none;
+      padding: 0; margin: 0 0 0.7rem; }
+    .cat-modal .m-tags :global(li) { font-size: 0.68rem; line-height: 1.5;
+      color: var(--sl-color-gray-2); background: var(--sl-color-gray-6);
+      border: 1px solid var(--sl-color-gray-5); border-radius: 999px; padding: 0.1rem 0.55rem; }
     .cat-modal .m-desc { margin: 0 0 0.8rem; color: var(--sl-color-gray-1); font-size: 0.92rem; line-height: 1.6; }
     .cat-modal .m-run { background: color-mix(in oklab, var(--sl-color-accent) 10%, var(--sl-color-gray-6));
       border: 1px solid color-mix(in oklab, var(--sl-color-accent) 30%, transparent);
@@ -344,6 +334,9 @@ const multiCourse = courseSlugs.length > 1;
     const courseRows = Array.from(body.querySelectorAll<HTMLTableRowElement>('tr.course-row'));
     const total = exRows.length;
     let status = 'all';
+    // Courses folded shut by the reader. A search overrides the fold, so a
+    // query never returns "no results" for rows that are merely collapsed.
+    const collapsed = new Set<string>();
 
     const thead = document.querySelector<HTMLElement>('.cat-table thead')!;
     const syncFilterHeight = () => {
@@ -359,6 +352,11 @@ const multiCourse = courseSlugs.length > 1;
       const q = search.value.toLowerCase().trim();
       const course = courseSel?.value ?? 'all';
       const level = diffSel.value;
+      const folded = (c?: string) => !q && !!c && collapsed.has(c);
+      // Courses the filters still leave something to show. Counted before
+      // folding is applied, so a folded course keeps its header — but only
+      // while it would have had rows.
+      const matched = new Set<string>();
       let shown = 0;
       exRows.forEach((row) => {
         const statusOk = status === 'all' || (status === 'verified' ? row.dataset.verified === '1' : row.dataset.verified === '0');
@@ -366,62 +364,47 @@ const multiCourse = courseSlugs.length > 1;
         const levelOk = level === 'all' || row.dataset.diff === level;
         const qOk = !q || (row.dataset.search || '').includes(q);
         const ok = statusOk && courseOk && levelOk && qOk;
-        row.hidden = !ok;
-        if (ok) shown++;
+        // Collapsed rows still count as matches; folding is a view, not a filter.
+        row.hidden = !ok || folded(row.dataset.course);
+        if (ok) { shown++; matched.add(row.dataset.course!); }
       });
       courseRows.forEach((tr) => {
-        const c = tr.dataset.course;
-        const any = exRows.some((r) => r.dataset.course === c && !r.hidden);
-        tr.hidden = !any;
-        if (!any && tr.getAttribute('aria-expanded') === 'true') closeCoursePop();
+        const c = tr.dataset.course!;
+        tr.hidden = !matched.has(c);
+        tr.setAttribute('aria-expanded', String(!folded(c)));
       });
       rc.textContent = `${shown} of ${total}`;
       empty.hidden = shown !== 0;
     }
 
-    // ---- course narrative popover ----
-    const coursePop = document.getElementById('coursePop')!;
-    const coursePopTitle = document.getElementById('coursePopTitle')!;
-    const coursePopLearn = document.getElementById('coursePopLearn')!;
-    let coursePopOwner: HTMLTableRowElement | null = null;
+    // ---- fold / unfold a course ----
+    const foldAll = document.getElementById('foldAll') as HTMLButtonElement;
 
-    function positionCoursePop(tr: HTMLTableRowElement) {
-      const cell = tr.querySelector('td') ?? tr;
-      const r = cell.getBoundingClientRect();
-      coursePop.style.top = `${r.bottom + 4}px`;
-      coursePop.style.left = `${r.left}px`;
-      coursePop.style.width = `${r.width}px`;
+    function syncFoldAll() {
+      const allFolded = courseRows.every((tr) => collapsed.has(tr.dataset.course!));
+      foldAll.textContent = allFolded ? 'Expand all' : 'Collapse all';
+      foldAll.setAttribute('aria-label', allFolded ? 'Expand every course' : 'Collapse every course');
     }
-    function closeCoursePop() {
-      coursePop.hidden = true;
-      if (coursePopOwner) coursePopOwner.setAttribute('aria-expanded', 'false');
-      coursePopOwner = null;
-    }
-    function openCoursePop(tr: HTMLTableRowElement) {
-      coursePopTitle.textContent = tr.dataset.label || '';
-      coursePopLearn.innerHTML = tr.dataset.learn ? `<b>You learn:</b> ${tr.dataset.learn}` : 'No course notes yet.';
-      positionCoursePop(tr);
-      coursePop.hidden = false;
-      coursePopOwner = tr;
-      tr.setAttribute('aria-expanded', 'true');
-    }
+
     courseRows.forEach((tr) => {
-      const toggle = () => (coursePopOwner === tr ? closeCoursePop() : openCoursePop(tr));
+      const toggle = () => {
+        const c = tr.dataset.course!;
+        collapsed.has(c) ? collapsed.delete(c) : collapsed.add(c);
+        apply();
+        syncFoldAll();
+      };
       tr.addEventListener('click', toggle);
       tr.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
       });
     });
-    document.getElementById('coursePopX')!.addEventListener('click', closeCoursePop);
-    window.addEventListener('scroll', () => { if (coursePopOwner) positionCoursePop(coursePopOwner); }, { passive: true });
-    window.addEventListener('resize', () => { if (coursePopOwner) positionCoursePop(coursePopOwner); });
-    document.addEventListener('click', (e) => {
-      if (!coursePopOwner) return;
-      const t = e.target as Node;
-      if (!coursePop.contains(t) && !coursePopOwner.contains(t)) closeCoursePop();
-    });
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && coursePopOwner) closeCoursePop();
+
+    foldAll.addEventListener('click', () => {
+      const allFolded = courseRows.every((t) => collapsed.has(t.dataset.course!));
+      collapsed.clear();
+      if (!allFolded) courseRows.forEach((t) => collapsed.add(t.dataset.course!));
+      apply();
+      syncFoldAll();
     });
 
     // ---- modal ----
@@ -430,6 +413,7 @@ const multiCourse = courseSlugs.length > 1;
     const mCourse = document.getElementById('mCourse')!;
     const mTitle = document.getElementById('mTitle')!;
     const mDesc = document.getElementById('mDesc')!;
+    const mTags = document.getElementById('mTags')!;
     const mRunCmd = document.getElementById('mRunCmd')!;
     const mLinks = document.getElementById('mLinks')!;
     const mDetailWrap = document.getElementById('mDetailWrap')!;
@@ -467,6 +451,13 @@ const multiCourse = courseSlugs.length > 1;
       mCourse.textContent = d.course!;
       mCourse.setAttribute('style', `background:${courseColor}`);
       mTitle.textContent = `${d.index}. ${d.title}`;
+      mTags.replaceChildren(
+        ...(d.concepts ? d.concepts.split('|') : []).map((t) => {
+          const li = document.createElement('li');
+          li.textContent = t;
+          return li;
+        })
+      );
       mDesc.textContent = d.desc || '';
       mRunCmd.textContent = `byok8s run ${d.index}`;
 
@@ -555,9 +546,6 @@ const multiCourse = courseSlugs.length > 1;
     diffSel.addEventListener('change', apply);
     courseSel?.addEventListener('change', apply);
     search.addEventListener('input', apply);
-    document.addEventListener('keydown', (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); search.focus(); search.select(); }
-    });
 
     // Deep links: /catalog/?stage=<course>-<slug> opens straight into the
     // modal; /catalog/?course=<course> preselects the course filter.
