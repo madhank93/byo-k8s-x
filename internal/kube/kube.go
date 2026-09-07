@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,8 +19,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -65,13 +69,20 @@ func RESTConfig() (*rest.Config, error) {
 	return loader.ClientConfig()
 }
 
-// Begin gives a stage a clean namespace named bko-<stage>.
+// Begin gives a stage a clean namespace named bko-<course>-<stage>.
+//
+// The course is part of the name because stage slugs are only unique within a
+// course: two courses may both have a stage called "watch", and they must not
+// land in the same namespace.
 //
 // It deletes any namespace left over from a previous run first — and strips
 // finalizers off its contents before deleting, because a stage that failed
 // midway can leave an object whose finalizer nothing will ever clear, which
 // wedges the namespace in Terminating forever and breaks every later run.
-func Begin(ctx context.Context, stage string, timeout time.Duration) (*Env, context.CancelFunc, error) {
+//
+// The sweep covers every namespaced kind the API server knows about, custom
+// ones included: a course that teaches finalizers will leave some behind.
+func Begin(ctx context.Context, course, stage string, timeout time.Duration) (*Env, context.CancelFunc, error) {
 	cfg, err := RESTConfig()
 	if err != nil {
 		return nil, nil, err
@@ -82,18 +93,18 @@ func Begin(ctx context.Context, stage string, timeout time.Duration) (*Env, cont
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
-	ns := "bko-" + stage
+	ns := "bko-" + course + "-" + stage
 
-	if err := reset(ctx, cs, ns); err != nil {
+	if err := reset(ctx, cs, cfg, ns); err != nil {
 		cancel()
 		return nil, nil, err
 	}
 	return &Env{Client: cs, Config: cfg, Namespace: ns}, cancel, nil
 }
 
-func reset(ctx context.Context, cs kubernetes.Interface, ns string) error {
+func reset(ctx context.Context, cs kubernetes.Interface, cfg *rest.Config, ns string) error {
 	if _, err := cs.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{}); err == nil {
-		if err := clearFinalizers(ctx, cs, ns); err != nil {
+		if err := clearFinalizers(ctx, cs, cfg, ns); err != nil {
 			return err
 		}
 		if err := cs.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
@@ -124,22 +135,52 @@ func reset(ctx context.Context, cs kubernetes.Interface, ns string) error {
 // clearFinalizers strips finalizers from the ConfigMaps in a namespace about to
 // be deleted. Stages that teach finalizers deliberately leave one behind when
 // they fail, and without this the namespace never finishes terminating.
-func clearFinalizers(ctx context.Context, cs kubernetes.Interface, ns string) error {
-	cms, err := cs.CoreV1().ConfigMaps(ns).List(ctx, metav1.ListOptions{})
+func clearFinalizers(ctx context.Context, cs kubernetes.Interface, cfg *rest.Config, ns string) error {
+	disco, err := discovery.NewDiscoveryClientForConfig(cfg)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("list configmaps in %s: %w", ns, err)
+		return fmt.Errorf("discovery client: %w", err)
 	}
-	for i := range cms.Items {
-		cm := &cms.Items[i]
-		if len(cm.Finalizers) == 0 {
+	// Listing every kind touches deprecated ones, and their warnings say
+	// nothing about the course the learner is running.
+	quiet := rest.CopyConfig(cfg)
+	quiet.WarningHandler = rest.NoWarnings{}
+	dyn, err := dynamic.NewForConfig(quiet)
+	if err != nil {
+		return fmt.Errorf("dynamic client: %w", err)
+	}
+
+	// Partial discovery is normal — an aggregated API can be unreachable —
+	// and everything that did resolve is still worth clearing.
+	lists, err := disco.ServerPreferredNamespacedResources()
+	if err != nil && len(lists) == 0 {
+		return fmt.Errorf("discover namespaced resources: %w", err)
+	}
+
+	for _, list := range lists {
+		gv, err := schema.ParseGroupVersion(list.GroupVersion)
+		if err != nil {
 			continue
 		}
-		cm.Finalizers = nil
-		if _, err := cs.CoreV1().ConfigMaps(ns).Update(ctx, cm, metav1.UpdateOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("clear finalizers on %s/%s: %w", ns, cm.Name, err)
+		for _, r := range list.APIResources {
+			if !slices.Contains(r.Verbs, "list") || !slices.Contains(r.Verbs, "patch") {
+				continue
+			}
+			gvr := gv.WithResource(r.Name)
+			items, err := dyn.Resource(gvr).Namespace(ns).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				continue
+			}
+			for i := range items.Items {
+				obj := &items.Items[i]
+				if len(obj.GetFinalizers()) == 0 {
+					continue
+				}
+				if _, err := dyn.Resource(gvr).Namespace(ns).Patch(ctx, obj.GetName(),
+					types.MergePatchType, []byte(`{"metadata":{"finalizers":null}}`),
+					metav1.PatchOptions{}); err != nil && !apierrors.IsNotFound(err) {
+					return fmt.Errorf("clear finalizers on %s %s/%s: %w", r.Name, ns, obj.GetName(), err)
+				}
+			}
 		}
 	}
 	return nil

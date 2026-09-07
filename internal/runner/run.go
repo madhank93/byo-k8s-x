@@ -131,3 +131,124 @@ func (c *capped) String() string {
 	defer c.mu.Unlock()
 	return c.buf.String()
 }
+
+// Process is the learner's program left running while a stage changes the
+// cluster underneath it. A controller, a webhook and a scheduler are all
+// long-lived, so their stages start the program, act, wait for the cluster to
+// converge, and only then stop it — which is a different shape from Invoke,
+// where the program's exit is the whole answer.
+type Process struct {
+	cmd    *exec.Cmd
+	stdout *capped
+	stderr *capped
+	done   chan error
+	cancel context.CancelFunc
+
+	mu     sync.Mutex
+	result *Result
+}
+
+// Start launches the built binary and returns once it is running. The caller
+// must Stop it; a stage that returns early without stopping leaves a program
+// holding watches against the cluster.
+func Start(ctx context.Context, bin string, env []string, args ...string) (*Process, error) {
+	ctx, cancel := context.WithCancel(ctx)
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
+	p := &Process{cmd: cmd, stdout: &capped{}, stderr: &capped{}, done: make(chan error, 1), cancel: cancel}
+	cmd.Stdout, cmd.Stderr = p.stdout, p.stderr
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 3 * time.Second
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("starting the program: %w", err)
+	}
+	go func() { p.done <- cmd.Wait() }()
+	return p, nil
+}
+
+// Stdout and Stderr are what the program has printed so far. They are safe to
+// read while it is still running.
+func (p *Process) Stdout() string { return p.stdout.String() }
+
+// Stderr is the program's error stream so far. A stage judges on stdout and
+// the state of the cluster; stderr is for the failure message, because
+// client-go logs warnings there on entirely successful runs.
+func (p *Process) Stderr() string { return p.stderr.String() }
+
+// Exited reports whether the program has already stopped on its own, which for
+// a long-running program is a failure the stage should name rather than wait
+// out.
+func (p *Process) Exited() (bool, *Result) {
+	select {
+	case err := <-p.done:
+		return true, p.finish(err)
+	default:
+		return false, nil
+	}
+}
+
+// Stop asks the program to shut down the way Kubernetes would: SIGTERM to the
+// whole process group, then SIGKILL if it outstays the grace period. The
+// Result carries everything it printed, so a stage can assert on what it said
+// on the way out.
+func (p *Process) Stop(grace time.Duration) *Result {
+	defer p.cancel()
+
+	// It may have exited already — on its own, or through an earlier Exited
+	// call that drained the channel.
+	p.mu.Lock()
+	cached := p.result
+	p.mu.Unlock()
+	if cached != nil {
+		return cached
+	}
+
+	if p.cmd.Process != nil {
+		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGTERM)
+	}
+	select {
+	case err := <-p.done:
+		return p.finish(err)
+	case <-time.After(grace):
+	}
+	if p.cmd.Process != nil {
+		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+	}
+	select {
+	case err := <-p.done:
+		return p.finish(err)
+	case <-time.After(3 * time.Second):
+		return &Result{Stdout: p.Stdout(), Stderr: p.Stderr(), ExitCode: -1}
+	}
+}
+
+// finish records the exit once, so Exited followed by Stop returns the same
+// answer rather than blocking on a channel that has already been drained.
+func (p *Process) finish(err error) *Result {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.result != nil {
+		return p.result
+	}
+	res := &Result{Stdout: p.Stdout(), Stderr: p.Stderr()}
+	var exit *exec.ExitError
+	if err != nil && asExitError(err, &exit) {
+		res.ExitCode = exit.ExitCode()
+	} else if err != nil {
+		res.ExitCode = -1
+	}
+	p.result = res
+	return res
+}

@@ -23,17 +23,14 @@ import (
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
 	"github.com/madhank93/byo-k8s-x/internal/runner"
+	"github.com/madhank93/byo-k8s-x/internal/stages"
 )
 
-// StageTimeout bounds one stage. Generous, because a cold cluster answering
-// its first request is slower than any later one.
-const StageTimeout = 90 * time.Second
+// StageTimeout bounds one stage.
+const StageTimeout = stages.Timeout
 
-// Stage is one gradable step.
-type Stage struct {
-	Slug string
-	Run  func(ctx context.Context, env *kube.Env, bin string) error
-}
+// Stage is one gradable step, in the shape cmd/tester dispatches on.
+type Stage = stages.Stage
 
 var registry = map[string]Stage{}
 
