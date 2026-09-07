@@ -1,0 +1,89 @@
+slug: controller
+name: Build your own controller
+language: go
+entrypoint: main.go
+stages:
+  - slug: install-crd
+    name: Teach the cluster a new kind
+    difficulty: medium
+  - slug: crd-schema
+    name: Give the kind a schema
+    difficulty: medium
+  - slug: list-then-watch
+    name: List, then watch from there
+    difficulty: medium
+  - slug: shared-informer
+    name: Let an informer keep the cache
+    difficulty: medium
+  - slug: lister
+    name: Read from the cache
+    difficulty: easy
+  - slug: workqueue
+    name: Queue keys, not objects
+    difficulty: medium
+  - slug: reconcile
+    name: Reconcile, don't react
+    difficulty: medium
+  - slug: create-child
+    name: Create the Deployment
+    difficulty: medium
+  - slug: owner-references
+    name: Own what you create
+    difficulty: medium
+  - slug: adopt-existing
+    name: Adopt what is already there
+    difficulty: medium
+  - slug: repair-drift
+    name: Put back what drifts
+    difficulty: medium
+  - slug: update-spec
+    name: Roll out a spec change
+    difficulty: easy
+  - slug: second-child
+    name: Add the Service
+    difficulty: easy
+  - slug: requeue-on-error
+    name: Retry instead of dying
+    difficulty: medium
+  - slug: requeue-after
+    name: Reconcile on a timer
+    difficulty: medium
+  - slug: paused-annotation
+    name: Let someone pause you
+    difficulty: easy
+  - slug: status-subresource
+    name: Report what you did
+    difficulty: medium
+  - slug: conditions
+    name: Say what Ready means
+    difficulty: medium
+  - slug: finalizer
+    name: Clean up before you let go
+    difficulty: hard
+  - slug: conflict-retry
+    name: Lose a race and recover
+    difficulty: hard
+  - slug: server-side-apply
+    name: Apply as a field manager
+    difficulty: hard
+  - slug: secondary-watch
+    name: Watch what you own
+    difficulty: medium
+  - slug: foreign-children
+    name: Leave other people's objects alone
+    difficulty: medium
+  - slug: events
+    name: Record events
+    difficulty: medium
+  - slug: metrics
+    name: Expose the loop's metrics
+    difficulty: easy
+  - slug: health-probes
+    name: Answer healthz and readyz
+    difficulty: easy
+  - slug: leader-election
+    name: Elect a leader
+    difficulty: hard
+  - slug: graceful-shutdown
+    name: Shut down cleanly
+    difficulty: medium

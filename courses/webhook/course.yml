@@ -1,0 +1,65 @@
+slug: webhook
+name: Build your own admission webhook
+language: go
+entrypoint: main.go
+stages:
+  - slug: serve-tls
+    name: Serve HTTPS the API server will trust
+    difficulty: medium
+  - slug: admission-review
+    name: Read an AdmissionReview, answer with one
+    difficulty: medium
+  - slug: register-validating
+    name: Register yourself with the cluster
+    difficulty: medium
+  - slug: deny
+    name: Reject what breaks the rule
+    difficulty: easy
+  - slug: uid-echo
+    name: Echo the UID, or the answer is discarded
+    difficulty: easy
+  - slug: rules-scope
+    name: Ask only for the objects you judge
+    difficulty: medium
+  - slug: namespace-selector
+    name: Leave other namespaces alone
+    difficulty: medium
+  - slug: object-selector
+    name: Narrow by label on the object itself
+    difficulty: easy
+  - slug: mutate-patch
+    name: Change an object with a JSON patch
+    difficulty: hard
+  - slug: defaulting
+    name: Fill in what was left out
+    difficulty: medium
+  - slug: sidecar-inject
+    name: Add a container nobody asked for
+    difficulty: hard
+  - slug: dry-run
+    name: Honour a dry run, change nothing
+    difficulty: medium
+  - slug: failure-policy
+    name: Decide what happens when you are down
+    difficulty: medium
+  - slug: timeout
+    name: Answer inside the deadline, or be one
+    difficulty: medium
+  - slug: reinvocation
+    name: Run again after another webhook has been
+    difficulty: hard
+  - slug: cert-rotation
+    name: Replace the certificate without dropping a request
+    difficulty: hard
+  - slug: audit-annotations
+    name: Say why, where an auditor will read it
+    difficulty: easy
+  - slug: match-conditions
+    name: Filter with CEL before the request reaches you
+    difficulty: medium
+  - slug: validating-admission-policy
+    name: The same rule, with no webhook at all
+    difficulty: hard
+  - slug: self-exclusion
+    name: Never gate the namespace you run in
+    difficulty: medium

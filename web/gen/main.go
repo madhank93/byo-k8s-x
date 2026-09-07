@@ -16,8 +16,6 @@ import (
 	"regexp"
 	"strings"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/madhank93/byo-k8s-x/internal/course"
 	"github.com/madhank93/byo-k8s-x/internal/learn"
 )
@@ -35,15 +33,7 @@ const (
 // first, because kubectl is the course this repo is built around.
 var courseColors = []string{
 	"#326ce5", "#4fa86d", "#d29922", "#9b5de5", "#e36f0e",
-}
-
-// registry is courses.yml: every course this repo ships, in the order the
-// site should present them.
-type registry struct {
-	Entries []struct {
-		Slug string `yaml:"slug"`
-		Name string `yaml:"name"`
-	} `yaml:"entries"`
+	"#00a6a6", "#c9184a", "#5a7d9a", "#7f8c00", "#b5179e",
 }
 
 type stageEntry struct {
@@ -56,7 +46,9 @@ type stageEntry struct {
 	Difficulty  string
 	Description string
 	Verified    bool
-	SourcePath  string // repo-relative path to the snapshotted main.go, if verified
+	Language    string // the code fence a snapshot renders in
+	Entrypoint  string // the one file a snapshot holds
+	SourcePath  string // repo-relative path to the snapshotted entrypoint, if verified
 	PrevPath    string // repo-relative path to the previous stage's snapshot, if any
 	Concepts    []string
 }
@@ -66,8 +58,19 @@ type courseInfo struct {
 	Name     string
 	Color    string
 	Learn    string
+	Language string
 	Total    int
 	Verified int
+}
+
+// plannedInfo is a course the ladder names but nobody has authored yet. It has
+// no directory to load, so it never reaches the stage table — the catalog
+// lists it separately, which is how the whole ladder stays visible.
+type plannedInfo struct {
+	Slug  string
+	Name  string
+	Tier  string
+	Blurb string
 }
 
 func main() {
@@ -82,9 +85,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	reg, err := loadRegistry(root)
+	reg, err := course.LoadRegistry(root)
 	if err != nil {
 		return err
+	}
+	if len(reg.Entries) == 0 {
+		return fmt.Errorf("courses.yml lists no courses")
 	}
 
 	// Both trees are regenerated wholesale, so clear them first: a renamed
@@ -100,8 +106,13 @@ func run() error {
 
 	var stages []stageEntry
 	var courses []courseInfo
+	var planned []plannedInfo
 
-	for i, entry := range reg.Entries {
+	for _, entry := range reg.Entries {
+		if !entry.Shipped() {
+			planned = append(planned, plannedInfo{Slug: entry.Slug, Name: entry.Name, Tier: entry.Tier, Blurb: entry.Blurb})
+			continue
+		}
 		c, err := course.Load(root, entry.Slug)
 		if err != nil {
 			return fmt.Errorf("%s: %w", entry.Slug, err)
@@ -109,10 +120,11 @@ func run() error {
 		courseDir := c.Dir()
 
 		ci := courseInfo{
-			Slug:  c.Slug,
-			Name:  c.Name,
-			Color: courseColors[i%len(courseColors)],
-			Total: len(c.Stages),
+			Slug:     c.Slug,
+			Name:     c.Name,
+			Color:    courseColors[len(courses)%len(courseColors)],
+			Language: c.Language,
+			Total:    len(c.Stages),
 		}
 		if primer, ok := learn.Primer(courseDir); ok {
 			ci.Learn = plainText(firstParagraph(primer))
@@ -129,6 +141,8 @@ func run() error {
 				StageDir:   stageDir,
 				Title:      s.Name,
 				Difficulty: s.Difficulty,
+				Language:   c.Language,
+				Entrypoint: c.Entrypoint,
 				Concepts:   learn.Concepts(courseDir, stageDir),
 			}
 
@@ -137,13 +151,13 @@ func run() error {
 				e.Description = summarize(plainText(firstParagraph(note)))
 			}
 
-			src := filepath.Join("courses", c.Slug, "reference", "stages", stageDir, "main.go")
+			src := filepath.Join("courses", c.Slug, "reference", "stages", stageDir, c.Entrypoint)
 			if _, err := os.Stat(filepath.Join(root, src)); err == nil {
 				e.Verified = true
 				e.SourcePath = src
 				ci.Verified++
 				if n > 1 {
-					prev := filepath.Join("courses", c.Slug, "reference", "stages", c.StageDir(n-1), "main.go")
+					prev := filepath.Join("courses", c.Slug, "reference", "stages", c.StageDir(n-1), c.Entrypoint)
 					if _, err := os.Stat(filepath.Join(root, prev)); err == nil {
 						e.PrevPath = prev
 					}
@@ -162,7 +176,7 @@ func run() error {
 		courses = append(courses, ci)
 	}
 
-	return writeCatalog(root, courses, stages)
+	return writeCatalog(root, courses, planned, stages)
 }
 
 // repoRoot walks up from the working directory looking for courses.yml, so
@@ -182,21 +196,6 @@ func repoRoot() (string, error) {
 		}
 		dir = parent
 	}
-}
-
-func loadRegistry(root string) (*registry, error) {
-	data, err := os.ReadFile(filepath.Join(root, "courses.yml"))
-	if err != nil {
-		return nil, err
-	}
-	var reg registry
-	if err := yaml.Unmarshal(data, &reg); err != nil {
-		return nil, fmt.Errorf("parse courses.yml: %w", err)
-	}
-	if len(reg.Entries) == 0 {
-		return nil, fmt.Errorf("courses.yml lists no courses")
-	}
-	return &reg, nil
 }
 
 // stageBody renders the shared markdown for a stage: its concept note, then
@@ -226,7 +225,7 @@ func stageBody(root string, e stageEntry, note string) string {
 			delta, changed := unifiedDiff(strings.TrimRight(string(prev), "\n"), cur)
 			if changed {
 				b.WriteString("_Changes this stage adds to the previous stage's solution:_\n\n")
-				fmt.Fprintf(&b, "```diff title=%q\n%s\n```\n\n", "main.go", delta)
+				fmt.Fprintf(&b, "```diff title=%q\n%s\n```\n\n", e.Entrypoint, delta)
 			} else {
 				b.WriteString("_No code changes this stage — identical to the previous stage's solution._\n\n")
 			}
@@ -236,7 +235,7 @@ func stageBody(root string, e stageEntry, note string) string {
 		}
 	}
 	b.WriteString("_The first stage's reference solution, in full:_\n\n")
-	fmt.Fprintf(&b, "```go title=%q\n%s\n```\n\n", "main.go", cur)
+	fmt.Fprintf(&b, "```%s title=%q\n%s\n```\n\n", e.Language, e.Entrypoint, cur)
 	b.WriteString("</details>\n")
 	return b.String()
 }
@@ -263,7 +262,7 @@ func writePrimer(root, courseDir string, ci courseInfo) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "---\ntitle: %s\ndescription: %s\nsidebar:\n  order: 0\n  label: %s\n---\n\n",
 		js(ci.Name+" — primer"),
-		js("The background behind "+ci.Name+": what the API actually is, and the Go APIs it needs."),
+		js("The background behind "+ci.Name+": what the API actually is, and the "+languageLabel(ci.Language)+" APIs it needs."),
 		js("Primer"))
 	fmt.Fprintf(&b, "_Read this before stage 1. Each of the %d stages has its own note — open any row in the [catalog](/catalog/) to read it._\n\n", ci.Total)
 	b.WriteString(body)
@@ -273,7 +272,7 @@ func writePrimer(root, courseDir string, ci courseInfo) error {
 
 // writeCatalog emits src/data/catalog.ts: the typed COURSES/CATALOG data the
 // /catalog page renders at build time.
-func writeCatalog(root string, courses []courseInfo, stages []stageEntry) error {
+func writeCatalog(root string, courses []courseInfo, planned []plannedInfo, stages []stageEntry) error {
 	var b strings.Builder
 	b.WriteString("// AUTO-GENERATED by `go run ./web/gen` from courses.yml — do not hand-edit.\n\n")
 	b.WriteString("export type CatalogEntry = {\n")
@@ -292,6 +291,12 @@ func writeCatalog(root string, courses []courseInfo, stages []stageEntry) error 
 		fmt.Fprintf(&b, "  { course: %s, index: %d, slug: %s, title: %s, difficulty: %s, description: %s, verified: %s, sourcePath: %s, concepts: %s },\n",
 			js(e.Course), e.Index, js(e.Slug), js(e.Title), js(e.Difficulty), js(e.Description), boolLit(e.Verified), js(e.SourcePath), jsList(e.Concepts))
 	}
+	b.WriteString("];\n\n")
+
+	b.WriteString("export const PLANNED: { slug: string; name: string; tier: string; blurb: string }[] = [\n")
+	for _, p := range planned {
+		fmt.Fprintf(&b, "  { slug: %s, name: %s, tier: %s, blurb: %s },\n", js(p.Slug), js(p.Name), js(p.Tier), js(p.Blurb))
+	}
 	b.WriteString("];\n")
 
 	if err := os.MkdirAll(filepath.Join(root, dataDir), 0o755); err != nil {
@@ -307,7 +312,7 @@ func writeCatalog(root string, courses []courseInfo, stages []stageEntry) error 
 		total += c.Total
 		verified += c.Verified
 	}
-	fmt.Fprintf(os.Stderr, "gen: wrote %d course(s), %d/%d stages verified -> %s\n", len(courses), verified, total, out)
+	fmt.Fprintf(os.Stderr, "gen: wrote %d course(s) + %d planned, %d/%d stages verified -> %s\n", len(courses), len(planned), verified, total, out)
 
 	// Teaching content is written by hand, so report coverage rather than
 	// assuming it.
@@ -319,6 +324,17 @@ func writeCatalog(root string, courses []courseInfo, stages []stageEntry) error 
 	}
 	fmt.Fprintf(os.Stderr, "gen: learn coverage: %d/%d stage notes\n", notes, total)
 	return nil
+}
+
+// languageLabel turns a course.yml language into prose. Every course is Go
+// today; this exists so the site does not say "Go" for one that is not.
+func languageLabel(lang string) string {
+	switch lang {
+	case "", course.DefaultLanguage:
+		return "Go"
+	default:
+		return strings.ToUpper(lang[:1]) + lang[1:]
+	}
 }
 
 var (

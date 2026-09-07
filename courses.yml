@@ -1,5 +1,88 @@
-# Every course this repo ships. A course is a directory under courses/
-# holding its own course.yml, the learner's app/, and its reference stages.
+# Every course this repo ships or plans. A shipped course is a directory under
+# courses/ holding its own course.yml, the learner's app/, and its reference
+# stages. A planned course has no directory yet: it appears in the catalog so
+# the ladder is visible, and nothing loads it. See CURRICULUM.md.
 entries:
   - slug: kubectl
     name: Build your own kubectl
+    status: shipped
+    tier: the client
+    blurb: kubeconfig, discovery, the RESTMapper, apply, watch, exec.
+
+  - slug: controller
+    name: Build your own controller
+    status: shipped
+    tier: control loops
+    blurb: Informers, a workqueue, and a reconcile loop that owns its children.
+
+  - slug: webhook
+    name: Build your own admission webhook
+    status: planned
+    tier: control loops
+    blurb: TLS, AdmissionReview, JSON patch, and the traps that take clusters down.
+
+  - slug: scheduler
+    name: Build your own scheduler
+    status: planned
+    tier: control loops
+    blurb: Filter, score, bind — then priority and preemption.
+
+  - slug: apiserver
+    name: Build your own kube-apiserver
+    status: planned
+    tier: the API plane
+    blurb: REST over etcd, watch, server-side apply, RBAC — driven by real kubectl.
+
+  - slug: runtime
+    name: Build your own container runtime
+    status: planned
+    tier: the node plane
+    blurb: Image layers, namespaces, cgroups, and the CRI a kubelet can drive.
+
+  - slug: kubelet
+    name: Build your own kubelet
+    status: planned
+    tier: the node plane
+    blurb: Register a node, run the pods assigned to it, report what happened.
+
+  - slug: cni
+    name: Build your own CNI plugin
+    status: planned
+    tier: the node plane
+    blurb: veth pairs, IPAM, routes, and an overlay across nodes.
+
+  - slug: kube-proxy
+    name: Build your own kube-proxy
+    status: planned
+    tier: the node plane
+    blurb: Services and EndpointSlices turned into a working data plane.
+
+  - slug: helm
+    name: Build your own Helm
+    status: planned
+    tier: the ecosystem
+    blurb: Charts, values, releases, and a three-way-merge upgrade.
+
+  - slug: kustomize
+    name: Build your own kustomize
+    status: planned
+    tier: the ecosystem
+    blurb: Bases, overlays, patches, and generated names that stay wired up.
+
+  - slug: csi
+    name: Build your own CSI driver
+    status: planned
+    tier: the ecosystem
+    blurb: Provision a volume, stage it, publish it into a pod.
+
+  - slug: hpa
+    name: Build your own metrics server and HPA
+    status: planned
+    tier: the ecosystem
+    blurb: Scrape the kubelet, serve metrics.k8s.io, then do the scaling maths.
+
+  - slug: kubeadm
+    name: Build your own cluster bootstrap
+    status: planned
+    tier: the ecosystem
+    blurb: PKI, static pods, bootstrap tokens — a control plane from nothing.

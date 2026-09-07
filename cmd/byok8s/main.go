@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/madhank93/byo-k8s-x/internal/cluster"
 	"github.com/madhank93/byo-k8s-x/internal/course"
@@ -19,20 +20,59 @@ import (
 
 const defaultCourse = "kubectl"
 
+// selected is the course every subcommand operates on: --course, else
+// BYOK8S_COURSE, else the course this repo started with.
+var selected = defaultCourse
+
 func main() {
-	if len(os.Args) < 2 {
+	args := os.Args[1:]
+	if env := os.Getenv("BYOK8S_COURSE"); env != "" {
+		selected = env
+	}
+	args, err := takeCourseFlag(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n%v\n", err)
+		os.Exit(2)
+	}
+	if len(args) == 0 {
 		usage()
 		os.Exit(2)
 	}
-	if err := dispatch(os.Args[1], os.Args[2:]); err != nil {
+	if err := dispatch(args[0], args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "\n%v\n", err)
 		os.Exit(1)
 	}
 }
 
+// takeCourseFlag pulls a leading --course out of the arguments. It is handled
+// by hand rather than with the flag package because it comes before the
+// subcommand, and flag stops at the first positional.
+func takeCourseFlag(args []string) ([]string, error) {
+	if len(args) == 0 {
+		return args, nil
+	}
+	switch {
+	case args[0] == "--course", args[0] == "-course":
+		if len(args) < 2 {
+			return nil, fmt.Errorf("--course needs a course slug (byok8s courses lists them)")
+		}
+		selected = args[1]
+		return args[2:], nil
+	case strings.HasPrefix(args[0], "--course="), strings.HasPrefix(args[0], "-course="):
+		_, value, _ := strings.Cut(args[0], "=")
+		if value == "" {
+			return nil, fmt.Errorf("--course needs a course slug (byok8s courses lists them)")
+		}
+		selected = value
+		return args[1:], nil
+	}
+	return args, nil
+}
+
 func usage() {
 	fmt.Fprint(os.Stderr, `byok8s — build your own Kubernetes tooling
 
+  byok8s courses            every course, shipped and planned
   byok8s up                 create the kind cluster the courses run against
   byok8s down               delete it
   byok8s doctor             check the environment can run a course
@@ -40,6 +80,8 @@ func usage() {
   byok8s run [N]            verify stages 1..N (default: the next unfinished one)
   byok8s learn [N] [-hints] the course primer, or the concept note for stage N
   byok8s reset --to N       replace your program with the stage N reference
+
+  --course <slug> before the command picks the course (default: kubectl).
 `)
 }
 
@@ -54,6 +96,8 @@ func dispatch(cmd string, args []string) error {
 		return cluster.Down(ctx, say)
 	case "doctor":
 		return doctor(ctx)
+	case "courses":
+		return listCourses(args)
 	case "list":
 		return list()
 	case "run":
@@ -120,7 +164,43 @@ func loadCourse() (*course.Course, error) {
 	if err != nil {
 		return nil, err
 	}
-	return course.Load(root, defaultCourse)
+	c, err := course.Load(root, selected)
+	if err != nil {
+		return nil, fmt.Errorf("course %q: %w\n  fix: byok8s courses", selected, err)
+	}
+	return c, nil
+}
+
+// listCourses shows the whole ladder, planned courses included, so the next
+// thing to build is visible from the CLI and not only on the site.
+//
+// --shipped prints just the slugs that have a directory to load, which is how
+// the hack/ scripts and CI enumerate courses without parsing YAML in bash.
+func listCourses(args []string) error {
+	shippedOnly := len(args) > 0 && (args[0] == "--shipped" || args[0] == "-shipped")
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	reg, err := course.LoadRegistry(root)
+	if err != nil {
+		return err
+	}
+	if shippedOnly {
+		for _, e := range reg.Shipped() {
+			fmt.Println(e.Slug)
+		}
+		return nil
+	}
+	for _, e := range reg.Entries {
+		mark := "planned"
+		if e.Shipped() {
+			mark = "shipped"
+		}
+		fmt.Printf("  %-8s %-12s %s\n", mark, e.Slug, e.Name)
+	}
+	fmt.Println("\n  byok8s --course <slug> list")
+	return nil
 }
 
 func list() error {
@@ -174,6 +254,7 @@ func runStages(ctx context.Context, args []string) error {
 	cmd := exec.CommandContext(ctx, "go", "run", "./cmd/tester")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(),
+		"BYOK8S_COURSE="+c.Slug,
 		"BYOK8S_SUBMISSION_DIR="+c.Dir(),
 		"BYOK8S_TEST_CASES_JSON="+string(payload),
 	)
@@ -196,12 +277,12 @@ func reset(args []string) error {
 	if err != nil || n < 1 || n > len(c.Stages) {
 		return fmt.Errorf("stage must be between 1 and %d", len(c.Stages))
 	}
-	src := filepath.Join(c.ReferenceDir(n), "main.go")
+	src := filepath.Join(c.ReferenceDir(n), c.Entrypoint)
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return fmt.Errorf("no reference snapshot for stage %d yet: %w", n, err)
 	}
-	dst := filepath.Join(c.AppDir(), "main.go")
+	dst := filepath.Join(c.AppDir(), c.Entrypoint)
 	if err := os.WriteFile(dst, data, 0o644); err != nil {
 		return err
 	}

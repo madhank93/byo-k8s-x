@@ -3,6 +3,7 @@
 // It reads its work from the environment, which keeps it usable from a CLI, a
 // TUI or CI without any of them knowing how grading works:
 //
+//	BYOK8S_COURSE           the course slug, which selects its assertions
 //	BYOK8S_SUBMISSION_DIR   the course directory holding app/
 //	BYOK8S_TEST_CASES_JSON  [{"slug":"server-url","title":"Stage #1: …"}, …]
 //
@@ -23,8 +24,19 @@ import (
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
 	"github.com/madhank93/byo-k8s-x/internal/runner"
-	stages "github.com/madhank93/byo-k8s-x/internal/stages/kubectl"
+	"github.com/madhank93/byo-k8s-x/internal/stages"
+	controllerstages "github.com/madhank93/byo-k8s-x/internal/stages/controller"
+	kubectlstages "github.com/madhank93/byo-k8s-x/internal/stages/kubectl"
+	webhookstages "github.com/madhank93/byo-k8s-x/internal/stages/webhook"
 )
+
+// courses maps a course slug to its assertions. A course is gradable exactly
+// when it appears here — the one line a new course adds to this command.
+var courses = map[string]stages.Lookup{
+	"kubectl":    kubectlstages.Lookup,
+	"controller": controllerstages.Lookup,
+	"webhook":    webhookstages.Lookup,
+}
 
 type testCase struct {
 	Slug  string `json:"slug"`
@@ -39,6 +51,14 @@ func main() {
 }
 
 func run() error {
+	slug := os.Getenv("BYOK8S_COURSE")
+	if slug == "" {
+		return fmt.Errorf("BYOK8S_COURSE is not set")
+	}
+	lookup, ok := courses[slug]
+	if !ok {
+		return fmt.Errorf("no assertions are registered for course %q", slug)
+	}
 	dir := os.Getenv("BYOK8S_SUBMISSION_DIR")
 	if dir == "" {
 		return fmt.Errorf("BYOK8S_SUBMISSION_DIR is not set")
@@ -64,7 +84,7 @@ func run() error {
 	defer os.RemoveAll(filepath.Dir(bin))
 
 	for i, tc := range cases {
-		stage, ok := stages.Lookup(tc.Slug)
+		stage, ok := lookup(tc.Slug)
 		if !ok {
 			return fmt.Errorf("no assertions registered for stage %q", tc.Slug)
 		}
@@ -75,7 +95,7 @@ func run() error {
 		}
 		fmt.Printf("\n[%s] running\n", title)
 
-		env, cancel, err := kube.Begin(ctx, tc.Slug, stages.StageTimeout+30*time.Second)
+		env, cancel, err := kube.Begin(ctx, slug, tc.Slug, stages.Timeout+30*time.Second)
 		if err != nil {
 			return fmt.Errorf("[%s] preparing the cluster: %w", title, err)
 		}

@@ -41,9 +41,13 @@ jobs:
       - uses: helm/kind-action@v1
         with:
           cluster_name: byok8s
-      - name: Verify every stage
+      - name: Verify every stage of every shipped course
         run: |
-          count=$(grep -c '^  - slug: ' courses/kubectl/course.yml)
-          ./hack/vsnap.sh "$count"
+          for slug in $(go run ./cmd/byok8s courses --shipped); do
+            count=$(grep -c '^  - slug: ' "courses/$slug/course.yml")
+            echo "::group::$slug ($count stages)"
+            ./hack/vsnap.sh "$slug" "$count"
+            echo "::endgroup::"
+          done
       - name: The snapshots must be unchanged by verification
-        run: git diff --exit-code courses/kubectl/reference/stages
+        run: git diff --exit-code courses/*/reference/stages
