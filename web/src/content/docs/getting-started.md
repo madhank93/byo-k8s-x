@@ -75,8 +75,8 @@ scaled to the stage's difficulty, and further reading.
 Hints stay behind `-hints`, because a hint you didn't ask for is a spoiler.
 
 The same notes are published here: read the [primer](/learn/kubectl/), then
-open any row in the [Catalog](/catalog/) for that stage's note. The
-[concepts](/learn/concepts/) page groups every stage by the idea it teaches.
+open any row in the [Catalog](/catalog/) for that stage's note. Each stage
+lists the concepts it teaches, and the catalog search matches them.
 
 ## Reference solutions
 
