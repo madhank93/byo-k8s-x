@@ -27,6 +27,7 @@ import (
 	"github.com/madhank93/byo-k8s-x/internal/stages"
 	controllerstages "github.com/madhank93/byo-k8s-x/internal/stages/controller"
 	kubectlstages "github.com/madhank93/byo-k8s-x/internal/stages/kubectl"
+	webhookstages "github.com/madhank93/byo-k8s-x/internal/stages/webhook"
 )
 
 // courses maps a course slug to its assertions. A course is gradable exactly
@@ -34,6 +35,7 @@ import (
 var courses = map[string]stages.Lookup{
 	"kubectl":    kubectlstages.Lookup,
 	"controller": controllerstages.Lookup,
+	"webhook":    webhookstages.Lookup,
 }
 
 type testCase struct {

@@ -10,7 +10,10 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
 dups=0
-for slug in $(go run ./cmd/byok8s courses --shipped); do
+# Every course with a directory, not only the shipped ones: a course is most
+# likely to grow a duplicate snapshot while it is still being authored, which
+# is exactly when its courses.yml still says planned.
+for slug in $(ls -d courses/*/ 2>/dev/null | xargs -n1 basename); do
   stages="$root/courses/$slug/reference/stages"
   [ -d "$stages" ] || { echo "$slug: no snapshots yet"; continue; }
   entry=$(awk '/^entrypoint: /{print $2; exit}' "$root/courses/$slug/course.yml")
