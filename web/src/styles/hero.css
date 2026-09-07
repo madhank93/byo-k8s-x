@@ -1,0 +1,23 @@
+/* Keep the splash hero logo modest — Starlight sizes the hero image to the
+   column, which renders the raw asset far larger than it needs to be. */
+.hero img {
+	max-width: 150px;
+	margin-inline: auto;
+}
+
+/* Trim the large empty gap around the splash hero — Starlight's default
+   padding-block ramps up to 10rem. */
+[data-has-hero] .hero {
+	padding-block: clamp(1.5rem, 4vmin, 3.5rem);
+}
+
+/* Highlight the Catalog action as the browse-everything entry point. */
+.sl-link-button.cta-catalog {
+	border-color: var(--sl-color-accent);
+	background: color-mix(in oklab, var(--sl-color-accent) 16%, transparent);
+	color: var(--sl-color-accent-high);
+}
+.sl-link-button.cta-catalog:hover {
+	background: color-mix(in oklab, var(--sl-color-accent) 26%, transparent);
+	border-color: var(--sl-color-accent-high);
+}

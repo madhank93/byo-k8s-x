@@ -28,8 +28,16 @@ run = "go test ./internal/..."
 
 [tasks.lint]
 description = "Vet and formatting"
-run = "go vet ./... && test -z \"$(gofmt -l cmd internal)\""
+run = "go vet ./... && test -z \"$(gofmt -l cmd internal web/gen)\""
 
 [tasks.sweep]
 description = "Fail if any stage snapshot is identical to the one before it"
 run = "./hack/sweep.sh"
+
+[tasks.gen]
+description = "Regenerate the website's catalog data and lesson pages"
+run = "go run ./web/gen"
+
+[tasks.site]
+description = "Serve the website locally (regenerates first)"
+run = "go run ./web/gen && cd web && npm install && npm run dev"

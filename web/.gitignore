@@ -1,0 +1,24 @@
+# build output
+dist/
+# generated types
+.astro/
+
+# generated catalog data (produced by `mise run gen` / `go run ./web/gen`)
+src/data/catalog.ts
+src/data/stage-details/
+
+# generated lesson pages (primer, stage notes, concept index)
+src/content/docs/learn/
+
+# dependencies
+node_modules/
+
+# logs
+npm-debug.log*
+
+# environment variables
+.env
+.env.production
+
+# macOS-specific files
+.DS_Store

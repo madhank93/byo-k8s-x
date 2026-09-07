@@ -18,7 +18,7 @@ jobs:
       - run: go vet ./...
       - name: Check formatting
         run: |
-          unformatted=$(gofmt -l cmd internal)
+          unformatted=$(gofmt -l cmd internal web/gen)
           if [ -n "$unformatted" ]; then
             echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
           fi

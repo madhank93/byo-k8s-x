@@ -1,0 +1,71 @@
+---
+title: byok8s
+description: Build your own kubectl in Go, one stage at a time, against a real kind cluster — with a concept note and a verified reference solution for every stage.
+template: splash
+hero:
+  tagline: Build your own kubectl in Go, one stage at a time — graded against a real Kubernetes cluster, not a fake client.
+  image:
+    alt: byok8s
+    file: ../../assets/byok8s.svg
+  actions:
+    - text: Get started
+      link: /getting-started/
+      icon: right-arrow
+    - text: Browse the catalog
+      link: /catalog/
+      icon: open-book
+      variant: secondary
+      attrs:
+        class: cta-catalog
+    - text: Read the primer
+      link: /learn/kubectl/
+      icon: document
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What is byok8s?
+
+`byok8s` is a local course runner. You write one Go program and grow it across
+30 stages until it does what `kubectl` does — find the cluster, ask the server
+what it serves, resolve any resource through discovery and the RESTMapper,
+print tables, select, watch, apply with server-side apply, describe, and stream
+logs, exec and port-forward.
+
+Every stage is graded against a real [kind](https://kind.sigs.k8s.io/) cluster.
+Nothing inspects your source: the verdict is your program's exit code and
+stdout, so any correct implementation passes.
+
+<CardGrid>
+  <Card title="30 stages" icon="puzzle">
+    From "which server, as whom?" to port-forward — each stage adds one
+    visible thing, and running a stage re-verifies every stage before it.
+  </Card>
+  <Card title="A real cluster" icon="rocket">
+    Graded against kind, in an isolated namespace per stage. `create
+    deployment` really does produce pods; `logs` really does stream from a
+    container.
+  </Card>
+  <Card title="A note per stage" icon="open-book">
+    A stage says whether your program behaves; it never says why. The
+    [lesson track](/learn/kubectl/) covers the concept, the client-go you
+    reach for, a hint ladder, and the primary sources.
+  </Card>
+  <Card title="Verified references" icon="seti:go">
+    Every stage ships a reference snapshot that passed stages 1..N
+    cumulatively in CI — browse the per-stage diffs in the
+    [catalog](/catalog/).
+  </Card>
+</CardGrid>
+
+## Start in four commands
+
+```sh
+git clone https://github.com/madhank93/byo-k8s-x && cd byo-k8s-x
+mise install              # go, kind, kubectl
+byok8s up                 # create the local kind cluster
+byok8s run 1              # verify stage 1
+```
+
+See [Getting started](/getting-started/) for the full setup.
