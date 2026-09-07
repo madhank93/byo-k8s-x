@@ -117,11 +117,6 @@ func run() error {
 	// broken kubeconfig still answers a liveness probe.
 	serveObservability(ctx, *metricsAddr)
 
-	// SIGTERM is an instruction, not a fault. Saying so before the work of
-	// shutting down begins is what lets an operator tell a rollout from a
-	// crash loop, and it is why this exits 0 rather than reporting an error.
-	context.AfterFunc(ctx, func() { fmt.Println("shutting down") })
-
 	cfg, ns, err := clientConfig()
 	if err != nil {
 		return err
@@ -922,10 +917,6 @@ func lead(ctx context.Context, clientset kubernetes.Interface, dyn dynamic.Inter
 		LeaseDuration: 15 * time.Second,
 		RenewDeadline: 10 * time.Second,
 		RetryPeriod:   2 * time.Second,
-		// Handing the lease back is what makes a rollout quick: the next
-		// instance leads as soon as it starts, rather than waiting out a
-		// lease whose holder is already gone.
-		ReleaseOnCancel: true,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				fmt.Printf("leading as %s\n", identity)

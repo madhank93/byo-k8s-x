@@ -38,8 +38,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/leaderelection"
-	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
@@ -65,10 +63,6 @@ const finalizerName = "byok8s.dev/cleanup"
 // is part of the contract: change it and the controller no longer owns the
 // fields it set under the old name.
 const fieldManager = "byok8s-controller"
-
-// leaseName is the object two instances of this controller compete over.
-// One name, one leader, one namespace.
-const leaseName = "byok8s-controller"
 
 const (
 	group   = "byok8s.dev"
@@ -110,17 +104,11 @@ func run() error {
 	defer stop()
 
 	metricsAddr := flag.String("metrics-addr", "", "address to serve /metrics, /healthz and /readyz on; empty serves nothing")
-	identity := flag.String("identity", defaultIdentity(), "name this instance holds the lease under")
 	flag.Parse()
 
 	// Started before anything else can fail, so a controller stuck on a
 	// broken kubeconfig still answers a liveness probe.
 	serveObservability(ctx, *metricsAddr)
-
-	// SIGTERM is an instruction, not a fault. Saying so before the work of
-	// shutting down begins is what lets an operator tell a rollout from a
-	// crash loop, and it is why this exits 0 rather than reporting an error.
-	context.AfterFunc(ctx, func() { fmt.Println("shutting down") })
 
 	cfg, ns, err := clientConfig()
 	if err != nil {
@@ -140,7 +128,7 @@ func run() error {
 	}
 	fmt.Printf("crd %s established\n", crdName)
 
-	return lead(ctx, clientset, dyn, ns, *identity)
+	return observe(ctx, dyn, clientset, ns)
 }
 
 // observe reports every Website in the namespace and every change to one.
@@ -888,57 +876,4 @@ func serveObservability(ctx context.Context, addr string) {
 			fmt.Fprintf(os.Stderr, "observability endpoints: %v\n", err)
 		}
 	}()
-}
-
-// defaultIdentity names this instance. The holder of a lease has to be
-// identifiable by whoever reads it, and in a cluster the pod name is the
-// answer — which is what the hostname is inside a pod.
-func defaultIdentity() string {
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		return "controller"
-	}
-	return host
-}
-
-// lead runs the controller only while this process holds the lease.
-//
-// Two copies acting at once is not redundancy, it is a race: both would create
-// the same children and fight over status. The standby does nothing but wait,
-// which is what makes it safe to run a second one at all.
-func lead(ctx context.Context, clientset kubernetes.Interface, dyn dynamic.Interface, ns, identity string) error {
-	lock := &resourcelock.LeaseLock{
-		LeaseMeta:  metav1.ObjectMeta{Name: leaseName, Namespace: ns},
-		Client:     clientset.CoordinationV1(),
-		LockConfig: resourcelock.ResourceLockConfig{Identity: identity},
-	}
-
-	var runErr error
-	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock: lock,
-		// The ordering is the contract: a lease outlives the deadline to renew
-		// it, which outlives the gap between attempts. Invert any pair and two
-		// instances can believe they lead at the same time.
-		LeaseDuration: 15 * time.Second,
-		RenewDeadline: 10 * time.Second,
-		RetryPeriod:   2 * time.Second,
-		// Handing the lease back is what makes a rollout quick: the next
-		// instance leads as soon as it starts, rather than waiting out a
-		// lease whose holder is already gone.
-		ReleaseOnCancel: true,
-		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(ctx context.Context) {
-				fmt.Printf("leading as %s\n", identity)
-				runErr = observe(ctx, dyn, clientset, ns)
-			},
-			OnStoppedLeading: func() {
-				fmt.Printf("no longer leading as %s\n", identity)
-			},
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("leader election: %w", err)
-	}
-	elector.Run(ctx)
-	return runErr
 }

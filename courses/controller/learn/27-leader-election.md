@@ -29,7 +29,7 @@ have followed the course, it already is.
 ## Go APIs
 
 - `resourcelock.New(resourcelock.LeasesResourceLock, ns, name, coreClient, coordinationClient, resourcelock.ResourceLockConfig{Identity: id})`.
-- `leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{Lock, LeaseDuration, RenewDeadline, RetryPeriod, ReleaseOnCancel, Callbacks})`.
+- `leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{Lock, LeaseDuration, RenewDeadline, RetryPeriod, Callbacks})`.
 - `OnStartedLeading(ctx)` — start the loop here, and only here.
 - `OnStoppedLeading()` — stop immediately; you are no longer the leader.
 
@@ -52,11 +52,10 @@ standby still answers probes.
 
 ```go
 leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
-    Lock:            lock,
-    LeaseDuration:   15 * time.Second,
-    RenewDeadline:   10 * time.Second,
-    RetryPeriod:     2 * time.Second,
-    ReleaseOnCancel: true,
+    Lock:          lock,
+    LeaseDuration: 15 * time.Second,
+    RenewDeadline: 10 * time.Second,
+    RetryPeriod:   2 * time.Second,
     Callbacks: leaderelection.LeaderCallbacks{
         OnStartedLeading: func(ctx context.Context) { run(ctx) },
         OnStoppedLeading: func() { fmt.Println("lost leadership") },
