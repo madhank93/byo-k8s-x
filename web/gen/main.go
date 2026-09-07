@@ -326,17 +326,6 @@ func writeCatalog(root string, courses []courseInfo, planned []plannedInfo, stag
 	return nil
 }
 
-// languageLabel turns a course.yml language into prose. Every course is Go
-// today; this exists so the site does not say "Go" for one that is not.
-func languageLabel(lang string) string {
-	switch lang {
-	case "", course.DefaultLanguage:
-		return "Go"
-	default:
-		return strings.ToUpper(lang[:1]) + lang[1:]
-	}
-}
-
 var (
 	mdLink    = regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`)
 	mdCode    = regexp.MustCompile("`([^`]+)`")
