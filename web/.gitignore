@@ -8,7 +8,6 @@ src/data/catalog.ts
 src/data/stage-details/
 
 # generated lesson pages (primer, stage notes, concept index)
-src/content/docs/learn/
 
 # dependencies
 node_modules/

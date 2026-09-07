@@ -23,7 +23,6 @@ import (
 const (
 	dataDir    = "web/src/data"
 	detailsDir = "web/src/data/stage-details"
-	docsLearn  = "web/src/content/docs/learn"
 	repoURL    = "https://github.com/madhank93/byo-k8s-x"
 	repoBlob   = repoURL + "/blob/main"
 )
@@ -58,6 +57,7 @@ type courseInfo struct {
 	Name     string
 	Color    string
 	Learn    string
+	Primer   bool
 	Language string
 	Total    int
 	Verified int
@@ -95,7 +95,7 @@ func run() error {
 
 	// Both trees are regenerated wholesale, so clear them first: a renamed
 	// or removed stage must not leave its old page behind.
-	for _, dir := range []string{detailsDir, docsLearn} {
+	for _, dir := range []string{detailsDir} {
 		if err := os.RemoveAll(filepath.Join(root, dir)); err != nil {
 			return err
 		}
@@ -127,7 +127,8 @@ func run() error {
 			Total:    len(c.Stages),
 		}
 		if primer, ok := learn.Primer(courseDir); ok {
-			ci.Learn = plainText(firstParagraph(primer))
+			ci.Primer = true
+			ci.Learn = firstSentence(plainText(firstParagraph(primer)))
 		}
 
 		for idx, s := range c.Stages {
@@ -251,23 +252,22 @@ func writeDetail(root string, e stageEntry, body string) error {
 	return os.WriteFile(filepath.Join(root, detailsDir, name), []byte(b.String()), 0o644)
 }
 
-// writePrimer publishes a course's learn/index.md as a page. It is the one
-// piece of teaching content that isn't a stage, so unlike the stage notes —
-// which the catalog modal shows — it needs a page of its own.
+// writePrimer renders a course's learn/index.md as a detail file, so the
+// catalog's primer row opens it in the same modal the stages use.
+//
+// A course is chosen in the catalog, so that is where its primer belongs. As a
+// page under /learn/ it sat behind a sidebar nobody opens before choosing.
 func writePrimer(root, courseDir string, ci courseInfo) error {
 	body, ok := learn.Primer(courseDir)
 	if !ok {
 		return nil
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "---\ntitle: %s\ndescription: %s\nsidebar:\n  order: 0\n  label: %s\n---\n\n",
-		js(ci.Name+" — primer"),
-		js("The background behind "+ci.Name+": what the API actually is, and the "+languageLabel(ci.Language)+" APIs it needs."),
-		js("Primer"))
-	fmt.Fprintf(&b, "_Read this before stage 1. Each of the %d stages has its own note — open any row in the [catalog](/catalog/) to read it._\n\n", ci.Total)
+	fmt.Fprintf(&b, "---\ntitle: %s\n---\n\n", js(ci.Name+" — primer"))
+	fmt.Fprintf(&b, "_Read this before stage 1. Each of the %d stages has its own note — open any row in the catalog to read it._\n\n", ci.Total)
 	b.WriteString(body)
 	b.WriteString("\n")
-	return os.WriteFile(filepath.Join(root, docsLearn, ci.Slug+".md"), []byte(b.String()), 0o644)
+	return os.WriteFile(filepath.Join(root, detailsDir, ci.Slug+"-primer.md"), []byte(b.String()), 0o644)
 }
 
 // writeCatalog emits src/data/catalog.ts: the typed COURSES/CATALOG data the
@@ -279,10 +279,10 @@ func writeCatalog(root string, courses []courseInfo, planned []plannedInfo, stag
 	b.WriteString("  course: string;\n  index: number;\n  slug: string;\n  title: string;\n")
 	b.WriteString("  difficulty: string;\n  description: string;\n  verified: boolean;\n  sourcePath: string;\n  concepts: string[];\n};\n\n")
 
-	b.WriteString("export const COURSES: Record<string, { name: string; repo: string; color: string; learn: string; total: number; verified: number }> = {\n")
+	b.WriteString("export const COURSES: Record<string, { name: string; repo: string; color: string; learn: string; primer: boolean; total: number; verified: number }> = {\n")
 	for _, c := range courses {
-		fmt.Fprintf(&b, "  %s: { name: %s, repo: %s, color: %s, learn: %s, total: %d, verified: %d },\n",
-			js(c.Slug), js(c.Name), js(repoURL), js(c.Color), js(c.Learn), c.Total, c.Verified)
+		fmt.Fprintf(&b, "  %s: { name: %s, repo: %s, color: %s, learn: %s, primer: %s, total: %d, verified: %d },\n",
+			js(c.Slug), js(c.Name), js(repoURL), js(c.Color), js(c.Learn), boolLit(c.Primer), c.Total, c.Verified)
 	}
 	b.WriteString("};\n\n")
 
@@ -324,17 +324,6 @@ func writeCatalog(root string, courses []courseInfo, planned []plannedInfo, stag
 	}
 	fmt.Fprintf(os.Stderr, "gen: learn coverage: %d/%d stage notes\n", notes, total)
 	return nil
-}
-
-// languageLabel turns a course.yml language into prose. Every course is Go
-// today; this exists so the site does not say "Go" for one that is not.
-func languageLabel(lang string) string {
-	switch lang {
-	case "", course.DefaultLanguage:
-		return "Go"
-	default:
-		return strings.ToUpper(lang[:1]) + lang[1:]
-	}
 }
 
 var (
@@ -379,6 +368,34 @@ func summarize(s string) string {
 
 // firstParagraph returns the first non-empty, non-heading paragraph — the
 // one-sentence summary shown in the catalog row.
+// firstSentence trims a paragraph to its opening sentence.
+//
+// The catalog gives this one line in a table row: a whole paragraph overflows
+// it, and the rest of the primer is one click away regardless.
+func firstSentence(s string) string {
+	for i, r := range s {
+		if r != '.' && r != '!' && r != '?' {
+			continue
+		}
+		rest := s[i+len(string(r)):]
+		// A full stop inside "e.g." or a version number does not end a
+		// sentence; one followed by a space and a capital does.
+		if rest == "" {
+			return s
+		}
+		if strings.HasPrefix(rest, " ") {
+			trimmed := strings.TrimLeft(rest, " ")
+			if trimmed == "" {
+				return s[:i+1]
+			}
+			if next := []rune(trimmed)[0]; next >= 'A' && next <= 'Z' {
+				return s[:i+1]
+			}
+		}
+	}
+	return s
+}
+
 func firstParagraph(md string) string {
 	for _, para := range strings.Split(md, "\n\n") {
 		para = strings.TrimSpace(para)
