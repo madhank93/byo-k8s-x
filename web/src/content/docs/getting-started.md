@@ -69,14 +69,14 @@ byok8s down               # delete the cluster
 
 A stage tells you whether your program behaves; it never tells you why. That
 lives in `courses/kubectl/learn/`: a primer to read before stage 1, and one
-note per stage covering the concept, the client-go you will reach for, a hint
-ladder scaled to the stage's difficulty, and links to the primary sources.
+note per stage covering the core concept, the Go APIs it needs, a hint ladder
+scaled to the stage's difficulty, and further reading.
 
 Hints stay behind `-hints`, because a hint you didn't ask for is a spoiler.
 
-The same notes are published here — start at the
-[primer](/learn/kubectl/), or read them by idea on the
-[concepts](/learn/concepts/) page.
+The same notes are published here: read the [primer](/learn/kubectl/), then
+open any row in the [Catalog](/catalog/) for that stage's note. The
+[concepts](/learn/concepts/) page groups every stage by the idea it teaches.
 
 ## Reference solutions
 
@@ -94,8 +94,8 @@ Browse them — with a per-stage diff showing only what that stage added — in 
 mise run test             # unit tests for the harness itself
 mise run lint             # vet and formatting
 mise run sweep            # fail if a stage snapshot repeats the one before it
-mise run gen              # regenerate the website's catalog and lesson pages
+mise run gen              # regenerate the website's catalog and generated pages
 ```
 
-Next: browse the [Catalog](/catalog/), or start reading the
-[primer](/learn/kubectl/).
+Next: read the [primer](/learn/kubectl/), then browse the
+[Catalog](/catalog/).

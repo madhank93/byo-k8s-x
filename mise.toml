@@ -35,7 +35,7 @@ description = "Fail if any stage snapshot is identical to the one before it"
 run = "./hack/sweep.sh"
 
 [tasks.gen]
-description = "Regenerate the website's catalog data and lesson pages"
+description = "Regenerate the website's catalog data and generated pages"
 run = "go run ./web/gen"
 
 [tasks.site]

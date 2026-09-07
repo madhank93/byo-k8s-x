@@ -125,7 +125,7 @@ const multiCourse = courseSlugs.length > 1;
             rows.push(
               <tr class="ex-row" data-i={i} data-slug={slug} data-course={e.course}
                   data-verified={e.verified ? '1' : '0'} data-diff={e.difficulty} data-search={search}
-                  data-desc={e.description} data-source={e.sourcePath} data-lesson={e.lesson}
+                  data-desc={e.description} data-source={e.sourcePath}
                   data-index={e.index} data-title={e.title}
                   tabindex="0" role="button">
                 <td><span class={`badge ${e.verified ? 'b-yes' : 'b-no'}`}>{e.verified ? '✓' : '—'}</span></td>
@@ -471,12 +471,6 @@ const multiCourse = courseSlugs.length > 1;
       mRunCmd.textContent = `byok8s run ${d.index}`;
 
       mLinks.innerHTML = '';
-      if (d.lesson) {
-        const a = document.createElement('a');
-        a.href = d.lesson;
-        a.textContent = '→ Read this stage as a lesson page';
-        mLinks.append(a);
-      }
       if (verified && d.source) {
         const a = document.createElement('a');
         a.href = `${REPO_BLOB}/${d.source}`;
