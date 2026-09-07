@@ -33,9 +33,9 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # The catalog, the lesson pages and the concept index are all derived
-      # from the repo, so they are generated here rather than committed.
-      - name: Generate catalog and lesson pages
+      # The catalog, the primer and the concept index are all derived from
+      # the repo, so they are generated here rather than committed.
+      - name: Generate the site's data and pages
         run: go run ./web/gen
 
       - uses: actions/setup-node@v4
