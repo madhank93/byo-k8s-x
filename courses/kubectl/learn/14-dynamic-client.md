@@ -3,7 +3,7 @@ title: Get anything at all
 concepts: [dynamic client, unstructured, clients]
 ---
 
-## What this stage teaches
+## Core concept
 
 This is the largest single step in the course: your program stops being a pod
 client. The dynamic client speaks in GVRs and `unstructured.Unstructured` —
@@ -29,7 +29,7 @@ value, found, and an error for "found but the wrong type" separately.
 This is a trade, not an upgrade. A controller that owns its own CRD should use
 a generated typed client; a general-purpose tool cannot.
 
-## Go you'll reach for
+## Go APIs
 
 - `dynamic.NewForConfig(cfg)` and `dyn.Resource(gvr).Namespace(ns)`.
 - `unstructured.NestedString` / `NestedSlice` / `NestedMap`.
@@ -51,7 +51,7 @@ converting the unstructured object back into a typed one; that reintroduces
 exactly the compile-time knowledge you are removing.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 dyn, err := dynamic.NewForConfig(cfg)
@@ -60,7 +60,7 @@ for _, o := range list.Items { fmt.Println(o.GetName()) }
 ```
 </details>
 
-## Going deeper
+## Further reading
 
 - [dynamic client](https://pkg.go.dev/k8s.io/client-go/dynamic)
 - [unstructured](https://pkg.go.dev/k8s.io/apimachinery/pkg/apis/meta/v1/unstructured)

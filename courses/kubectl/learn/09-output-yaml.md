@@ -3,7 +3,7 @@ title: Print the object as YAML
 concepts: [output formats, serialization]
 ---
 
-## What this stage teaches
+## Core concept
 
 Same object, different serializer — and the way you get there matters. Handing
 a Go struct to a generic YAML library emits *Go* field names (`ObjectMeta`,
@@ -17,7 +17,7 @@ Every Kubernetes project uses it for this reason, and the bug it prevents —
 YAML output that no `kubectl apply` will accept — is a memorable one to have
 seen coming.
 
-## Go you'll reach for
+## Go APIs
 
 - `sigs.k8s.io/yaml` — `JSONToYAML(data)`, or `Marshal(obj)` which converts
   through JSON for you.
@@ -37,6 +37,6 @@ Marshal to JSON exactly as before, then `yaml.JSONToYAML(data)`. If you reach
 for `gopkg.in/yaml.v3` here, look closely at the field names in the output.
 </details>
 
-## Going deeper
+## Further reading
 
 - [sigs.k8s.io/yaml](https://pkg.go.dev/sigs.k8s.io/yaml)

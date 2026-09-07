@@ -3,7 +3,7 @@ title: Stream a container's logs
 concepts: [subresources, streaming, kubelet]
 ---
 
-## What this stage teaches
+## Core concept
 
 There is no Log object to Get. `pods/log` is a subresource that returns a
 **stream of bytes**, and with `--follow` it never ends — which is why its
@@ -23,7 +23,7 @@ The container name is optional only when the pod has one container. The
 apiserver refuses to guess with more, so a program that never passes it works
 until the day someone adds a sidecar.
 
-## Go you'll reach for
+## Go APIs
 
 - `cs.CoreV1().Pods(ns).GetLogs(pod, &corev1.PodLogOptions{Container: c, Follow: f})`.
 - `req.Stream(ctx)` → `io.ReadCloser`; `defer stream.Close()`.
@@ -45,7 +45,7 @@ to call on it.
 — with `--follow` that call never returns.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 req := cs.CoreV1().Pods(ns).GetLogs(pod, &corev1.PodLogOptions{
@@ -57,7 +57,7 @@ _, err = io.Copy(os.Stdout, stream)
 ```
 </details>
 
-## Going deeper
+## Further reading
 
 - [PodLogOptions](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodLogOptions)
 - [Logging architecture](https://kubernetes.io/docs/concepts/cluster-administration/logging/)

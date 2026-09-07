@@ -3,7 +3,7 @@ title: Print the object as JSON
 concepts: [output formats, serialization, api objects]
 ---
 
-## What this stage teaches
+## Core concept
 
 `-o json` is not "your table, as JSON". It is the API's own object, verbatim —
 apiVersion, kind, metadata, spec, status, managedFields and all. That is what
@@ -18,7 +18,7 @@ One detail: kubectl prints a `List` object when listing, not a bare JSON array,
 so a caller can tell "a collection of pods" from "a pod that happens to be
 first". Marshal the list you got, not `list.Items`.
 
-## Go you'll reach for
+## Go APIs
 
 - `json.MarshalIndent(list, "", "    ")` — kubectl indents with four spaces.
 - The API types carry `json` struct tags, so field names come out as the API
@@ -38,7 +38,7 @@ Marshal the whole list object the client returned. Resist the urge to strip
 will make those fields the point.
 </details>
 
-## Going deeper
+## Further reading
 
 - [encoding/json](https://pkg.go.dev/encoding/json)
 - [Kubernetes API objects](https://kubernetes.io/docs/reference/using-api/api-concepts/#standard-api-terminology)

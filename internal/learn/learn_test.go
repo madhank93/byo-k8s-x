@@ -12,7 +12,7 @@ title: List the pods
 concepts: [clients, listing]
 ---
 
-## What this stage teaches
+## Core concept
 
 The idea.
 
@@ -23,7 +23,7 @@ The idea.
 Try the small thing.
 </details>
 
-## Going deeper
+## Further reading
 
 - [a link](https://example.com)
 `
@@ -50,7 +50,7 @@ func TestNoteStripsFrontmatter(t *testing.T) {
 	if strings.Contains(body, "title:") {
 		t.Errorf("frontmatter reached the reader:\n%s", body)
 	}
-	if !strings.HasPrefix(body, "## What this stage teaches") {
+	if !strings.HasPrefix(body, "## Core concept") {
 		t.Errorf("body starts wrong:\n%s", body)
 	}
 }
@@ -87,7 +87,7 @@ func TestConcepts(t *testing.T) {
 func TestSplitHints(t *testing.T) {
 	body, hints := SplitHints(stripFrontmatter(note))
 
-	for _, want := range []string{"## What this stage teaches", "## Going deeper"} {
+	for _, want := range []string{"## Core concept", "## Further reading"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body lost %q:\n%s", want, body)
 		}
@@ -104,7 +104,7 @@ func TestSplitHints(t *testing.T) {
 }
 
 func TestSplitHintsWithoutHints(t *testing.T) {
-	in := "## What this stage teaches\n\nJust prose.\n"
+	in := "## Core concept\n\nJust prose.\n"
 	body, hints := SplitHints(in)
 	if body != in || hints != "" {
 		t.Errorf("SplitHints(no hints) = %q, %q", body, hints)

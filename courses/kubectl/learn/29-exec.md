@@ -3,7 +3,7 @@ title: Run a command inside
 concepts: [spdy, streaming, subresources, rbac]
 ---
 
-## What this stage teaches
+## Core concept
 
 Exec needs several **independent byte streams at once** — stdin, stdout, stderr
 and a terminal-resize channel — multiplexed over a single connection. Ordinary
@@ -35,7 +35,7 @@ One CLI detail belongs here too: the command for the container must be kept
 away from *your* flag parser. `--` is the convention, and everything after it
 is passed through untouched.
 
-## Go you'll reach for
+## Go APIs
 
 - `cs.CoreV1().RESTClient().Post().Resource("pods").Namespace(ns).Name(pod).SubResource("exec")`.
 - `.VersionedParams(&corev1.PodExecOptions{...}, scheme.ParameterCodec)` —
@@ -59,7 +59,7 @@ executor run it. Scan `os.Args` yourself for `--`; the `flag` package will not
 hand it to you.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 req := cs.CoreV1().RESTClient().Post().
@@ -75,7 +75,7 @@ err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
 ```
 </details>
 
-## Going deeper
+## Further reading
 
 - [remotecommand](https://pkg.go.dev/k8s.io/client-go/tools/remotecommand)
 - [Get a shell to a running container](https://kubernetes.io/docs/tasks/debug/debug-application/get-shell-running-container/)

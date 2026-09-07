@@ -3,7 +3,7 @@ title: Filter by field
 concepts: [selectors, indexing, api semantics]
 ---
 
-## What this stage teaches
+## Core concept
 
 Field selectors look like label selectors and are a different axis. Labels are
 yours to invent and are indexed by design; fields belong to the object itself
@@ -21,7 +21,7 @@ Practically: use fields when you want objects "in state X" or "on node Y", and
 labels for anything you control. Both can be sent on the same request; they AND
 together.
 
-## Go you'll reach for
+## Go APIs
 
 - `metav1.ListOptions{FieldSelector: s}`.
 - `fields.OneTermEqualSelector(k, v)` and `fields.AndSelectors(...)` when you
@@ -43,6 +43,6 @@ Pass the flag through and let the server validate. Try
 is a much better error than a wrong answer.
 </details>
 
-## Going deeper
+## Further reading
 
 - [Field selectors](https://kubernetes.io/docs/concepts/overview/working-with-objects/field-selectors/)

@@ -38,7 +38,7 @@ Nothing inspects your source: any correct implementation passes.
 
 A stage says whether your program behaves; it never says why. That lives in
 `courses/kubectl/learn/` — a primer to read before stage 1, and one note per
-stage covering the concept, the client-go you will reach for, a hint ladder
+stage covering the core concept, the Go APIs it needs, a hint ladder
 scaled to the difficulty, and links to the primary sources. Hints stay behind
 `-hints`, because a hint you did not ask for is a spoiler.
 

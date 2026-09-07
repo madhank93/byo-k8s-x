@@ -3,7 +3,7 @@ title: Resolve any spelling
 concepts: [restmapper, discovery, gvk vs gvr]
 ---
 
-## What this stage teaches
+## Core concept
 
 `po`, `pod`, `pods`, `Pod`, `pods.v1.` — five spellings of one thing, and the
 API accepts exactly one of them in a URL. Turning what a person typed into a
@@ -21,7 +21,7 @@ shortnames. `pods` resolves and `po` does not, which is a confusing way to
 fail. Shortname expansion is a separate client-side layer — the shortcut
 expander — wrapped around the mapper.
 
-## Go you'll reach for
+## Go APIs
 
 - `restmapper.GetAPIGroupResources(dc)` then
   `restmapper.NewDiscoveryRESTMapper(groups)`.
@@ -46,7 +46,7 @@ call. Lowercase the input before parsing so `Pod` behaves; `ResourceFor` with
 an empty version asks for the preferred one.
 </details>
 
-<details><summary>The API</summary>
+<details><summary>Implementation</summary>
 
 ```go
 return restmapper.NewShortcutExpander(
@@ -64,7 +64,7 @@ m, err := mapper.ResourceFor(gr.WithVersion(""))
 ```
 </details>
 
-## Going deeper
+## Further reading
 
 - [restmapper](https://pkg.go.dev/k8s.io/client-go/restmapper)
 - [meta.RESTMapper](https://pkg.go.dev/k8s.io/apimachinery/pkg/api/meta#RESTMapper)
