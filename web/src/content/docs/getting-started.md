@@ -74,7 +74,7 @@ scaled to the stage's difficulty, and further reading.
 
 Hints stay behind `-hints`, because a hint you didn't ask for is a spoiler.
 
-The same notes are published here: read the [primer](/learn/kubectl/), then
+The same notes are published here: read the [primer](/catalog/?stage=kubectl-primer), then
 open any row in the [Catalog](/catalog/) for that stage's note. Each stage
 lists the concepts it teaches, and the catalog search matches them.
 
@@ -97,5 +97,5 @@ mise run sweep            # fail if a stage snapshot repeats the one before it
 mise run gen              # regenerate the website's catalog and generated pages
 ```
 
-Next: read the [primer](/learn/kubectl/), then browse the
+Next: read the [primer](/catalog/?stage=kubectl-primer), then browse the
 [Catalog](/catalog/).

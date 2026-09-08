@@ -204,7 +204,7 @@ const plannedTiers = [...new Set(PLANNED.map((p) => p.tier))];
         </div>
         <div class="m-links" id="mLinks"></div>
         <div class="m-section" id="mDetailWrap" hidden>
-          <h3>The stage</h3>
+          <h3 id="mDetailLabel">The stage</h3>
           <div class="sl-markdown-content m-md" id="mDetail"></div>
         </div>
         <p class="m-loading" id="mLoading" hidden>Loading the stage…</p>
@@ -346,6 +346,9 @@ const plannedTiers = [...new Set(PLANNED.map((p) => p.tier))];
     .cat-modal .m-body { overflow-y: auto; padding: 1.1rem 1.4rem 1.4rem; }
     .cat-modal .m-tags { display: flex; flex-wrap: wrap; gap: 0.3rem; list-style: none;
       padding: 0; margin: 0 0 0.7rem; }
+    /* A display rule outranks the UA's [hidden], so these two would keep their
+       margins open while empty — a primer has neither tags nor links. */
+    .cat-modal .m-tags[hidden], .cat-modal .m-links[hidden] { display: none; }
     .cat-modal .m-tags :global(li) { font-size: 0.68rem; line-height: 1.5;
       color: var(--sl-color-gray-2); background: var(--sl-color-gray-6);
       border: 1px solid var(--sl-color-gray-5); border-radius: 999px; padding: 0.1rem 0.55rem; }
@@ -359,6 +362,10 @@ const plannedTiers = [...new Set(PLANNED.map((p) => p.tier))];
       background: var(--sl-color-black); padding: 0.06rem 0.35rem; border-radius: 0.25rem; }
     .cat-modal .m-links { display: flex; flex-wrap: wrap; gap: 0.9rem; font-size: 0.82rem; margin-bottom: 0.4rem; }
     .cat-modal .m-section { margin-top: 1.4rem; border-top: 1px solid var(--sl-color-gray-6); padding-top: 1rem; }
+    /* A primer has nothing above its note — no tags, blurb, run command or
+       links — so the rule that separates them would open a gap under the
+       title instead of dividing anything. */
+    .cat-modal article.primer-only .m-section { margin-top: 0; border-top: 0; padding-top: 0; }
     .cat-modal .m-section h3 { margin: 0 0 0.6rem; font-size: 0.78rem; text-transform: uppercase;
       letter-spacing: 0.06em; color: var(--sl-color-gray-3); }
     .cat-modal .m-md { font-size: 0.88rem; }
@@ -492,6 +499,8 @@ const plannedTiers = [...new Set(PLANNED.map((p) => p.tier))];
     const mRunCmd = document.getElementById('mRunCmd')!;
     const mLinks = document.getElementById('mLinks')!;
     const mDetailWrap = document.getElementById('mDetailWrap')!;
+    const mDetailLabel = document.getElementById('mDetailLabel')!;
+    const mArticle = modal.querySelector('article')!;
     const mDetail = document.getElementById('mDetail')!;
     const mLoading = document.getElementById('mLoading')!;
     const mPrev = document.getElementById('mPrev') as HTMLButtonElement;
@@ -534,6 +543,11 @@ const plannedTiers = [...new Set(PLANNED.map((p) => p.tier))];
           return li;
         })
       );
+      // A primer teaches no single concept, so it carries no tags — and an
+      // empty list would still hold its margin open.
+      mTags.hidden = mTags.children.length === 0;
+      mArticle.classList.toggle('primer-only', isPrimer);
+      mDetailLabel.textContent = isPrimer ? 'The primer' : 'The stage';
       // A primer's blurb is its own opening sentence, which the body below
       // repeats verbatim — so show it on the row, not again in the modal.
       mDesc.textContent = isPrimer ? '' : d.desc || '';
@@ -549,6 +563,7 @@ const plannedTiers = [...new Set(PLANNED.map((p) => p.tier))];
         a.textContent = '↗ View the reference solution on GitHub';
         mLinks.append(a);
       }
+      mLinks.hidden = mLinks.children.length === 0;
 
       mDetailWrap.hidden = true;
       mDetail.innerHTML = '';

@@ -3,8 +3,6 @@ title: Build your own controller — primer
 concepts: [control loops, level triggering, custom resources, operators]
 ---
 
-Read this before stage 1.
-
 ## What a controller actually is
 
 Kubernetes is not a system that does what you tell it. It is a system that

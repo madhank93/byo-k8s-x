@@ -12,6 +12,12 @@ const DESCRIPTION =
 export default defineConfig({
 	site: SITE,
 	base: BASE,
+	// Primers used to be pages under /learn/. They now open in the catalog's
+	// modal, where the course is chosen; keep the published URLs working.
+	redirects: {
+		'/learn/kubectl/': '/catalog/?stage=kubectl-primer',
+		'/learn/controller/': '/catalog/?stage=controller-primer',
+	},
 	integrations: [
 		sitemap(),
 		starlight({
