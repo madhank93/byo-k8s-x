@@ -3,7 +3,7 @@
 // Keeping it out of catalog.astro stops every stage's solution from loading
 // with the table.
 import type { APIRoute } from 'astro';
-import { CATALOG } from '../../data/catalog';
+import { CATALOG, COURSES } from '../../data/catalog';
 
 type MdModule = {
   frontmatter: Record<string, unknown>;
@@ -18,8 +18,14 @@ const DETAILS = Object.fromEntries(
   )
 );
 
+// Stages, plus one primer per course that ships one — the catalog's primer row
+// and its ?stage=<course>-primer deep link fetch from here too.
 export function getStaticPaths() {
-  return CATALOG.map((e) => ({ params: { slug: `${e.course}-${e.slug}` } }));
+  const stages = CATALOG.map((e) => ({ params: { slug: `${e.course}-${e.slug}` } }));
+  const primers = Object.entries(COURSES)
+    .filter(([, c]) => c.primer)
+    .map(([course]) => ({ params: { slug: `${course}-primer` } }));
+  return [...stages, ...primers];
 }
 
 export const GET: APIRoute = async ({ params }) => {
