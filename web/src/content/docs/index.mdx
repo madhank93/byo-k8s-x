@@ -24,11 +24,16 @@ hero:
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
+import { COURSES } from '../../data/catalog';
+
+export const courseCount = Object.keys(COURSES).length;
+export const stageCount = Object.values(COURSES).reduce((n, c) => n + c.total, 0);
+export const kubectlStages = COURSES['kubectl'].total;
 
 ## What is byok8s?
 
 `byok8s` is a local course runner. You write one Go program and grow it across
-30 stages until it does what `kubectl` does — find the cluster, ask the server
+{kubectlStages} stages until it does what `kubectl` does — find the cluster, ask the server
 what it serves, resolve any resource through discovery and the RESTMapper,
 print tables, select, watch, apply with server-side apply, describe, and stream
 logs, exec and port-forward.
@@ -38,9 +43,10 @@ Nothing inspects your source: the verdict is your program's exit code and
 stdout, so any correct implementation passes.
 
 <CardGrid>
-  <Card title="30 stages" icon="puzzle">
-    From "which server, as whom?" to port-forward — each stage adds one
-    visible thing, and running a stage re-verifies every stage before it.
+  <Card title={`${stageCount} stages, ${courseCount} courses`} icon="puzzle">
+    From "which server, as whom?" to port-forward, then a controller of your
+    own — each stage adds one visible thing, and running a stage re-verifies
+    every stage before it.
   </Card>
   <Card title="A real cluster" icon="rocket">
     Graded against kind, in an isolated namespace per stage. `create
