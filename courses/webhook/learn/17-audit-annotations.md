@@ -46,6 +46,20 @@ request, and a warning that appears on every apply is one people stop reading.
 - The audit event these land in is `ResponseComplete`, at `Metadata` level or
   above.
 
+## What this stage checks
+
+- A pod that is admitted comes back with at least one audit annotation. Keys
+  are short and local — the API server adds the namespace prefix, so a key you
+  prefix yourself ends up prefixed twice.
+- A pod carrying the deprecated `byok8s.dev/delay` annotation comes back with a
+  warning that names it, and is still admitted.
+- A pod without that annotation comes back with no warnings at all. A warning
+  on every request is noise, and this stage treats it as one.
+- The warning reaches a real client: a create through client-go surfaces it on
+  the `Warning:` channel, the same place `kubectl` prints it from.
+- The verdict itself is unchanged — a pod with no `owner` label is still
+  refused.
+
 ## Hints
 
 <details><summary>Nudge</summary>

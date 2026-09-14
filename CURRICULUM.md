@@ -240,6 +240,65 @@ Host processes again. Independent of tiers 2 and 3 — take them whenever.
 
 ---
 
+## Tier 5 — isolation and safety
+
+Running code you did not write, and changing a cluster you cannot afford to
+break. The first two courses are about the blast radius of a workload; the
+third is about the blast radius of an apply.
+
+`microvm` and `sandbox` sit below tier 3 conceptually — they are what a
+`runtime` reaches for once "a container is a process with namespaces" stops
+being a strong enough answer — but either can be taken straight after
+`runtime`.
+
+### `microvm` — Build your own microVM runtime · 22 stages
+
+A VM thin enough to start per pod: no BIOS, no emulated hardware beyond virtio,
+a kernel booted directly and a jailer around the whole thing.
+
+`kvm-open` · `vcpu-create` · `memory-map` · `kernel-load` · `boot-params` ·
+`serial-console` · `virtio-queue` · `virtio-block` · `virtio-net` ·
+`rootfs-image` · `vsock` · `balloon` · `snapshot` · `restore` ·
+`jailer-chroot` · `seccomp-filter` · `cgroup-confine` · `api-socket` ·
+`boot-time` · `pod-sandbox` · `cri-shim` · `kubelet-drives-it`
+
+**Verified by** booting a guest and talking to it — serial output, a vsock
+round trip, a block device it can read — then proving the jailer holds when the
+guest misbehaves.
+
+### `sandbox` — Build your own syscall sandbox · 20 stages
+
+The other half of the same problem: keep the process on the host, but make the
+kernel surface it can reach small enough to reason about.
+
+`ptrace-trap` · `seccomp-bpf` · `syscall-table` · `user-ns` · `mount-ns-jail` ·
+`pivot-root` · `capability-drop` · `no-new-privs` · `landlock-fs` · `rlimits` ·
+`cgroup-limit` · `net-jail` · `file-broker` · `syscall-emulate` ·
+`signal-passthrough` · `exit-status` · `policy-file` · `violation-log` ·
+`escape-suite` · `oci-hook`
+
+**Verified by** an escape suite: a set of programs that each try one way out —
+a raw socket, a mount, a setuid exec, a path outside the jail — and must all
+fail while a legitimate workload still runs.
+
+### `safe-apply` — Build your own diff and safe apply · 18 stages
+
+What `kubectl diff` and `--server-side` actually do, and how to tell someone
+what a change will do before it does it.
+
+`manifest-load` · `live-fetch` · `three-way-merge` · `structured-diff` ·
+`diff-render` · `server-dry-run` · `admission-preview` · `managed-fields` ·
+`field-ownership` · `conflict-detect` · `force-conflicts` · `prune-plan` ·
+`prune-guard` · `drift-detect` · `impact-report` · `plan-file` · `apply-plan` ·
+`kubectl-parity`
+
+**Verified by** applying the same manifests through your tool and through
+`kubectl`, and requiring the cluster to end up in the same state — including
+`managedFields`, which is where server-side apply keeps its record of who owns
+what.
+
+---
+
 ## Authoring a stage
 
 The loop, and the two traps in it:

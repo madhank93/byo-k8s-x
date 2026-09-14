@@ -31,6 +31,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
 	"github.com/madhank93/byo-k8s-x/internal/runner"
@@ -80,6 +82,7 @@ func init() {
 	register(Stage{Slug: "timeout", Run: stageTimeout})
 	register(Stage{Slug: "reinvocation", Run: stageReinvocation})
 	register(Stage{Slug: "cert-rotation", Run: stageCertRotation})
+	register(Stage{Slug: "audit-annotations", Run: stageAuditAnnotations})
 }
 
 // stageServeTLS checks the one thing every later stage rests on: that the
@@ -238,6 +241,123 @@ func stageCertRotation(ctx context.Context, env *kube.Env, bin string) error {
 	if !strings.Contains(err.Error(), "denied the request") {
 		return fmt.Errorf("pod %q was refused after the rotation, but not by the webhook: %w", bad, err)
 	}
+	return nil
+}
+
+// stageAuditAnnotations checks the two things a verdict cannot carry: a line
+// in the audit log for whoever investigates months from now, and a warning for
+// whoever is running the command right now.
+//
+// Both belong on a response that *allows* the object, so neither can be read
+// off the admission decision. The stage asks the program directly for the
+// response fields, then creates a pod through the API server to prove the
+// warning survives the trip back to a client.
+func stageAuditAnnotations(ctx context.Context, env *kube.Env, bin string) error {
+	const deprecated = "byok8s.dev/delay"
+
+	port, err := freePort()
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://%s:%d/validate", externalHost, port)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+	defer sweepRegistrations(context.WithoutCancel(ctx), env)
+
+	p, cleanup, err := launch(ctx, env, bin, port)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := awaitLine(ctx, p, "serving", 60*time.Second); err != nil {
+		return err
+	}
+
+	if err := waitFor(ctx, "the program to register itself", 60*time.Second, func(ctx context.Context) (bool, error) {
+		_, ok, err := findRegistration(ctx, env, url)
+		return ok, err
+	}); err != nil {
+		return fmt.Errorf("no ValidatingWebhookConfiguration points at %s: %w", url, err)
+	}
+
+	owned := map[string]string{"owner": "platform"}
+	legacy := map[string]string{deprecated: "200ms"}
+
+	// The ordinary admitted pod. The audit trail has to exist when nothing is
+	// wrong, because that is the request an investigation starts from.
+	object, err := podObject("audited", env.Namespace, owned, nil)
+	if err != nil {
+		return err
+	}
+	admitted, err := askVerdict(ctx, addr, "audit-allowed", env.Namespace, object)
+	if err != nil {
+		return fmt.Errorf("%w\nthe program said:\n%s", err, tail(p.Stdout()))
+	}
+	if !admitted.Allowed {
+		return fmt.Errorf("a pod carrying an owner label was refused, so this stage cannot tell a missing audit trail from a rejection\nthe program said:\n%s", tail(p.Stdout()))
+	}
+	if len(admitted.AuditAnnotations) == 0 {
+		return fmt.Errorf("the response admitting the pod carries no auditAnnotations: an allowed request leaves no other trace, so nobody reading the audit log later can tell this webhook ran at all")
+	}
+	for k, v := range admitted.AuditAnnotations {
+		if k == "" || v == "" {
+			return fmt.Errorf("an audit annotation has an empty key or value (%q: %q), which records nothing", k, v)
+		}
+		if strings.Contains(k, "/") {
+			return fmt.Errorf("the audit annotation key %q is already namespaced: the API server prefixes these with the webhook's own name, so a key you prefix yourself arrives prefixed twice", k)
+		}
+	}
+	if len(admitted.Warnings) != 0 {
+		return fmt.Errorf("a pod that used nothing deprecated still came back with the warning %q: a warning on every request is one people stop reading, so keep it for the request that earns it", admitted.Warnings[0])
+	}
+
+	// The same pod plus the deprecated annotation: still admitted, and told why
+	// it will not be next time.
+	object, err = podObject("audited-legacy", env.Namespace, owned, legacy)
+	if err != nil {
+		return err
+	}
+	warned, err := askVerdict(ctx, addr, "audit-warned", env.Namespace, object)
+	if err != nil {
+		return fmt.Errorf("%w\nthe program said:\n%s", err, tail(p.Stdout()))
+	}
+	if !warned.Allowed {
+		return fmt.Errorf("the pod using %s was refused: a deprecation warns the people still on the old field, it does not break them", deprecated)
+	}
+	if len(warned.AuditAnnotations) == 0 {
+		return fmt.Errorf("the response to the pod using %s carries no auditAnnotations, although the plain pod's did", deprecated)
+	}
+	if !slices.ContainsFunc(warned.Warnings, func(w string) bool { return strings.Contains(w, deprecated) }) {
+		return fmt.Errorf("the pod using the deprecated %s annotation came back with warnings %q: none of them names the annotation, so nobody applying it learns what to change", deprecated, warned.Warnings)
+	}
+
+	// None of this is allowed to soften the verdict itself.
+	object, err = podObject("audited-no-owner", env.Namespace, nil, nil)
+	if err != nil {
+		return err
+	}
+	refused, err := askVerdict(ctx, addr, "audit-refused", env.Namespace, object)
+	if err != nil {
+		return fmt.Errorf("%w\nthe program said:\n%s", err, tail(p.Stdout()))
+	}
+	if refused.Allowed {
+		return fmt.Errorf("a pod with no owner label was admitted, so the policy was lost somewhere in the new response fields")
+	}
+
+	// The last hop is the one the learner cannot see from their own logs: the
+	// API server has to turn resp.Warnings into a header the client prints.
+	seen, err := warningsFromCreate(ctx, env, "audited-through-api", owned, legacy)
+	if err != nil {
+		return fmt.Errorf("%w\nthe program said:\n%s", err, tail(p.Stdout()))
+	}
+	if !slices.ContainsFunc(seen, func(w string) bool { return strings.Contains(w, deprecated) }) {
+		return fmt.Errorf("creating that pod through the API server surfaced the warnings %q to the client: resp.Warnings is what becomes the Warning: header kubectl prints, so an empty field is silence at the terminal", seen)
+	}
+
 	return nil
 }
 
@@ -1802,4 +1922,85 @@ func reviewFor(uid, namespace, object string) string {
 	    "object": %s
 	  }
 	}`, uid, namespace, object)
+}
+
+// podObject renders a pod as the raw JSON that goes inside an AdmissionReview.
+func podObject(name, namespace string, labels, annotations map[string]string) (string, error) {
+	pod := &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   namespace,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	raw, err := json.Marshal(pod)
+	if err != nil {
+		return "", fmt.Errorf("render pod %s: %w", name, err)
+	}
+	return string(raw), nil
+}
+
+// verdict is the part of an AdmissionResponse a stage reads when it asks the
+// program directly rather than through the API server.
+type verdict struct {
+	Allowed          bool              `json:"allowed"`
+	AuditAnnotations map[string]string `json:"auditAnnotations"`
+	Warnings         []string          `json:"warnings"`
+}
+
+// askVerdict posts one hand-built AdmissionReview and decodes the answer.
+func askVerdict(ctx context.Context, addr, uid, namespace, object string) (verdict, error) {
+	body, err := tlsPost(ctx, fmt.Sprintf("https://%s/validate", addr), reviewFor(uid, namespace, object))
+	if err != nil {
+		return verdict{}, fmt.Errorf("asking about %s got no answer: %w", uid, err)
+	}
+	var review struct {
+		Response verdict `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(body), &review); err != nil {
+		return verdict{}, fmt.Errorf("the reply to %s is not an AdmissionReview: %w\n%s", uid, err, tail(body))
+	}
+	return review.Response, nil
+}
+
+// warningsFromCreate creates a pod with a client that keeps the Warning:
+// headers instead of dropping them.
+//
+// The course's own client sets rest.NoWarnings so stage output stays readable,
+// which is exactly the channel this stage needs to watch.
+func warningsFromCreate(ctx context.Context, env *kube.Env, name string, labels, annotations map[string]string) ([]string, error) {
+	recorder := &warningRecorder{}
+	cfg := rest.CopyConfig(env.Config)
+	cfg.WarningHandler = recorder
+
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build a client that keeps warnings: %w", err)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels, Annotations: annotations},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	if _, err := client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return nil, fmt.Errorf("create pod %s: %w", name, err)
+	}
+	return recorder.seen, nil
+}
+
+// warningRecorder collects what the API server warned about. The handler runs
+// inline on the request's own goroutine, so the slice needs no lock.
+type warningRecorder struct{ seen []string }
+
+func (r *warningRecorder) HandleWarningHeader(code int, _ string, text string) {
+	if code != 299 || text == "" {
+		return
+	}
+	r.seen = append(r.seen, text)
 }

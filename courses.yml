@@ -86,3 +86,21 @@ entries:
     status: planned
     tier: the ecosystem
     blurb: PKI, static pods, bootstrap tokens — a control plane from nothing.
+
+  - slug: microvm
+    name: Build your own microVM runtime
+    status: planned
+    tier: isolation and safety
+    blurb: KVM, virtio, and a jailer — one VM per pod, booted in milliseconds.
+
+  - slug: sandbox
+    name: Build your own syscall sandbox
+    status: planned
+    tier: isolation and safety
+    blurb: seccomp-bpf, user namespaces, and Landlock around a process you do not trust.
+
+  - slug: safe-apply
+    name: Build your own diff and safe apply
+    status: planned
+    tier: isolation and safety
+    blurb: Server-side dry-run, a three-way diff, and a change you can read before it lands.
