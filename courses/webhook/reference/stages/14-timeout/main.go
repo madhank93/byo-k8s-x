@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,14 +40,6 @@ import (
 // The name of the configuration this program owns. One name means a restart
 // updates its own registration rather than accumulating a second one.
 const webhookConfigName = "byok8s-webhook"
-
-// A rotation has to be observable inside one run of the course, so the leaf is
-// far shorter-lived than a real one. Production intervals are hours or days;
-// the shape of the reload is what matters, not the numbers.
-const (
-	leafLifetime = 2 * time.Minute
-	rotateEvery  = 15 * time.Second
-)
 
 // The mark this webhook leaves, and the same key as a JSON Pointer: RFC 6901
 // gives `/` meaning inside a path, so it is escaped as `~1` there.
@@ -93,19 +84,10 @@ func run() error {
 	externalHost := flag.String("external-host", "host.docker.internal", "the name the API server reaches this program by")
 	flag.Parse()
 
-	ca, caKey, caDER, err := certAuthority(*externalHost)
+	cert, caDER, err := selfSigned(*externalHost)
 	if err != nil {
 		return err
 	}
-	leaf, err := leafFor(*externalHost, ca, caKey)
-	if err != nil {
-		return err
-	}
-	// Read per handshake rather than once at startup: tls.Config.Certificates
-	// is a fixed slice, and swapping it under a running server is a data race
-	// that open connections would not notice anyway.
-	var current atomic.Pointer[tls.Certificate]
-	current.Store(leaf)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -114,13 +96,9 @@ func run() error {
 	mux.HandleFunc("/mutate", mutate)
 
 	srv := &http.Server{
-		Addr:    *addr,
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-				return current.Load(), nil
-			},
-		},
+		Addr:      *addr,
+		Handler:   mux,
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}},
 		// A client that opens a connection and then says nothing otherwise
 		// holds it open for as long as it likes.
 		ReadHeaderTimeout: 5 * time.Second,
@@ -131,30 +109,6 @@ func run() error {
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
-	}()
-
-	// Rotating from the same CA keeps both halves valid at once: only the leaf
-	// changes, so the caBundle registered below never has to. Rotating on a
-	// timer rather than per request keeps the cost off the admission path.
-	go func() {
-		t := time.NewTicker(rotateEvery)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				next, err := leafFor(*externalHost, ca, caKey)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "rotate certificate: %v\n", err)
-					continue
-				}
-				current.Store(next)
-				// A rotation nobody can see is one nobody can correlate with
-				// the outage that followed it.
-				fmt.Printf("rotated certificate serial=%s expires=%s\n", next.Leaf.SerialNumber, next.Leaf.NotAfter.Format(time.RFC3339))
-			}
-		}
 	}()
 
 	// The API server reaches this program by URL rather than by Service,
@@ -393,10 +347,6 @@ func mutate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A reinvocation carries the uid of the call it repeats, so two of these
-	// lines with one uid is the second pass made visible.
-	fmt.Printf("mutate %s pods/%s uid=%s\n", review.Request.Operation, pod.Name, uid)
-
 	// Admission can deliver this program its own output — another webhook's
 	// patch triggers a second call — so every op below is emitted only when it
 	// is still missing: applying this twice changes nothing the first pass did.
@@ -493,93 +443,55 @@ func respondPatch(w http.ResponseWriter, uid types.UID, patch []byte) {
 	}
 }
 
-// certAuthority mints the CA a webhook's caBundle is built from.
+// selfSigned mints a certificate for the name the API server will use, and
+// returns it alongside the DER bytes a webhook's caBundle is built from.
 //
-// It signs the serving certificate and is never served itself, which is what
-// lets the leaf be replaced without touching the registration the API server
-// already trusts. A real deployment gets this from cert-manager or the
-// cluster's signer; the shape is the same — one bundle, many leaves under it.
-func certAuthority(host string) (*x509.Certificate, *ecdsa.PrivateKey, []byte, error) {
+// The certificate signs itself, so it is its own CA: whoever is told to trust
+// these bytes trusts this program and nothing else. A real deployment gets its
+// certificate from cert-manager or the cluster's signer, but the shape is the
+// same — something has to hand the API server a bundle it will accept.
+func selfSigned(host string) (*tls.Certificate, []byte, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("generate CA key: %w", err)
+		return nil, nil, fmt.Errorf("generate key: %w", err)
 	}
-	serial, err := serialNumber()
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	tmpl := &x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: host + " CA"},
-		NotBefore:             time.Now().Add(-time.Minute),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create CA certificate: %w", err)
-	}
-	ca, err := x509.ParseCertificate(der)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("parse CA certificate: %w", err)
-	}
-	return ca, key, der, nil
-}
-
-// leafFor mints the certificate the program presents, signed by the CA whose
-// bytes are already in the registration. Rotation is a new leaf, not a new
-// bundle.
-func leafFor(host string, ca *x509.Certificate, caKey *ecdsa.PrivateKey) (*tls.Certificate, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate key: %w", err)
-	}
-	serial, err := serialNumber()
-	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("serial number: %w", err)
 	}
 
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: host},
 		NotBefore:             time.Now().Add(-time.Minute),
-		NotAfter:              time.Now().Add(leafLifetime),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+		IsCA:                  true,
 		DNSNames:              []string{host},
 	}
-	// A caller reaching the webhook by address rather than by name — the
-	// harness does, over loopback — is checked against IP SANs, not DNS ones.
+	// A caller reaching the webhook by address rather than name — the harness
+	// does, over the loopback — is checked against the IP SANs, not the DNS
+	// ones.
 	if ip := net.ParseIP(host); ip != nil {
 		tmpl.IPAddresses = []net.IP{ip}
 	}
 	tmpl.IPAddresses = append(tmpl.IPAddresses, net.IPv4(127, 0, 0, 1), net.IPv6loopback)
 
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
-		return nil, fmt.Errorf("create certificate: %w", err)
+		return nil, nil, fmt.Errorf("create certificate: %w", err)
 	}
 	leaf, err := x509.ParseCertificate(der)
 	if err != nil {
-		return nil, fmt.Errorf("parse certificate: %w", err)
+		return nil, nil, fmt.Errorf("parse certificate: %w", err)
 	}
 	return &tls.Certificate{
 		Certificate: [][]byte{der},
 		PrivateKey:  key,
 		Leaf:        leaf,
-	}, nil
-}
-
-func serialNumber() (*big.Int, error) {
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return nil, fmt.Errorf("serial number: %w", err)
-	}
-	return serial, nil
+	}, der, nil
 }
 
 // clientConfig loads the kubeconfig the way every Kubernetes tool does, and
@@ -691,7 +603,6 @@ func registerMutating(ctx context.Context, cs kubernetes.Interface, url string, 
 	side := admissionregistrationv1.SideEffectClassNone
 	scope := admissionregistrationv1.NamespacedScope
 	timeout := int32(5)
-	reinvoke := admissionregistrationv1.IfNeededReinvocationPolicy
 
 	cfg := &admissionregistrationv1.MutatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: webhookConfigName},
@@ -713,11 +624,6 @@ func registerMutating(ctx context.Context, cs kubernetes.Interface, url string, 
 			FailurePolicy:  &fail,
 			SideEffects:    &side,
 			TimeoutSeconds: &timeout,
-			// Ordering among mutating webhooks is not ours to choose, so ask to
-			// be called again when someone later changed the object out from
-			// under the decision made here. It costs a second pass, and it is
-			// only safe because every op this program emits is conditional.
-			ReinvocationPolicy: &reinvoke,
 			// The patching half is scoped exactly like the judging half: a
 			// mutator loose in the control plane's namespaces edits objects the
 			// cluster needs in order to start.

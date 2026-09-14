@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,14 +41,6 @@ import (
 // updates its own registration rather than accumulating a second one.
 const webhookConfigName = "byok8s-webhook"
 
-// A rotation has to be observable inside one run of the course, so the leaf is
-// far shorter-lived than a real one. Production intervals are hours or days;
-// the shape of the reload is what matters, not the numbers.
-const (
-	leafLifetime = 2 * time.Minute
-	rotateEvery  = 15 * time.Second
-)
-
 // The mark this webhook leaves, and the same key as a JSON Pointer: RFC 6901
 // gives `/` meaning inside a path, so it is escaped as `~1` there.
 const (
@@ -59,13 +50,6 @@ const (
 
 // The floor handed to a container that asked for no CPU of its own.
 const defaultCPURequest = "100m"
-
-// Where this webhook writes down what it decided.
-const verdictConfigMap = "byok8s-admissions"
-
-// A pod may ask to be judged slowly. Nothing in production would offer this;
-// it exists so the caller's deadline can be watched from outside the program.
-const delayAnnotation = "byok8s.dev/delay"
 
 // Injection is opt-in: a workload asks for the sidecar by annotation, because a
 // webhook that injects into everything eventually injects into something that
@@ -93,37 +77,22 @@ func run() error {
 	externalHost := flag.String("external-host", "host.docker.internal", "the name the API server reaches this program by")
 	flag.Parse()
 
-	ca, caKey, caDER, err := certAuthority(*externalHost)
+	cert, caDER, err := selfSigned(*externalHost)
 	if err != nil {
 		return err
 	}
-	leaf, err := leafFor(*externalHost, ca, caKey)
-	if err != nil {
-		return err
-	}
-	// Read per handshake rather than once at startup: tls.Config.Certificates
-	// is a fixed slice, and swapping it under a running server is a data race
-	// that open connections would not notice anyway.
-	var current atomic.Pointer[tls.Certificate]
-	current.Store(leaf)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
+	mux.HandleFunc("/validate", validate)
 	mux.HandleFunc("/mutate", mutate)
 
 	srv := &http.Server{
-		Addr:    *addr,
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-				return current.Load(), nil
-			},
-		},
-		// A client that opens a connection and then says nothing otherwise
-		// holds it open for as long as it likes.
-		ReadHeaderTimeout: 5 * time.Second,
+		Addr:      *addr,
+		Handler:   mux,
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}},
 	}
 	go func() {
 		<-ctx.Done()
@@ -131,30 +100,6 @@ func run() error {
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
-	}()
-
-	// Rotating from the same CA keeps both halves valid at once: only the leaf
-	// changes, so the caBundle registered below never has to. Rotating on a
-	// timer rather than per request keeps the cost off the admission path.
-	go func() {
-		t := time.NewTicker(rotateEvery)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				next, err := leafFor(*externalHost, ca, caKey)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "rotate certificate: %v\n", err)
-					continue
-				}
-				current.Store(next)
-				// A rotation nobody can see is one nobody can correlate with
-				// the outage that followed it.
-				fmt.Printf("rotated certificate serial=%s expires=%s\n", next.Leaf.SerialNumber, next.Leaf.NotAfter.Format(time.RFC3339))
-			}
-		}
 	}()
 
 	// The API server reaches this program by URL rather than by Service,
@@ -168,12 +113,6 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("build clientset: %w", err)
 	}
-
-	// Wired here rather than above because recording a verdict needs a client,
-	// and there is no client until now.
-	mux.HandleFunc("/validate", func(w http.ResponseWriter, r *http.Request) {
-		validate(w, r, cs, ns)
-	})
 
 	_, port, err := net.SplitHostPort(*addr)
 	if err != nil {
@@ -211,13 +150,13 @@ func run() error {
 // The wrapper is the protocol: the same kind goes back, carrying the request's
 // uid and a verdict. A reply that loses the uid is discarded — the API server
 // cannot tell which request it answers.
-func validate(w http.ResponseWriter, r *http.Request, cs kubernetes.Interface, ns string) {
+func validate(w http.ResponseWriter, r *http.Request) {
 	// A panic would close the connection with no verdict in it, which reads to
 	// the API server as an unreachable webhook rather than as a bug here.
 	var uid types.UID
 	defer func() {
-		if rec := recover(); rec != nil {
-			fmt.Fprintf(os.Stderr, "panic while admitting: %v\n", rec)
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "panic while admitting: %v\n", r)
 			respond(w, uid, false, "the webhook failed while judging this object")
 		}
 	}()
@@ -234,125 +173,39 @@ func validate(w http.ResponseWriter, r *http.Request, cs kubernetes.Interface, n
 	uid = review.Request.UID
 
 	// A CREATE request may carry no name of its own — the name lives in the
-	// object — so metadata is read from there.
-	var meta metav1.PartialObjectMetadata
-	_ = json.Unmarshal(review.Request.Object.Raw, &meta)
+	// object — so it is read from there when the request field is empty.
 	name := review.Request.Name
 	if name == "" {
-		name = meta.Name
+		var meta metav1.PartialObjectMetadata
+		if err := json.Unmarshal(review.Request.Object.Raw, &meta); err == nil {
+			name = meta.Name
+		}
 	}
 	fmt.Printf("review %s %s/%s\n", review.Request.Operation, review.Request.Resource.Resource, name)
 
-	// The deadline belongs to the caller, so the wait watches the caller's
-	// context rather than a timer of this program's own. That is the difference
-	// between a handler that stops when its answer stopped being wanted and one
-	// that keeps working on a question nobody is listening to.
-	if !waited(r.Context(), meta.Annotations, name) {
-		return
-	}
-
-	allowed, message := decide(review.Request, name)
-
-	respond(w, uid, allowed, message)
-
-	// Without this the reply sits in the server's buffer until the handler
-	// returns, and "answer, then work" would still bill the caller for the work.
-	if err := http.NewResponseController(w).Flush(); err != nil {
-		fmt.Fprintf(os.Stderr, "flush reply for %s: %v\n", name, err)
-	}
-
-	// Answer first, then work: the record is not on the path the caller waits
-	// on. It deliberately outlives the request's context, because the reply has
-	// already gone and the verdict still has to be written down.
-	//
-	// The verdict a hypothetical request gets is provably the one a real request
-	// would have got, because the dry run only skips what happens after it.
-	if !dryRun(review.Request) {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-		defer cancel()
-		if err := recordVerdict(ctx, cs, ns, name, allowed); err != nil {
-			fmt.Fprintf(os.Stderr, "record verdict for %s: %v\n", name, err)
-		}
-	}
-}
-
-// waited honours a pod that asked to be judged slowly, and reports whether the
-// caller was still there at the end of it.
-//
-// Waiting on the context rather than on the clock is the whole lesson: when the
-// API server gives up, this returns immediately instead of holding a connection
-// nobody is reading.
-func waited(ctx context.Context, annotations map[string]string, name string) bool {
-	d, err := time.ParseDuration(annotations[delayAnnotation])
-	if err != nil || d <= 0 {
-		return true
-	}
-
-	select {
-	case <-time.After(d):
-		return true
-	case <-ctx.Done():
-		fmt.Printf("gave up on %s: the API server stopped waiting (%v)\n", name, ctx.Err())
-		return false
-	}
-}
-
-// decide is the whole policy: it reads a request and returns a verdict,
-// touching nothing outside it.
-func decide(req *admissionv1.AdmissionRequest, name string) (bool, string) {
 	// Rules live in the cluster, not in this program: something else can widen
 	// them. Anything that is not a pod is somebody else's business, and saying
 	// so is what keeps a widened rule from becoming an outage.
-	if req.Resource.Resource != "pods" {
-		return true, ""
+	if review.Request.Resource.Resource != "pods" {
+		respond(w, review.Request.UID, true, "")
+		return
 	}
 
 	var pod corev1.Pod
-	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
-		return false, fmt.Sprintf("this object could not be read as a pod: %v", err)
+	if err := json.Unmarshal(review.Request.Object.Raw, &pod); err != nil {
+		respond(w, review.Request.UID, false, fmt.Sprintf("this object could not be read as a pod: %v", err))
+		return
 	}
 
 	// The message is the whole explanation whoever applied the pod will get:
 	// nothing else points at this program, so it says what was wrong and what
 	// would have been right.
 	if pod.Labels["owner"] == "" {
-		return false, fmt.Sprintf("pod %q has no owner label: every pod must say who owns it", name)
+		respond(w, review.Request.UID, false, fmt.Sprintf("pod %q has no owner label: every pod must say who owns it", name))
+		return
 	}
 
-	return true, ""
-}
-
-// dryRun reports whether this request is hypothetical.
-//
-// The field is a pointer and nil on an ordinary request, so it is never
-// dereferenced without asking.
-func dryRun(req *admissionv1.AdmissionRequest) bool {
-	return req.DryRun != nil && *req.DryRun
-}
-
-// recordVerdict writes down what was decided. This is the side effect a dry run
-// has to suppress: the request never happened, so neither did the record.
-//
-// It patches rather than reading and writing back, because several admissions
-// are in flight at once and a read-modify-write loses the ones it did not see.
-func recordVerdict(ctx context.Context, cs kubernetes.Interface, ns, name string, allowed bool) error {
-	verdict := "denied"
-	if allowed {
-		verdict = "allowed"
-	}
-	patch := fmt.Appendf(nil, `{"data":{%q:%q}}`, name, verdict)
-
-	_, err := cs.CoreV1().ConfigMaps(ns).Patch(ctx, verdictConfigMap, types.MergePatchType, patch, metav1.PatchOptions{})
-	if apierrors.IsNotFound(err) {
-		_, err = cs.CoreV1().ConfigMaps(ns).Create(ctx, &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: verdictConfigMap, Namespace: ns},
-			Data:       map[string]string{name: verdict},
-		}, metav1.CreateOptions{})
-		if apierrors.IsAlreadyExists(err) {
-			_, err = cs.CoreV1().ConfigMaps(ns).Patch(ctx, verdictConfigMap, types.MergePatchType, patch, metav1.PatchOptions{})
-		}
-	}
-	return err
+	respond(w, review.Request.UID, true, "")
 }
 
 // mutate answers with a patch describing a change rather than with a verdict.
@@ -392,10 +245,6 @@ func mutate(w http.ResponseWriter, r *http.Request) {
 		respond(w, uid, true, "")
 		return
 	}
-
-	// A reinvocation carries the uid of the call it repeats, so two of these
-	// lines with one uid is the second pass made visible.
-	fmt.Printf("mutate %s pods/%s uid=%s\n", review.Request.Operation, pod.Name, uid)
 
 	// Admission can deliver this program its own output — another webhook's
 	// patch triggers a second call — so every op below is emitted only when it
@@ -493,93 +342,55 @@ func respondPatch(w http.ResponseWriter, uid types.UID, patch []byte) {
 	}
 }
 
-// certAuthority mints the CA a webhook's caBundle is built from.
+// selfSigned mints a certificate for the name the API server will use, and
+// returns it alongside the DER bytes a webhook's caBundle is built from.
 //
-// It signs the serving certificate and is never served itself, which is what
-// lets the leaf be replaced without touching the registration the API server
-// already trusts. A real deployment gets this from cert-manager or the
-// cluster's signer; the shape is the same — one bundle, many leaves under it.
-func certAuthority(host string) (*x509.Certificate, *ecdsa.PrivateKey, []byte, error) {
+// The certificate signs itself, so it is its own CA: whoever is told to trust
+// these bytes trusts this program and nothing else. A real deployment gets its
+// certificate from cert-manager or the cluster's signer, but the shape is the
+// same — something has to hand the API server a bundle it will accept.
+func selfSigned(host string) (*tls.Certificate, []byte, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("generate CA key: %w", err)
+		return nil, nil, fmt.Errorf("generate key: %w", err)
 	}
-	serial, err := serialNumber()
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	tmpl := &x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: host + " CA"},
-		NotBefore:             time.Now().Add(-time.Minute),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create CA certificate: %w", err)
-	}
-	ca, err := x509.ParseCertificate(der)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("parse CA certificate: %w", err)
-	}
-	return ca, key, der, nil
-}
-
-// leafFor mints the certificate the program presents, signed by the CA whose
-// bytes are already in the registration. Rotation is a new leaf, not a new
-// bundle.
-func leafFor(host string, ca *x509.Certificate, caKey *ecdsa.PrivateKey) (*tls.Certificate, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate key: %w", err)
-	}
-	serial, err := serialNumber()
-	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("serial number: %w", err)
 	}
 
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: host},
 		NotBefore:             time.Now().Add(-time.Minute),
-		NotAfter:              time.Now().Add(leafLifetime),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+		IsCA:                  true,
 		DNSNames:              []string{host},
 	}
-	// A caller reaching the webhook by address rather than by name — the
-	// harness does, over loopback — is checked against IP SANs, not DNS ones.
+	// A caller reaching the webhook by address rather than name — the harness
+	// does, over the loopback — is checked against the IP SANs, not the DNS
+	// ones.
 	if ip := net.ParseIP(host); ip != nil {
 		tmpl.IPAddresses = []net.IP{ip}
 	}
 	tmpl.IPAddresses = append(tmpl.IPAddresses, net.IPv4(127, 0, 0, 1), net.IPv6loopback)
 
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
-		return nil, fmt.Errorf("create certificate: %w", err)
+		return nil, nil, fmt.Errorf("create certificate: %w", err)
 	}
 	leaf, err := x509.ParseCertificate(der)
 	if err != nil {
-		return nil, fmt.Errorf("parse certificate: %w", err)
+		return nil, nil, fmt.Errorf("parse certificate: %w", err)
 	}
 	return &tls.Certificate{
 		Certificate: [][]byte{der},
 		PrivateKey:  key,
 		Leaf:        leaf,
-	}, nil
-}
-
-func serialNumber() (*big.Int, error) {
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return nil, fmt.Errorf("serial number: %w", err)
-	}
-	return serial, nil
+	}, der, nil
 }
 
 // clientConfig loads the kubeconfig the way every Kubernetes tool does, and
@@ -603,15 +414,8 @@ func clientConfig() (*rest.Config, string, error) {
 // ValidatingWebhookConfiguration. An Ignore failure policy means a request is
 // admitted when the webhook is unreachable.
 func register(ctx context.Context, cs kubernetes.Interface, url string, caBundle []byte, namespace string) error {
-	// A rule that may be bypassed by killing this process is not a rule, so the
-	// judging half fails closed: while it is down, nothing it matches is
-	// written. That makes this program a dependency of every pod create in the
-	// namespaces it selects, which is the price of the guarantee.
-	fail := admissionregistrationv1.Fail
-	// This half records what it admits, so it does have a side effect — and
-	// suppresses it on a dry run. Declaring None here would be a lie the API
-	// server has no way to check.
-	side := admissionregistrationv1.SideEffectClassNoneOnDryRun
+	fail := admissionregistrationv1.Ignore
+	side := admissionregistrationv1.SideEffectClassNone
 	scope := admissionregistrationv1.NamespacedScope
 	timeout := int32(5)
 
@@ -691,7 +495,6 @@ func registerMutating(ctx context.Context, cs kubernetes.Interface, url string, 
 	side := admissionregistrationv1.SideEffectClassNone
 	scope := admissionregistrationv1.NamespacedScope
 	timeout := int32(5)
-	reinvoke := admissionregistrationv1.IfNeededReinvocationPolicy
 
 	cfg := &admissionregistrationv1.MutatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: webhookConfigName},
@@ -713,11 +516,6 @@ func registerMutating(ctx context.Context, cs kubernetes.Interface, url string, 
 			FailurePolicy:  &fail,
 			SideEffects:    &side,
 			TimeoutSeconds: &timeout,
-			// Ordering among mutating webhooks is not ours to choose, so ask to
-			// be called again when someone later changed the object out from
-			// under the decision made here. It costs a second pass, and it is
-			// only safe because every op this program emits is conditional.
-			ReinvocationPolicy: &reinvoke,
 			// The patching half is scoped exactly like the judging half: a
 			// mutator loose in the control plane's namespaces edits objects the
 			// cluster needs in order to start.

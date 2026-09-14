@@ -234,6 +234,34 @@ func (p *Process) Stop(grace time.Duration) *Result {
 	}
 }
 
+// Kill stops the program the way a crash does: SIGKILL to the process group,
+// with no SIGTERM first.
+//
+// A program that tidies up on SIGTERM never gets the chance, which is the
+// point. A stage that needs the cluster to see the program as simply gone —
+// registration still in place, nothing listening — cannot let it unregister on
+// the way out.
+func (p *Process) Kill() *Result {
+	defer p.cancel()
+
+	p.mu.Lock()
+	cached := p.result
+	p.mu.Unlock()
+	if cached != nil {
+		return cached
+	}
+
+	if p.cmd.Process != nil {
+		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+	}
+	select {
+	case err := <-p.done:
+		return p.finish(err)
+	case <-time.After(3 * time.Second):
+		return &Result{Stdout: p.Stdout(), Stderr: p.Stderr(), ExitCode: -1}
+	}
+}
+
 // finish records the exit once, so Exited followed by Stop returns the same
 // answer rather than blocking on a channel that has already been drained.
 func (p *Process) finish(err error) *Result {
