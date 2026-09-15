@@ -58,6 +58,26 @@ else. Knowing which you have is the point of writing both.
   together is legal.
 - `variables:` in the policy, to name a subexpression used more than once.
 
+## What this stage checks
+
+- A `ValidatingAdmissionPolicy` covering pods exists, with at least one
+  validation carrying an expression and a message, and a
+  `ValidatingAdmissionPolicyBinding` that names it with `Deny` among its
+  validation actions.
+- The binding narrows something. A binding with no `matchResources` applies
+  its policy to every namespace in the cluster, including the ones the control
+  plane needs to start.
+- With the program killed and its webhook registrations deleted, the rule
+  still holds: a pod with no `owner` label is refused, and the refusal names
+  the policy rather than a webhook. That is the claim — the rule no longer
+  depends on your program being up.
+- A pod that carries the label is still admitted, so the policy is the same
+  rule and not a blanket refusal.
+- Every narrowing the webhook already had is reproduced. The policy runs for
+  all the earlier stages too, so anything the webhook deliberately skips — the
+  `byok8s.dev/skip` label, the exempt writer — the policy has to skip as well,
+  or it starts refusing objects those stages expect to be admitted.
+
 ## Hints
 
 <details><summary>Nudge</summary>

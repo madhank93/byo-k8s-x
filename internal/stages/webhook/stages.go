@@ -85,6 +85,7 @@ func init() {
 	register(Stage{Slug: "cert-rotation", Run: stageCertRotation})
 	register(Stage{Slug: "audit-annotations", Run: stageAuditAnnotations})
 	register(Stage{Slug: "match-conditions", Run: stageMatchConditions})
+	register(Stage{Slug: "validating-admission-policy", Run: stageValidatingAdmissionPolicy})
 }
 
 // stageServeTLS checks the one thing every later stage rests on: that the
@@ -488,6 +489,105 @@ func stageMatchConditions(ctx context.Context, env *kube.Env, bin string) error 
 
 	if strings.Contains(p.Stdout(), skipped) {
 		return fmt.Errorf("pod %s was admitted, but this program logged a request for it: the exemption is being made in the handler, so the round trip was paid to reach a verdict the API server could have skipped, and it stops applying the moment this program is down\nthe program said:\n%s", skipped, tail(p.Stdout()))
+	}
+
+	return nil
+}
+
+// stageValidatingAdmissionPolicy checks the rule survives the program.
+//
+// Everything before this stage exists because the API server had no way to
+// evaluate the rule itself. It does now, and the test of whether the rule has
+// really moved is to take the program away: kill it, delete its registrations,
+// and ask the cluster the same question. A webhook cannot answer it. A policy
+// does not need to.
+func stageValidatingAdmissionPolicy(ctx context.Context, env *kube.Env, bin string) error {
+	port, err := freePort()
+	if err != nil {
+		return err
+	}
+
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+	defer sweepRegistrations(context.WithoutCancel(ctx), env)
+	if err := sweepPolicies(ctx, env); err != nil {
+		return err
+	}
+	defer sweepPolicies(context.WithoutCancel(ctx), env)
+
+	// The one stage that keeps the policy: it is the thing under test.
+	p, cleanup, err := launchKeepingPolicy(ctx, env, bin, port)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := awaitLine(ctx, p, "serving", 60*time.Second); err != nil {
+		return err
+	}
+
+	var policy admissionregistrationv1.ValidatingAdmissionPolicy
+	var binding admissionregistrationv1.ValidatingAdmissionPolicyBinding
+	if err := waitFor(ctx, "the program to install a policy and bind it", 60*time.Second, func(ctx context.Context) (bool, error) {
+		foundPolicy, foundBinding, ok, err := findPolicy(ctx, env)
+		if err != nil || !ok {
+			return false, err
+		}
+		policy, binding = foundPolicy, foundBinding
+		return true, nil
+	}); err != nil {
+		return fmt.Errorf("no bound ValidatingAdmissionPolicy covering pods exists: the rule has to live in an object the API server evaluates itself, not in a program it calls: %w\nthe program said:\n%s", err, tail(p.Stdout()))
+	}
+
+	if len(policy.Spec.Validations) == 0 {
+		return fmt.Errorf("policy %s declares no validations, so it admits everything it matches", policy.Name)
+	}
+	for _, v := range policy.Spec.Validations {
+		if v.Expression == "" {
+			return fmt.Errorf("a validation in policy %s has no expression", policy.Name)
+		}
+		if v.Message == "" && v.MessageExpression == "" {
+			return fmt.Errorf("a validation in policy %s carries no message, so whoever it refuses is told only that an expression was false", policy.Name)
+		}
+	}
+	if !slices.Contains(binding.Spec.ValidationActions, admissionregistrationv1.Deny) {
+		return fmt.Errorf("binding %s does not list Deny among its validation actions (%v), so the policy reports rather than enforces", binding.Name, binding.Spec.ValidationActions)
+	}
+	if m := binding.Spec.MatchResources; m == nil || (m.NamespaceSelector == nil && m.ObjectSelector == nil && len(m.ResourceRules) == 0) {
+		return fmt.Errorf("binding %s narrows nothing, so policy %s applies in every namespace in the cluster, including the ones the control plane needs in order to start", binding.Name, policy.Name)
+	}
+
+	// Take the program away. The registrations go with it, so nothing is left
+	// that could answer an admission request on its behalf.
+	p.Kill()
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+
+	// A binding does not begin denying the moment it is written: the API server
+	// picks it up asynchronously, so one create here would race that and let a
+	// pod past a policy that is real. Retry until it bites, deleting whatever
+	// slipped through in the meantime.
+	var refusal error
+	if err := waitFor(ctx, "the policy to refuse a pod with no owner label", 30*time.Second, func(ctx context.Context) (bool, error) {
+		if err := deletePod(ctx, env.Client, env.Namespace, "policy-no-owner"); err != nil {
+			return false, err
+		}
+		refusal = seedPod(ctx, env, "policy-no-owner", nil, nil)
+		return refusal != nil, nil
+	}); err != nil {
+		return fmt.Errorf("with the program gone and its registrations deleted, a pod with no owner label was admitted: the rule is still the program's, not the cluster's")
+	}
+	if !strings.Contains(refusal.Error(), "ValidatingAdmissionPolicy") {
+		return fmt.Errorf("the pod was refused, but not by a policy (%v): with no webhook registered this refusal should name the ValidatingAdmissionPolicy that produced it", refusal)
+	}
+
+	if err := deletePod(ctx, env.Client, env.Namespace, "policy-owned"); err != nil {
+		return err
+	}
+	if err := seedPod(ctx, env, "policy-owned", map[string]string{"owner": "platform"}, nil); err != nil {
+		return fmt.Errorf("a pod carrying an owner label was refused by the policy: %w", err)
 	}
 
 	return nil
@@ -1012,10 +1112,41 @@ func stageDeny(ctx context.Context, env *kube.Env, bin string) error {
 
 // --- helpers ---------------------------------------------------------------
 
-// launch starts the learner's webhook with a kubeconfig scoped to this stage's
-// namespace, the port it should listen on, and the name the API server will
-// reach it by.
+// launch starts the learner's webhook and removes any admission policy the
+// program installed on the way up.
+//
+// The program is cumulative: from the policy stage on it installs a policy at
+// every start, and the API server evaluates a policy before it calls any
+// webhook. Left in place, the policy would answer the very requests these
+// stages put to the webhook, and it would answer them in its own words. Every
+// stage but the policy stage therefore takes it back out, so that what the
+// webhook does is what gets measured.
 func launch(ctx context.Context, env *kube.Env, bin string, port int) (*runner.Process, func(), error) {
+	p, cleanup, err := launchKeepingPolicy(ctx, env, bin, port)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The policy is installed before the program says it is serving, so by
+	// this line there is nothing left to race with.
+	if err := awaitLine(ctx, p, "serving", 60*time.Second); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if err := sweepPolicies(ctx, env); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if err := awaitPolicyQuiet(ctx, env); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return p, cleanup, nil
+}
+
+// launchKeepingPolicy starts the learner's webhook with a kubeconfig scoped to
+// this stage's namespace, the port it should listen on, and the name the API
+// server will reach it by.
+func launchKeepingPolicy(ctx context.Context, env *kube.Env, bin string, port int) (*runner.Process, func(), error) {
 	kc, cleanupEnv, err := scoped(env)
 	if err != nil {
 		return nil, nil, err
@@ -2178,6 +2309,127 @@ func grantNamespaceWrite(ctx context.Context, env *kube.Env, user string) error 
 		return fmt.Errorf("bind that role to %s: %w", user, err)
 	}
 	return nil
+}
+
+// findPolicy returns the first bound policy that covers pods.
+//
+// The learner names these objects, so they are found by what they do rather
+// than by what they are called: a binding, the policy it names, and a rule in
+// that policy matching pods.
+func findPolicy(ctx context.Context, env *kube.Env) (admissionregistrationv1.ValidatingAdmissionPolicy, admissionregistrationv1.ValidatingAdmissionPolicyBinding, bool, error) {
+	var noPolicy admissionregistrationv1.ValidatingAdmissionPolicy
+	var noBinding admissionregistrationv1.ValidatingAdmissionPolicyBinding
+
+	bindings, err := env.Client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return noPolicy, noBinding, false, fmt.Errorf("list policy bindings: %w", err)
+	}
+
+	for _, binding := range bindings.Items {
+		if binding.Spec.PolicyName == "" {
+			continue
+		}
+		policy, err := env.Client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, binding.Spec.PolicyName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return noPolicy, noBinding, false, fmt.Errorf("read policy %s: %w", binding.Spec.PolicyName, err)
+		}
+		if policyCoversPods(*policy) {
+			return *policy, binding, true, nil
+		}
+	}
+	return noPolicy, noBinding, false, nil
+}
+
+// policyCoversPods reports whether a rule in the policy matches creating a pod.
+func policyCoversPods(policy admissionregistrationv1.ValidatingAdmissionPolicy) bool {
+	if policy.Spec.MatchConstraints == nil {
+		return false
+	}
+	for _, r := range policy.Spec.MatchConstraints.ResourceRules {
+		hasCreate := slices.Contains(r.Operations, admissionregistrationv1.Create) || slices.Contains(r.Operations, admissionregistrationv1.OperationAll)
+		if hasCreate && slices.Contains(r.Resources, "pods") {
+			return true
+		}
+	}
+	return false
+}
+
+// sweepPolicies deletes the policies this course installs.
+//
+// Policies and their bindings are cluster-scoped, so one left behind by a
+// failed stage denies pods in every later stage that shares its namespace
+// selector — a failure that shows up nowhere near the stage that caused it.
+func sweepPolicies(ctx context.Context, env *kube.Env) error {
+	api := env.Client.AdmissionregistrationV1()
+
+	bindings, err := api.ValidatingAdmissionPolicyBindings().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list policy bindings: %w", err)
+	}
+	for _, binding := range bindings.Items {
+		if !bindsCourseNamespace(binding) {
+			continue
+		}
+		if err := api.ValidatingAdmissionPolicyBindings().Delete(ctx, binding.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete policy binding %s: %w", binding.Name, err)
+		}
+		if binding.Spec.PolicyName == "" {
+			continue
+		}
+		if err := api.ValidatingAdmissionPolicies().Delete(ctx, binding.Spec.PolicyName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete policy %s: %w", binding.Spec.PolicyName, err)
+		}
+	}
+	return nil
+}
+
+// awaitPolicyQuiet waits until the API server has stopped enforcing a policy
+// that has already been deleted.
+//
+// Deleting a policy is as asynchronous as writing one: for the best part of a
+// second afterwards the API server still refuses what the policy refused, and
+// a stage that writes inside that window is answered by an object that no
+// longer exists. The probe is a server-side dry run, so it asks admission the
+// same question without leaving a pod behind. Any other refusal — the
+// webhook's own, most often — means the policy is no longer the one answering.
+func awaitPolicyQuiet(ctx context.Context, env *kube.Env) error {
+	probe := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "byok8s-policy-probe", Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	return waitFor(ctx, "the API server to stop enforcing a deleted policy", 30*time.Second, func(ctx context.Context) (bool, error) {
+		_, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, probe, metav1.CreateOptions{
+			DryRun: []string{metav1.DryRunAll},
+		})
+		if err == nil {
+			return true, nil
+		}
+		return !strings.Contains(err.Error(), "ValidatingAdmissionPolicy"), nil
+	})
+}
+
+// bindsCourseNamespace reports whether a binding targets a namespace this
+// course created, which is what makes it ours to delete.
+func bindsCourseNamespace(binding admissionregistrationv1.ValidatingAdmissionPolicyBinding) bool {
+	if strings.HasPrefix(binding.Name, "byok8s") || strings.HasPrefix(binding.Spec.PolicyName, "byok8s") {
+		return true
+	}
+	if binding.Spec.MatchResources == nil || binding.Spec.MatchResources.NamespaceSelector == nil {
+		return false
+	}
+	for _, req := range binding.Spec.MatchResources.NamespaceSelector.MatchExpressions {
+		for _, v := range req.Values {
+			if strings.HasPrefix(v, "bko-") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // deletePod removes a pod left by an earlier run, so that a create which must
