@@ -1,0 +1,11 @@
+slug: scheduler
+name: Build your own scheduler
+language: go
+entrypoint: main.go
+# Stages assert which node a pod lands on, so the cluster needs nodes to choose
+# between: three workers beside the control plane.
+workers: 3
+stages:
+  - slug: watch-unscheduled
+    name: Find the pods waiting for you
+    difficulty: easy
