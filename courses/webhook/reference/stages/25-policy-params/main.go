@@ -36,7 +36,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -223,21 +222,19 @@ func run() error {
 	// The caBundle is parsed as PEM, not as the DER the certificate was built
 	// from: raw bytes there fail inside the API server, not at registration.
 	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
-	// Installed, and deliberately not removed on the way out: a policy that
-	// disappeared when this program stopped would have none of the property
-	// that makes it worth writing. It goes in before the webhooks because it
-	// seeds an OwnerList, which the webhook judges and cannot answer for until
-	// the server below is serving.
-	if err := installPolicy(ctx, cs, dyn, ns, ownNS); err != nil {
-		return err
-	}
-	fmt.Printf("installed policy %s\n", policyObjectName)
 	if err := register(ctx, cs, url, caPEM, ns, ownNS); err != nil {
 		return err
 	}
 	if err := registerMutating(ctx, cs, mutateURL, caPEM, ns, ownNS); err != nil {
 		return err
 	}
+	// Installed, and deliberately not removed on the way out: a policy that
+	// disappeared when this program stopped would have none of the property
+	// that makes it worth writing.
+	if err := installPolicy(ctx, cs, dyn, ns, ownNS); err != nil {
+		return err
+	}
+	fmt.Printf("installed policy %s\n", policyObjectName)
 	defer func() {
 		if err := unregister(cs); err != nil {
 			fmt.Fprintf(os.Stderr, "unregister: %v\n", err)
@@ -529,9 +526,6 @@ func decide(req *admissionv1.AdmissionRequest, name string) (bool, string) {
 	// Rules live in the cluster, not in this program: something else can widen
 	// them. Anything that is not a pod is somebody else's business, and saying
 	// so is what keeps a widened rule from becoming an outage.
-	if req.Resource.Resource == "ownerlists" {
-		return decideOwnerList(req)
-	}
 	if req.Resource.Resource != "pods" {
 		return true, ""
 	}
@@ -604,20 +598,10 @@ var ownerListResource = schema.GroupVersionResource{Group: "byok8s.dev", Version
 
 // ensureOwnerLists installs the OwnerList type and seeds this namespace's list.
 //
-// The type is the program's and is kept current. A list is created only if
-// absent: once it exists it belongs to whoever runs the namespace, so a
-// restart must not undo their edit.
+// Both are created only if absent: the type is shared by every namespace, and
+// once a list exists it belongs to whoever runs the namespace, so a restart
+// must not undo their edit.
 func ensureOwnerLists(ctx context.Context, dyn dynamic.Interface, namespace string) error {
-	openAPI := map[string]any{"openAPIV3Schema": map[string]any{
-		"type": "object",
-		"properties": map[string]any{"spec": map[string]any{
-			"type": "object",
-			"properties": map[string]any{"owners": map[string]any{
-				"type":  "array",
-				"items": map[string]any{"type": "string"},
-			}},
-		}},
-	}}
 	crd := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apiextensions.k8s.io/v1",
 		"kind":       "CustomResourceDefinition",
@@ -626,36 +610,25 @@ func ensureOwnerLists(ctx context.Context, dyn dynamic.Interface, namespace stri
 			"group": "byok8s.dev",
 			"scope": "Namespaced",
 			"names": map[string]any{"plural": "ownerlists", "singular": "ownerlist", "kind": "OwnerList"},
-			// v1beta1 is an older spelling of the same object, still served: a
-			// client written against it writes the same lists by another
-			// version. Only v1 is stored.
-			"versions": []any{
-				map[string]any{
-					"name":    "v1",
-					"served":  true,
-					"storage": true,
-					"schema":  openAPI,
-				},
-				map[string]any{
-					"name":    "v1beta1",
-					"served":  true,
-					"storage": false,
-					"schema":  openAPI,
-				},
-			},
+			"versions": []any{map[string]any{
+				"name":    "v1",
+				"served":  true,
+				"storage": true,
+				"schema": map[string]any{"openAPIV3Schema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{"spec": map[string]any{
+						"type": "object",
+						"properties": map[string]any{"owners": map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "string"},
+						}},
+					}},
+				}},
+			}},
 		},
 	}}
 	crds := dyn.Resource(schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"})
-	_, err := crds.Create(ctx, crd, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		existing, getErr := crds.Get(ctx, crd.GetName(), metav1.GetOptions{})
-		if getErr != nil {
-			return fmt.Errorf("read OwnerList type: %w", getErr)
-		}
-		crd.SetResourceVersion(existing.GetResourceVersion())
-		_, err = crds.Update(ctx, crd, metav1.UpdateOptions{})
-	}
-	if err != nil {
+	if _, err := crds.Create(ctx, crd, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("install OwnerList type: %w", err)
 	}
 
@@ -678,32 +651,6 @@ func ensureOwnerLists(ctx context.Context, dyn dynamic.Interface, namespace stri
 			return false, fmt.Errorf("seed OwnerList %s: %w", ownerListName, err)
 		}
 	})
-}
-
-// decideOwnerList judges an allowlist before the policy can read it. A list
-// with no owners, or with an owner no label can ever carry, locks the
-// namespace out with no pod to blame.
-//
-// The object arrives in the version the rule names, whatever version the
-// client wrote, so it is decoded without looking at its apiVersion.
-func decideOwnerList(req *admissionv1.AdmissionRequest) (bool, string) {
-	var list struct {
-		Spec struct {
-			Owners []string `json:"owners"`
-		} `json:"spec"`
-	}
-	if err := json.Unmarshal(req.Object.Raw, &list); err != nil {
-		return false, fmt.Sprintf("this object could not be read as an OwnerList: %v", err)
-	}
-	if len(list.Spec.Owners) == 0 {
-		return false, "an OwnerList with no owners refuses every pod in its namespace"
-	}
-	for _, owner := range list.Spec.Owners {
-		if errs := validation.IsValidLabelValue(owner); len(errs) > 0 {
-			return false, fmt.Sprintf("owner %q can never match an owner label: %s", owner, errs[0])
-		}
-	}
-	return true, ""
 }
 
 // dryRun reports whether this request is hypothetical.
@@ -999,11 +946,6 @@ func register(ctx context.Context, cs kubernetes.Interface, url string, caBundle
 	scope := admissionregistrationv1.NamespacedScope
 	timeout := int32(5)
 
-	// Equivalent is the default in v1, spelled out because the old default,
-	// Exact, matches only the versions a rule names: a client writing through
-	// another version of the same resource would never be asked.
-	equivalent := admissionregistrationv1.Equivalent
-
 	cfg := &admissionregistrationv1.ValidatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: webhookConfigName},
 		Webhooks: []admissionregistrationv1.ValidatingWebhook{{
@@ -1037,19 +979,7 @@ func register(ctx context.Context, cs kubernetes.Interface, url string, caBundle
 					Resources:   []string{"pods/eviction"},
 					Scope:       &scope,
 				},
-			}, {
-				// The allowlist the policy reads: a malformed one locks a
-				// namespace out as surely as a wrong rule. Only v1 is named;
-				// MatchPolicy below is what sends a v1beta1 write here too.
-				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
-				Rule: admissionregistrationv1.Rule{
-					APIGroups:   []string{"byok8s.dev"},
-					APIVersions: []string{"v1"},
-					Resources:   []string{"ownerlists"},
-					Scope:       &scope,
-				},
 			}},
-			MatchPolicy:    &equivalent,
 			FailurePolicy:  &fail,
 			SideEffects:    &side,
 			TimeoutSeconds: &timeout,

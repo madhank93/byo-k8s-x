@@ -38,6 +38,23 @@ patch, scale, describe, logs, exec, port-forward.
 **Verified by** running your binary as a subprocess against a seeded namespace
 and asserting on its exit code and stdout.
 
+### `safe-apply` — Build your own diff and safe apply · 18 stages
+
+What `kubectl diff` and `--server-side` actually do, and how to tell someone
+what a change will do before it does it. Takes `kubectl`'s apply stages as its
+floor and goes past them, into ownership and drift.
+
+`manifest-load` · `live-fetch` · `three-way-merge` · `structured-diff` ·
+`diff-render` · `server-dry-run` · `admission-preview` · `managed-fields` ·
+`field-ownership` · `conflict-detect` · `force-conflicts` · `prune-plan` ·
+`prune-guard` · `drift-detect` · `impact-report` · `plan-file` · `apply-plan` ·
+`kubectl-parity`
+
+**Verified by** applying the same manifests through your tool and through
+`kubectl`, and requiring the cluster to end up in the same state — including
+`managedFields`, which is where server-side apply keeps its record of who owns
+what.
+
 ---
 
 ## Tier 1 — control loops
@@ -86,7 +103,7 @@ Service, owned, repaired, reported on and cleaned up after.
 **Verified by** starting your binary, mutating the cluster, and waiting for it
 to converge — then stopping it and checking it let go cleanly.
 
-### `webhook` — Build your own admission webhook · 20 stages
+### `webhook` — Build your own admission webhook · 26 stages
 
 Serving TLS, `AdmissionReview` in and out, mutation by JSON patch, and the
 operational traps that take clusters down.
@@ -96,7 +113,7 @@ operational traps that take clusters down.
 `mutate-patch` · `defaulting` · `sidecar-inject` · `dry-run` ·
 `failure-policy` · `timeout` · `reinvocation` · `cert-rotation` ·
 `audit-annotations` · `match-conditions` · `validating-admission-policy` ·
-`self-exclusion`
+`self-exclusion` · `subresource-eviction` · `delete-old-object` · `connect-exec` · `namespace-teardown` · `policy-params` · `match-policy`
 
 **Verified by** registering your webhook into the cluster and applying objects
 with `kubectl` — the verdict is whether the API server accepted or rejected

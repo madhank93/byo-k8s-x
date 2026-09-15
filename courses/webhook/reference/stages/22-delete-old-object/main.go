@@ -33,12 +33,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/validation"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -202,10 +197,6 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("build clientset: %w", err)
 	}
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return fmt.Errorf("build dynamic client: %w", err)
-	}
 
 	// Wired here rather than above because recording a verdict needs a client,
 	// and there is no client until now.
@@ -223,21 +214,19 @@ func run() error {
 	// The caBundle is parsed as PEM, not as the DER the certificate was built
 	// from: raw bytes there fail inside the API server, not at registration.
 	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
-	// Installed, and deliberately not removed on the way out: a policy that
-	// disappeared when this program stopped would have none of the property
-	// that makes it worth writing. It goes in before the webhooks because it
-	// seeds an OwnerList, which the webhook judges and cannot answer for until
-	// the server below is serving.
-	if err := installPolicy(ctx, cs, dyn, ns, ownNS); err != nil {
-		return err
-	}
-	fmt.Printf("installed policy %s\n", policyObjectName)
 	if err := register(ctx, cs, url, caPEM, ns, ownNS); err != nil {
 		return err
 	}
 	if err := registerMutating(ctx, cs, mutateURL, caPEM, ns, ownNS); err != nil {
 		return err
 	}
+	// Installed, and deliberately not removed on the way out: a policy that
+	// disappeared when this program stopped would have none of the property
+	// that makes it worth writing.
+	if err := installPolicy(ctx, cs, ns, ownNS); err != nil {
+		return err
+	}
+	fmt.Printf("installed policy %s\n", policyObjectName)
 	defer func() {
 		if err := unregister(cs); err != nil {
 			fmt.Fprintf(os.Stderr, "unregister: %v\n", err)
@@ -261,23 +250,14 @@ func run() error {
 // narrowing the webhook carries is repeated here, because both are live at
 // once: a policy that judged what the webhook deliberately skips would refuse
 // objects this program is supposed to let past.
-func installPolicy(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface, namespace, ownNamespace string) error {
+func installPolicy(ctx context.Context, cs kubernetes.Interface, namespace, ownNamespace string) error {
 	scope := admissionregistrationv1.NamespacedScope
 	fail := admissionregistrationv1.Fail
-
-	// The params exist before the binding that names them, so the binding
-	// never sees them missing.
-	if err := ensureOwnerLists(ctx, dyn, namespace); err != nil {
-		return err
-	}
 
 	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: policyObjectName},
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
 			FailurePolicy: &fail,
-			// The allowlist is read at admission time from the OwnerList the
-			// binding names, so changing it is an edit, not a redeploy.
-			ParamKind: &admissionregistrationv1.ParamKind{APIVersion: "byok8s.dev/v1", Kind: "OwnerList"},
 			MatchConstraints: &admissionregistrationv1.MatchResources{
 				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
 					RuleWithOperations: admissionregistrationv1.RuleWithOperations{
@@ -301,11 +281,6 @@ func installPolicy(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Int
 			Validations: []admissionregistrationv1.Validation{{
 				Expression: "has(object.metadata.labels) && 'owner' in object.metadata.labels",
 				Message:    "every pod must carry an owner label",
-			}, {
-				// The half of the rule a platform team changes without a
-				// deployment: which owners this namespace accepts.
-				Expression:        "!has(object.metadata.labels) || !('owner' in object.metadata.labels) || object.metadata.labels['owner'] in params.spec.owners",
-				MessageExpression: "'owner ' + object.metadata.labels['owner'] + ' is not on the allowlist in ' + params.metadata.name",
 			}},
 		},
 	}
@@ -324,18 +299,11 @@ func installPolicy(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Int
 		return fmt.Errorf("install policy: %w", err)
 	}
 
-	// A missing OwnerList refuses everything rather than switching the rule
-	// off: deleting one object must not be a way past the policy.
-	deny := admissionregistrationv1.DenyAction
-
 	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: policyObjectName},
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
 			PolicyName:        policyObjectName,
 			ValidationActions: []admissionregistrationv1.ValidationAction{admissionregistrationv1.Deny},
-			// No namespace: the name is looked up in the namespace of the pod
-			// being admitted, so each namespace carries its own allowlist.
-			ParamRef: &admissionregistrationv1.ParamRef{Name: ownerListName, ParameterNotFoundAction: &deny},
 			// Without this the policy denies matching pods in every namespace
 			// in the cluster. A binding is the blast radius.
 			MatchResources: &admissionregistrationv1.MatchResources{
@@ -402,15 +370,6 @@ func validate(w http.ResponseWriter, r *http.Request, cs kubernetes.Interface, n
 	if name == "" {
 		name = meta.Name
 	}
-	if name == "" {
-		// A collection delete — how the namespace controller empties a
-		// namespace — names nothing in the request and carries the pod only as
-		// oldObject. Only the name is taken from it: its annotations describe
-		// how the pod asked to be created, not how to judge its removal.
-		var old metav1.PartialObjectMetadata
-		_ = json.Unmarshal(review.Request.OldObject.Raw, &old)
-		name = old.Name
-	}
 	fmt.Printf("review %s %s/%s\n", review.Request.Operation, review.Request.Resource.Resource, name)
 
 	// The deadline belongs to the caller, so the wait watches the caller's
@@ -421,25 +380,14 @@ func validate(w http.ResponseWriter, r *http.Request, cs kubernetes.Interface, n
 		return
 	}
 
-	// Evictions, execs and attaches arrive as resource "pods" with a
-	// subresource, and none of them carries the pod, so the resource check in
-	// decide() cannot tell them apart from a pod.
+	// An eviction arrives as resource "pods" with subresource "eviction", so
+	// the resource check in decide() is not enough to tell the two apart.
 	var allowed bool
 	var message string
-	switch review.Request.SubResource {
-	case "eviction":
-		allowed, message = decideProtected(r.Context(), cs, review.Request.Namespace, name, "evicting")
-	case "exec", "attach":
-		allowed, message = decideProtected(r.Context(), cs, review.Request.Namespace, name, "opening a session in")
-	default:
+	if review.Request.SubResource == "eviction" {
+		allowed, message = decideEviction(r.Context(), cs, review.Request.Namespace, name)
+	} else {
 		allowed, message = decide(review.Request, name)
-		// A namespace being torn down deletes everything in it through this
-		// webhook: the controller's delete, then the kubelet's. Refusing either
-		// holds the whole namespace in Terminating, so the lookup is paid only
-		// when a delete is about to be refused.
-		if !allowed && review.Request.Operation == admissionv1.Delete && namespaceEnding(r.Context(), cs, review.Request.Namespace) {
-			allowed, message = true, ""
-		}
 	}
 
 	respondAudited(w, uid, allowed, message, auditFor(review.Request, allowed), warningsFor(meta.Annotations))
@@ -529,9 +477,6 @@ func decide(req *admissionv1.AdmissionRequest, name string) (bool, string) {
 	// Rules live in the cluster, not in this program: something else can widen
 	// them. Anything that is not a pod is somebody else's business, and saying
 	// so is what keeps a widened rule from becoming an outage.
-	if req.Resource.Resource == "ownerlists" {
-		return decideOwnerList(req)
-	}
 	if req.Resource.Resource != "pods" {
 		return true, ""
 	}
@@ -565,143 +510,24 @@ func decide(req *admissionv1.AdmissionRequest, name string) (bool, string) {
 	return true, ""
 }
 
-// The label that says a pod is to be left alone: not evicted, not deleted, and
-// not entered with exec or attach.
+// The label that says a pod is not to be evicted. Eviction is how a drain asks
+// politely, so refusing it refuses the drain without touching an ordinary
+// delete.
 const protectedLabel = "byok8s.dev/protected"
 
-// decideProtected judges a request made through a pod subresource, where the
-// object under review is an Eviction or a set of exec or attach options and
-// not the pod itself.
+// decideEviction judges an eviction, where the object under review is an
+// Eviction and not the pod being evicted.
 //
 // Only the pod's name is in the payload, so the verdict needs a lookup. A
 // handler that unmarshals this request as a pod gets an empty one back and
-// refuses every such request it is asked about.
-func decideProtected(ctx context.Context, cs kubernetes.Interface, namespace, name, action string) (bool, string) {
+// refuses every eviction it is asked about.
+func decideEviction(ctx context.Context, cs kubernetes.Interface, namespace, name string) (bool, string) {
 	pod, err := cs.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		return false, fmt.Sprintf("pod %q could not be read to judge this request: %v", name, err)
+		return false, fmt.Sprintf("pod %q could not be read to judge its eviction: %v", name, err)
 	}
 	if pod.Labels[protectedLabel] == "true" {
-		return false, fmt.Sprintf("pod %q is protected: remove the %s label before %s it", name, protectedLabel, action)
-	}
-	return true, ""
-}
-
-// namespaceEnding reports whether a namespace is being torn down. Anything
-// deleted inside one is going anyway, whoever is asking.
-func namespaceEnding(ctx context.Context, cs kubernetes.Interface, name string) bool {
-	ns, err := cs.CoreV1().Namespaces().Get(ctx, name, metav1.GetOptions{})
-	return err == nil && ns.Status.Phase == corev1.NamespaceTerminating
-}
-
-// The allowlist the policy reads, one per namespace under the same name. It is
-// a custom resource rather than a ConfigMap because the API server stops
-// watching a built-in param type once no policy uses it, and does not watch it
-// again until it restarts: every policy after that is blind to new ConfigMaps.
-const ownerListName = "byok8s-owners"
-
-var ownerListResource = schema.GroupVersionResource{Group: "byok8s.dev", Version: "v1", Resource: "ownerlists"}
-
-// ensureOwnerLists installs the OwnerList type and seeds this namespace's list.
-//
-// The type is the program's and is kept current. A list is created only if
-// absent: once it exists it belongs to whoever runs the namespace, so a
-// restart must not undo their edit.
-func ensureOwnerLists(ctx context.Context, dyn dynamic.Interface, namespace string) error {
-	openAPI := map[string]any{"openAPIV3Schema": map[string]any{
-		"type": "object",
-		"properties": map[string]any{"spec": map[string]any{
-			"type": "object",
-			"properties": map[string]any{"owners": map[string]any{
-				"type":  "array",
-				"items": map[string]any{"type": "string"},
-			}},
-		}},
-	}}
-	crd := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "apiextensions.k8s.io/v1",
-		"kind":       "CustomResourceDefinition",
-		"metadata":   map[string]any{"name": "ownerlists.byok8s.dev"},
-		"spec": map[string]any{
-			"group": "byok8s.dev",
-			"scope": "Namespaced",
-			"names": map[string]any{"plural": "ownerlists", "singular": "ownerlist", "kind": "OwnerList"},
-			// v1beta1 is an older spelling of the same object, still served: a
-			// client written against it writes the same lists by another
-			// version. Only v1 is stored.
-			"versions": []any{
-				map[string]any{
-					"name":    "v1",
-					"served":  true,
-					"storage": true,
-					"schema":  openAPI,
-				},
-				map[string]any{
-					"name":    "v1beta1",
-					"served":  true,
-					"storage": false,
-					"schema":  openAPI,
-				},
-			},
-		},
-	}}
-	crds := dyn.Resource(schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"})
-	_, err := crds.Create(ctx, crd, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		existing, getErr := crds.Get(ctx, crd.GetName(), metav1.GetOptions{})
-		if getErr != nil {
-			return fmt.Errorf("read OwnerList type: %w", getErr)
-		}
-		crd.SetResourceVersion(existing.GetResourceVersion())
-		_, err = crds.Update(ctx, crd, metav1.UpdateOptions{})
-	}
-	if err != nil {
-		return fmt.Errorf("install OwnerList type: %w", err)
-	}
-
-	list := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "byok8s.dev/v1",
-		"kind":       "OwnerList",
-		"metadata":   map[string]any{"name": ownerListName, "namespace": namespace},
-		"spec":       map[string]any{"owners": []any{"platform"}},
-	}}
-	// A type that was just created is not served until the API server has
-	// established it, so the first create can fail with NotFound for a moment.
-	return wait.PollUntilContextTimeout(ctx, time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		_, err := dyn.Resource(ownerListResource).Namespace(namespace).Create(ctx, list, metav1.CreateOptions{})
-		switch {
-		case err == nil, apierrors.IsAlreadyExists(err):
-			return true, nil
-		case apierrors.IsNotFound(err):
-			return false, nil
-		default:
-			return false, fmt.Errorf("seed OwnerList %s: %w", ownerListName, err)
-		}
-	})
-}
-
-// decideOwnerList judges an allowlist before the policy can read it. A list
-// with no owners, or with an owner no label can ever carry, locks the
-// namespace out with no pod to blame.
-//
-// The object arrives in the version the rule names, whatever version the
-// client wrote, so it is decoded without looking at its apiVersion.
-func decideOwnerList(req *admissionv1.AdmissionRequest) (bool, string) {
-	var list struct {
-		Spec struct {
-			Owners []string `json:"owners"`
-		} `json:"spec"`
-	}
-	if err := json.Unmarshal(req.Object.Raw, &list); err != nil {
-		return false, fmt.Sprintf("this object could not be read as an OwnerList: %v", err)
-	}
-	if len(list.Spec.Owners) == 0 {
-		return false, "an OwnerList with no owners refuses every pod in its namespace"
-	}
-	for _, owner := range list.Spec.Owners {
-		if errs := validation.IsValidLabelValue(owner); len(errs) > 0 {
-			return false, fmt.Sprintf("owner %q can never match an owner label: %s", owner, errs[0])
-		}
+		return false, fmt.Sprintf("pod %q is protected: remove the %s label before evicting it", name, protectedLabel)
 	}
 	return true, ""
 }
@@ -999,11 +825,6 @@ func register(ctx context.Context, cs kubernetes.Interface, url string, caBundle
 	scope := admissionregistrationv1.NamespacedScope
 	timeout := int32(5)
 
-	// Equivalent is the default in v1, spelled out because the old default,
-	// Exact, matches only the versions a rule names: a client writing through
-	// another version of the same resource would never be asked.
-	equivalent := admissionregistrationv1.Equivalent
-
 	cfg := &admissionregistrationv1.ValidatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: webhookConfigName},
 		Webhooks: []admissionregistrationv1.ValidatingWebhook{{
@@ -1037,19 +858,7 @@ func register(ctx context.Context, cs kubernetes.Interface, url string, caBundle
 					Resources:   []string{"pods/eviction"},
 					Scope:       &scope,
 				},
-			}, {
-				// The allowlist the policy reads: a malformed one locks a
-				// namespace out as surely as a wrong rule. Only v1 is named;
-				// MatchPolicy below is what sends a v1beta1 write here too.
-				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
-				Rule: admissionregistrationv1.Rule{
-					APIGroups:   []string{"byok8s.dev"},
-					APIVersions: []string{"v1"},
-					Resources:   []string{"ownerlists"},
-					Scope:       &scope,
-				},
 			}},
-			MatchPolicy:    &equivalent,
 			FailurePolicy:  &fail,
 			SideEffects:    &side,
 			TimeoutSeconds: &timeout,
@@ -1081,25 +890,6 @@ func register(ctx context.Context, cs kubernetes.Interface, url string, caBundle
 			AdmissionReviewVersions: []string{"v1"},
 		}},
 	}
-
-	// exec starts a process in a running container and attach joins the one
-	// already there; a rule naming only one leaves the other way in open. They
-	// get an entry of their own because the object of a connect is a set of
-	// options with no metadata, so no objectSelector matches it — not even
-	// DoesNotExist — and a webhook carrying one is skipped for every connect.
-	connect := cfg.Webhooks[0]
-	connect.Name = "connect.pods.byok8s.dev"
-	connect.ObjectSelector = nil
-	connect.Rules = []admissionregistrationv1.RuleWithOperations{{
-		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Connect},
-		Rule: admissionregistrationv1.Rule{
-			APIGroups:   []string{""},
-			APIVersions: []string{"v1"},
-			Resources:   []string{"pods/exec", "pods/attach"},
-			Scope:       &scope,
-		},
-	}}
-	cfg.Webhooks = append(cfg.Webhooks, connect)
 
 	api := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations()
 	_, err := api.Create(ctx, cfg, metav1.CreateOptions{})

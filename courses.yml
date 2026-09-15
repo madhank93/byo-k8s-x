@@ -9,6 +9,12 @@ entries:
     tier: the client
     blurb: kubeconfig, discovery, the RESTMapper, apply, watch, exec.
 
+  - slug: safe-apply
+    name: Build your own diff and safe apply
+    status: planned
+    tier: the client
+    blurb: Server-side dry-run, a three-way diff, and a change you can read before it lands.
+
   - slug: controller
     name: Build your own controller
     status: shipped

@@ -63,3 +63,21 @@ stages:
   - slug: self-exclusion
     name: Never gate the namespace you run in
     difficulty: medium
+  - slug: subresource-eviction
+    name: An eviction is not a delete
+    difficulty: hard
+  - slug: delete-old-object
+    name: Judge what is being taken away
+    difficulty: medium
+  - slug: connect-exec
+    name: Guard every way in
+    difficulty: medium
+  - slug: namespace-teardown
+    name: Let the namespace go
+    difficulty: medium
+  - slug: policy-params
+    name: The rule, as data
+    difficulty: medium
+  - slug: match-policy
+    name: Every version of the same thing
+    difficulty: medium
