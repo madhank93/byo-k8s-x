@@ -63,3 +63,6 @@ stages:
   - slug: self-exclusion
     name: Never gate the namespace you run in
     difficulty: medium
+  - slug: subresource-eviction
+    name: An eviction is not a delete
+    difficulty: hard

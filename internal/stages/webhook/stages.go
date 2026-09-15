@@ -27,6 +27,7 @@ import (
 	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -87,6 +88,7 @@ func init() {
 	register(Stage{Slug: "match-conditions", Run: stageMatchConditions})
 	register(Stage{Slug: "validating-admission-policy", Run: stageValidatingAdmissionPolicy})
 	register(Stage{Slug: "self-exclusion", Run: stageSelfExclusion})
+	register(Stage{Slug: "subresource-eviction", Run: stageSubresourceEviction})
 }
 
 // stageServeTLS checks the one thing every later stage rests on: that the
@@ -592,6 +594,99 @@ func stageValidatingAdmissionPolicy(ctx context.Context, env *kube.Env, bin stri
 	}
 
 	return nil
+}
+
+// stageSubresourceEviction checks the webhook is asked about evictions.
+//
+// An eviction is neither a delete nor an update: it is a create on the
+// pods/eviction subresource, carrying an Eviction where every other request so
+// far carried the pod. A rule naming pods alone never sees one, so a webhook
+// that refuses to let a pod go can still be drained out from under.
+func stageSubresourceEviction(ctx context.Context, env *kube.Env, bin string) error {
+	port, err := freePort()
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://%s:%d/validate", externalHost, port)
+
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+	defer sweepRegistrations(context.WithoutCancel(ctx), env)
+
+	p, cleanup, err := launch(ctx, env, bin, port)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	var hook admissionregistrationv1.ValidatingWebhook
+	if err := waitFor(ctx, "the program to register itself", 60*time.Second, func(ctx context.Context) (bool, error) {
+		found, ok, err := findRegistration(ctx, env, url)
+		if err != nil || !ok {
+			return false, err
+		}
+		hook = found
+		return true, nil
+	}); err != nil {
+		return fmt.Errorf("no ValidatingWebhookConfiguration points at %s: %w", url, err)
+	}
+
+	asked := false
+	for _, rule := range hook.Rules {
+		if slices.Contains(rule.Resources, "pods/eviction") {
+			asked = true
+		}
+	}
+	if !asked {
+		return fmt.Errorf("no rule names the pods/eviction subresource: a rule on pods does not cover an eviction, so a drain empties this namespace without ever calling this webhook")
+	}
+
+	const protected = "protected-pod"
+	const ordinary = "ordinary-pod"
+	if err := env.SeedLabeledPod(ctx, protected, map[string]string{"owner": "byok8s", protectedLabel: "true"}); err != nil {
+		return fmt.Errorf("seeding pod %q failed: %w", protected, err)
+	}
+	if err := env.SeedLabeledPod(ctx, ordinary, map[string]string{"owner": "byok8s"}); err != nil {
+		return fmt.Errorf("seeding pod %q failed: %w", ordinary, err)
+	}
+
+	var refusal error
+	if err := waitFor(ctx, "the API server to refuse the eviction of a protected pod", 60*time.Second, func(ctx context.Context) (bool, error) {
+		refusal = evict(ctx, env, protected)
+		return refusal != nil, nil
+	}); err != nil {
+		return fmt.Errorf("pod %q carries the %s label and was evicted anyway: the rule matched, so the verdict is this program's\nthe program said:\n%s", protected, protectedLabel, tail(p.Stdout()))
+	}
+	if !strings.Contains(refusal.Error(), "denied the request") {
+		return fmt.Errorf("the eviction of %q failed for a reason that is not this webhook: %v", protected, refusal)
+	}
+
+	// The half that fails when an Eviction is read as a pod: the labels are not
+	// in that payload, so every eviction looks unlabelled and gets refused.
+	if err := waitFor(ctx, "the API server to allow the eviction of an unprotected pod", 60*time.Second, func(ctx context.Context) (bool, error) {
+		return evict(ctx, env, ordinary) == nil, nil
+	}); err != nil {
+		return fmt.Errorf("pod %q carries no %s label and its eviction was refused anyway: the object under review is an Eviction, not the pod, so reading it as a pod leaves every eviction looking unlabelled\nthe program said:\n%s", ordinary, protectedLabel, tail(p.Stdout()))
+	}
+
+	// Naming the subresource must not change what the plain verb does: a
+	// protected pod may still be deleted outright.
+	if err := deletePod(ctx, env.Client, env.Namespace, protected); err != nil {
+		return fmt.Errorf("pod %q could not be deleted: the rule covers pods/eviction, which is not what a DELETE goes through: %w", protected, err)
+	}
+
+	return nil
+}
+
+// protectedLabel marks a pod that may not be evicted.
+const protectedLabel = "byok8s.dev/protected"
+
+// evict asks for a pod to go the way a drain would, rather than deleting it.
+func evict(ctx context.Context, env *kube.Env, name string) error {
+	return env.Client.PolicyV1().Evictions(env.Namespace).Evict(ctx, &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+	})
 }
 
 // stageSelfExclusion checks the webhook leaves its own namespace alone.
