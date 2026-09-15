@@ -75,3 +75,6 @@ stages:
   - slug: namespace-teardown
     name: Let the namespace go
     difficulty: medium
+  - slug: policy-params
+    name: The rule, as data
+    difficulty: medium

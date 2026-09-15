@@ -31,8 +31,11 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -92,6 +95,7 @@ func init() {
 	register(Stage{Slug: "delete-old-object", Run: stageDeleteOldObject})
 	register(Stage{Slug: "connect-exec", Run: stageConnectExec})
 	register(Stage{Slug: "namespace-teardown", Run: stageNamespaceTeardown})
+	register(Stage{Slug: "policy-params", Run: stagePolicyParams})
 }
 
 // stageServeTLS checks the one thing every later stage rests on: that the
@@ -589,11 +593,165 @@ func stageValidatingAdmissionPolicy(ctx context.Context, env *kube.Env, bin stri
 		return fmt.Errorf("the pod was refused, but not by a policy (%v): with no webhook registered this refusal should name the ValidatingAdmissionPolicy that produced it", refusal)
 	}
 
-	if err := deletePod(ctx, env.Client, env.Namespace, "policy-owned"); err != nil {
+	// A policy that reads parameters refuses everything for a moment after it
+	// is bound, until the API server has loaded them: the verdict that counts
+	// is the settled one.
+	var last error
+	if err := waitFor(ctx, "the policy to admit a pod carrying an owner label", 30*time.Second, func(ctx context.Context) (bool, error) {
+		if err := deletePod(ctx, env.Client, env.Namespace, "policy-owned"); err != nil {
+			return false, err
+		}
+		last = seedPod(ctx, env, "policy-owned", map[string]string{"owner": "platform"}, nil)
+		return last == nil, nil
+	}); err != nil {
+		return fmt.Errorf("a pod carrying an owner label was refused by the policy: %v", last)
+	}
+
+	return nil
+}
+
+// stagePolicyParams checks the policy reads the changeable half of its rule
+// from an object the cluster stores.
+//
+// The program is taken away before anything is judged, as in stage 19, so
+// every verdict here is the API server's: an edit to the params object has to
+// change what is admitted with no program left to redeploy.
+func stagePolicyParams(ctx context.Context, env *kube.Env, bin string) error {
+	port, err := freePort()
+	if err != nil {
 		return err
 	}
-	if err := seedPod(ctx, env, "policy-owned", map[string]string{"owner": "platform"}, nil); err != nil {
-		return fmt.Errorf("a pod carrying an owner label was refused by the policy: %w", err)
+
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+	defer sweepRegistrations(context.WithoutCancel(ctx), env)
+	if err := sweepPolicies(ctx, env); err != nil {
+		return err
+	}
+	defer sweepPolicies(context.WithoutCancel(ctx), env)
+
+	p, cleanup, err := launchKeepingPolicy(ctx, env, bin, port)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := awaitLine(ctx, p, "serving", 60*time.Second); err != nil {
+		return err
+	}
+
+	var policy admissionregistrationv1.ValidatingAdmissionPolicy
+	var binding admissionregistrationv1.ValidatingAdmissionPolicyBinding
+	if err := waitFor(ctx, "the program to install a policy and bind it", 60*time.Second, func(ctx context.Context) (bool, error) {
+		foundPolicy, foundBinding, ok, err := findPolicy(ctx, env)
+		if err != nil || !ok {
+			return false, err
+		}
+		policy, binding = foundPolicy, foundBinding
+		return true, nil
+	}); err != nil {
+		return fmt.Errorf("no bound ValidatingAdmissionPolicy covering pods exists: %w\nthe program said:\n%s", err, tail(p.Stdout()))
+	}
+
+	switch k := policy.Spec.ParamKind; {
+	case k == nil:
+		return fmt.Errorf("policy %s declares no paramKind, so its allowlist is written into the policy itself and changing it means redeploying the program", policy.Name)
+	case k.APIVersion == "v1" && k.Kind == "ConfigMap":
+		return fmt.Errorf("policy %s reads its params from a ConfigMap: the API server stops watching a built-in param type once no policy uses it and does not watch it again until it restarts, so every later policy is blind to new ConfigMaps and, with Deny, refuses everything — read an OwnerList (byok8s.dev/v1) instead", policy.Name)
+	case k.APIVersion != "byok8s.dev/v1" || k.Kind != "OwnerList":
+		return fmt.Errorf("policy %s reads its params from %s %s, but this stage edits an OwnerList (byok8s.dev/v1)", policy.Name, k.APIVersion, k.Kind)
+	}
+	ref := binding.Spec.ParamRef
+	if ref == nil || ref.Name == "" {
+		return fmt.Errorf("binding %s has no paramRef naming an OwnerList, so the policy has nothing to read its allowlist from", binding.Name)
+	}
+	if ref.ParameterNotFoundAction == nil || *ref.ParameterNotFoundAction != admissionregistrationv1.DenyAction {
+		return fmt.Errorf("binding %s does not set parameterNotFoundAction to Deny: with Allow, deleting the OwnerList switches the rule off", binding.Name)
+	}
+	ns := ref.Namespace
+	if ns == "" {
+		ns = env.Namespace
+	}
+	dyn, err := dynamic.NewForConfig(env.Config)
+	if err != nil {
+		return fmt.Errorf("build dynamic client: %w", err)
+	}
+	lists := dyn.Resource(schema.GroupVersionResource{Group: "byok8s.dev", Version: "v1", Resource: "ownerlists"}).Namespace(ns)
+
+	// The program seeds the allowlist; the grader then pins it to a known value.
+	list, err := lists.Get(ctx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("binding %s names OwnerList %s/%s, but reading it failed (%v): the program has to create it, or with Deny every pod is refused until someone does", binding.Name, ns, ref.Name, err)
+	}
+	setOwners := func(owners ...string) error {
+		if err := unstructured.SetNestedStringSlice(list.Object, owners, "spec", "owners"); err != nil {
+			return err
+		}
+		updated, err := lists.Update(ctx, list, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("update OwnerList %s/%s: %w", ns, ref.Name, err)
+		}
+		list = updated
+		return nil
+	}
+	if err := setOwners("platform"); err != nil {
+		return err
+	}
+
+	// Take the program away, as in stage 19: from here every verdict is the
+	// API server's.
+	p.Kill()
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+
+	// A dry run is judged by admission exactly like a real create and stores
+	// nothing, so the same name can be asked about again.
+	try := func(owner string) error {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "owned-by-" + owner, Namespace: env.Namespace, Labels: map[string]string{"owner": owner}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}}},
+		}
+		_, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+		return err
+	}
+	refused := func(err error) bool {
+		return err != nil && strings.Contains(err.Error(), "ValidatingAdmissionPolicy")
+	}
+
+	// Until the API server has loaded the params, every pod is refused, so a
+	// refusal alone proves nothing: both halves have to hold in the same round.
+	var allowed, disallowed error
+	if err := waitFor(ctx, "the policy to admit an owner on the allowlist and refuse one that is not", 60*time.Second, func(ctx context.Context) (bool, error) {
+		allowed, disallowed = try("platform"), try("research")
+		return allowed == nil && refused(disallowed), nil
+	}); err != nil {
+		if allowed != nil {
+			return fmt.Errorf("the allowlist in %s/%s is \"platform\" and a pod owned by platform is still refused: %v", ns, ref.Name, allowed)
+		}
+		return fmt.Errorf("the allowlist in %s/%s is \"platform\" and a pod owned by research was not refused by the policy (last answer: %v): the policy is not reading its allowlist from params", ns, ref.Name, disallowed)
+	}
+	var last error
+
+	if err := setOwners("platform", "research"); err != nil {
+		return err
+	}
+	if err := waitFor(ctx, "the policy to admit an owner added to the allowlist", 30*time.Second, func(ctx context.Context) (bool, error) {
+		last = try("research")
+		return last == nil, nil
+	}); err != nil {
+		return fmt.Errorf("research was added to the allowlist in %s/%s and a pod it owns is still refused (last answer: %v): an edit to the params object has to change the verdict with nothing redeployed", ns, ref.Name, last)
+	}
+
+	if err := lists.Delete(ctx, ref.Name, metav1.DeleteOptions{}); err != nil {
+		return fmt.Errorf("delete OwnerList %s/%s: %w", ns, ref.Name, err)
+	}
+	if err := waitFor(ctx, "the policy to refuse everything once its params are gone", 30*time.Second, func(ctx context.Context) (bool, error) {
+		last = try("platform")
+		return refused(last), nil
+	}); err != nil {
+		return fmt.Errorf("OwnerList %s/%s was deleted and a pod owned by platform was still admitted (last answer: %v): with its params gone the rule has switched itself off", ns, ref.Name, last)
 	}
 
 	return nil
