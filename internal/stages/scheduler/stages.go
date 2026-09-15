@@ -16,6 +16,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -46,6 +47,7 @@ func init() {
 	register(Stage{Slug: "watch-unscheduled", Run: stageWatchUnscheduled})
 	register(Stage{Slug: "bind", Run: stageBind})
 	register(Stage{Slug: "node-list", Run: stageNodeList})
+	register(Stage{Slug: "fit-resources", Run: stageFitResources})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -245,6 +247,110 @@ func dropFakeNode(ctx context.Context, env *kube.Env, name string) {
 		}
 	}
 	_ = env.Client.CoreV1().Nodes().Delete(ctx, name, metav1.DeleteOptions{})
+}
+
+// stageFitResources checks the program places a pod only where its requests
+// fit beside everything already on the node.
+//
+// Each pod asks for more than half of any node, so a node takes one and no
+// more. Pods are created one at a time, each placed before the next exists,
+// which keeps the program's view of the cluster current; racing it is a later
+// stage. A pod bound where it does not fit is failed by the kubelet, which is
+// how an overcommit shows.
+func stageFitResources(ctx context.Context, env *kube.Env, bin string) error {
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	for _, ask := range []struct {
+		resource corev1.ResourceName
+		amount   string
+	}{{corev1.ResourceCPU, "6"}, {corev1.ResourceMemory, "5Gi"}} {
+		if err := fillNodes(ctx, env, p, ask.resource, ask.amount); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fillNodes creates pods asking for amount of resource, one at a time, until
+// one is left waiting, then deletes them all.
+func fillNodes(ctx context.Context, env *kube.Env, p *runner.Process, resource corev1.ResourceName, amount string) error {
+	var created []string
+	defer func() {
+		zero := int64(0)
+		for _, name := range created {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+
+	holder := map[string]string{} // node -> the pod this batch put there
+	for i := 1; i <= 6; i++ {
+		name := fmt.Sprintf("%s-%d", resource, i)
+		if err := seedRequestingPod(ctx, env, name, resource, amount); err != nil {
+			return err
+		}
+		created = append(created, name)
+
+		var node string
+		if err := waitFor(ctx, "pod "+name+" to be bound", 15*time.Second, func(ctx context.Context) (bool, error) {
+			got, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			node = got.Spec.NodeName
+			return node != "", nil
+		}); err != nil {
+			// Left waiting is right once every worker holds one.
+			if len(holder) < 3 {
+				return fmt.Errorf("pod %s asks for %s of %s and was left waiting while only %d node(s) held such a pod: a worker still had room\nthe program said:\n%s", name, amount, resource, len(holder), tail(p.Stdout()))
+			}
+			return nil
+		}
+
+		if other, ok := holder[node]; ok {
+			return fmt.Errorf("pods %s and %s each ask for %s of %s, more than half of %s, and both were bound there: the second cannot fit beside the first", other, name, amount, resource, node)
+		}
+		holder[node] = name
+
+		if err := waitFor(ctx, "pod "+name+" to run", 60*time.Second, func(ctx context.Context) (bool, error) {
+			got, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			if got.Status.Phase == corev1.PodFailed {
+				return false, fmt.Errorf("the kubelet on %s refused it: %s", node, got.Status.Message)
+			}
+			return got.Status.Phase == corev1.PodRunning, nil
+		}); err != nil {
+			return fmt.Errorf("pod %s was bound to %s but did not run: %w", name, node, err)
+		}
+	}
+	return fmt.Errorf("six pods each asking for more than half of a node were all bound: at most one fits on each")
+}
+
+// seedRequestingPod creates a pod naming this scheduler that asks for amount of
+// one resource.
+func seedRequestingPod(ctx context.Context, env *kube.Env, name string, resource corev1.ResourceName, amount string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName: schedulerName,
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Image: "registry.k8s.io/pause:3.9",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{resource: apiresource.MustParse(amount)},
+				},
+			}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
 }
 
 // seedPod creates a pod that names a scheduler. It asks for nothing and
