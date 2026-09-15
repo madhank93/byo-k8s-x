@@ -48,7 +48,7 @@ that would fix it.
 
 ## What you will build
 
-One program that grows for twenty-one stages: an HTTPS server that registers
+One program that grows for twenty-two stages: an HTTPS server that registers
 itself, judges pods, then rewrites them, and finally survives the operational
 traps that make webhooks dangerous.
 
@@ -58,10 +58,11 @@ traps that make webhooks dangerous.
 2. **Stages 6-11 — what you are asked about, and what you change.** Narrow the
    rules to the objects you actually judge, filter by namespace and by label,
    then start mutating: a JSON patch, a default, an injected sidecar.
-3. **Stages 12-21 — behaving in production.** Honour a dry run, choose a
+3. **Stages 12-22 — behaving in production.** Honour a dry run, choose a
    failure policy, answer inside the deadline, survive reinvocation, rotate a
    certificate without dropping a request, leave an audit trail, filter with
-   CEL, express the same rule with no webhook at all, never gate yourself, and tell an eviction from a delete.
+   CEL, express the same rule with no webhook at all, never gate yourself,
+   tell an eviction from a delete, and judge the delete itself.
 
 ## Two things worth knowing before you start
 

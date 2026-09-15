@@ -89,6 +89,7 @@ func init() {
 	register(Stage{Slug: "validating-admission-policy", Run: stageValidatingAdmissionPolicy})
 	register(Stage{Slug: "self-exclusion", Run: stageSelfExclusion})
 	register(Stage{Slug: "subresource-eviction", Run: stageSubresourceEviction})
+	register(Stage{Slug: "delete-old-object", Run: stageDeleteOldObject})
 }
 
 // stageServeTLS checks the one thing every later stage rests on: that the
@@ -596,6 +597,97 @@ func stageValidatingAdmissionPolicy(ctx context.Context, env *kube.Env, bin stri
 	return nil
 }
 
+// stageDeleteOldObject checks the webhook judges what is being taken away.
+//
+// A delete carries no object. The pod being removed arrives in oldObject and
+// request.object is null. Reading the usual field either fails to decode, so
+// every delete is refused, or its error is dropped and the verdict rests on a
+// pod with no fields, so every delete is allowed. Each half below catches one.
+func stageDeleteOldObject(ctx context.Context, env *kube.Env, bin string) error {
+	port, err := freePort()
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://%s:%d/validate", externalHost, port)
+
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+	defer sweepRegistrations(context.WithoutCancel(ctx), env)
+
+	p, cleanup, err := launch(ctx, env, bin, port)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	var hook admissionregistrationv1.ValidatingWebhook
+	if err := waitFor(ctx, "the program to register itself", 60*time.Second, func(ctx context.Context) (bool, error) {
+		found, ok, err := findRegistration(ctx, env, url)
+		if err != nil || !ok {
+			return false, err
+		}
+		hook = found
+		return true, nil
+	}); err != nil {
+		return fmt.Errorf("no ValidatingWebhookConfiguration points at %s: %w", url, err)
+	}
+
+	asked := false
+	for _, rule := range hook.Rules {
+		if slices.Contains(rule.Resources, "pods") && slices.Contains(rule.Operations, admissionregistrationv1.Delete) {
+			asked = true
+		}
+	}
+	if !asked {
+		return fmt.Errorf("no rule on pods covers DELETE, so a pod this webhook refused to let go of can be removed without asking it")
+	}
+
+	const guarded = "guarded-pod"
+	const ordinary = "removable-pod"
+	if err := env.SeedLabeledPod(ctx, guarded, map[string]string{"owner": "byok8s", protectedLabel: "true"}); err != nil {
+		return fmt.Errorf("seeding pod %q failed: %w", guarded, err)
+	}
+	if err := env.SeedLabeledPod(ctx, ordinary, map[string]string{"owner": "byok8s"}); err != nil {
+		return fmt.Errorf("seeding pod %q failed: %w", ordinary, err)
+	}
+
+	var refusal error
+	if err := waitFor(ctx, "the API server to refuse the deletion of a protected pod", 60*time.Second, func(ctx context.Context) (bool, error) {
+		refusal = env.Client.CoreV1().Pods(env.Namespace).Delete(ctx, guarded, metav1.DeleteOptions{})
+		return refusal != nil, nil
+	}); err != nil {
+		return fmt.Errorf("pod %q carries the %s label and was deleted anyway: if request.object is read with its decode error dropped, every pod looks unlabelled\nthe program said:\n%s", guarded, protectedLabel, tail(p.Stdout()))
+	}
+	if !strings.Contains(refusal.Error(), "denied the request") {
+		return fmt.Errorf("the deletion of %q failed for a reason that is not this webhook: %v", guarded, refusal)
+	}
+
+	// The half that fails when request.object is read and its decode error
+	// honoured: nothing decodes, so every delete is refused.
+	if err := deletePod(ctx, env.Client, env.Namespace, ordinary); err != nil {
+		return fmt.Errorf("pod %q carries no %s label and its deletion was refused anyway: on a delete request.object is null and the pod is in oldObject\nthe program said:\n%s", ordinary, protectedLabel, tail(p.Stdout()))
+	}
+
+	// The verdict has to follow the pod as it stands now, not the rule as it
+	// stood when the pod was made: unlabel it and it goes.
+	pod, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, guarded, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read pod %q: %w", guarded, err)
+	}
+	delete(pod.Labels, protectedLabel)
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("removing the %s label from pod %q failed: %w", protectedLabel, guarded, err)
+	}
+	if err := waitFor(ctx, "the API server to allow the deletion once the label is gone", 60*time.Second, func(ctx context.Context) (bool, error) {
+		return env.Client.CoreV1().Pods(env.Namespace).Delete(ctx, guarded, metav1.DeleteOptions{}) == nil, nil
+	}); err != nil {
+		return fmt.Errorf("pod %q no longer carries the %s label and its deletion is still refused: the verdict is reading something other than the pod in oldObject\nthe program said:\n%s", guarded, protectedLabel, tail(p.Stdout()))
+	}
+
+	return nil
+}
+
 // stageSubresourceEviction checks the webhook is asked about evictions.
 //
 // An eviction is neither a delete nor an update: it is a create on the
@@ -670,10 +762,14 @@ func stageSubresourceEviction(ctx context.Context, env *kube.Env, bin string) er
 		return fmt.Errorf("pod %q carries no %s label and its eviction was refused anyway: the object under review is an Eviction, not the pod, so reading it as a pod leaves every eviction looking unlabelled\nthe program said:\n%s", ordinary, protectedLabel, tail(p.Stdout()))
 	}
 
-	// Naming the subresource must not change what the plain verb does: a
-	// protected pod may still be deleted outright.
-	if err := deletePod(ctx, env.Client, env.Namespace, protected); err != nil {
-		return fmt.Errorf("pod %q could not be deleted: the rule covers pods/eviction, which is not what a DELETE goes through: %w", protected, err)
+	// Naming the subresource must not change what the plain verb does: an
+	// ordinary pod is still deleted by a delete.
+	const deletable = "deletable-pod"
+	if err := env.SeedLabeledPod(ctx, deletable, map[string]string{"owner": "byok8s"}); err != nil {
+		return fmt.Errorf("seeding pod %q failed: %w", deletable, err)
+	}
+	if err := deletePod(ctx, env.Client, env.Namespace, deletable); err != nil {
+		return fmt.Errorf("pod %q could not be deleted: the rule covers pods/eviction, which is not the path a DELETE takes: %w", deletable, err)
 	}
 
 	return nil
