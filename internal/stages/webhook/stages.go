@@ -27,6 +27,7 @@ import (
 	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -83,6 +84,7 @@ func init() {
 	register(Stage{Slug: "reinvocation", Run: stageReinvocation})
 	register(Stage{Slug: "cert-rotation", Run: stageCertRotation})
 	register(Stage{Slug: "audit-annotations", Run: stageAuditAnnotations})
+	register(Stage{Slug: "match-conditions", Run: stageMatchConditions})
 }
 
 // stageServeTLS checks the one thing every later stage rests on: that the
@@ -356,6 +358,136 @@ func stageAuditAnnotations(ctx context.Context, env *kube.Env, bin string) error
 	}
 	if !slices.ContainsFunc(seen, func(w string) bool { return strings.Contains(w, deprecated) }) {
 		return fmt.Errorf("creating that pod through the API server surfaced the warnings %q to the client: resp.Warnings is what becomes the Warning: header kubectl prints, so an empty field is silence at the terminal", seen)
+	}
+
+	return nil
+}
+
+// stageMatchConditions checks the caller check moved out of the handler and
+// into the API server.
+//
+// An objectSelector can only ask about labels on the object. A match condition
+// is CEL over the whole request — who is asking, which operation, which
+// subresource — which is what it takes to exempt one identity. Recognising that
+// identity in the handler reaches the same verdict, but it has already paid for
+// the round trip, and the exemption stops working the moment the program does.
+func stageMatchConditions(ctx context.Context, env *kube.Env, bin string) error {
+	const exemptUser = "byok8s-exempt"
+
+	port, err := freePort()
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://%s:%d/validate", externalHost, port)
+
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+	defer sweepRegistrations(context.WithoutCancel(ctx), env)
+
+	p, cleanup, err := launch(ctx, env, bin, port)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := awaitLine(ctx, p, "serving", 60*time.Second); err != nil {
+		return err
+	}
+
+	var hook admissionregistrationv1.ValidatingWebhook
+	if err := waitFor(ctx, "the program to register itself", 60*time.Second, func(ctx context.Context) (bool, error) {
+		found, ok, err := findRegistration(ctx, env, url)
+		if err != nil || !ok {
+			return false, err
+		}
+		hook = found
+		return true, nil
+	}); err != nil {
+		return fmt.Errorf("no ValidatingWebhookConfiguration points at %s: %w", url, err)
+	}
+
+	mutateURL := fmt.Sprintf("https://%s:%d/mutate", externalHost, port)
+	var mutating admissionregistrationv1.MutatingWebhook
+	if err := waitFor(ctx, "the program to register its mutating half", 60*time.Second, func(ctx context.Context) (bool, error) {
+		found, ok, err := findMutatingRegistration(ctx, env, mutateURL)
+		if err != nil || !ok {
+			return false, err
+		}
+		mutating = found
+		return true, nil
+	}); err != nil {
+		return fmt.Errorf("no MutatingWebhookConfiguration points at %s: %w", mutateURL, err)
+	}
+
+	if len(hook.MatchConditions) == 0 {
+		return fmt.Errorf("the validating registration carries no matchConditions, so every request reaches this program before anything decides whether it should have: an exemption is worth only as much as the API server can check without calling you")
+	}
+	if len(mutating.MatchConditions) == 0 {
+		return fmt.Errorf("the mutating registration carries no matchConditions, so the exempt caller still reaches this program's patching half: an exemption that covers one registration and not the other pays for the round trip it was meant to avoid")
+	}
+	for _, c := range slices.Concat(hook.MatchConditions, mutating.MatchConditions) {
+		if c.Name == "" || c.Expression == "" {
+			return fmt.Errorf("a match condition is missing its name or expression (%q: %q)", c.Name, c.Expression)
+		}
+	}
+
+	// The ordinary caller is judged exactly as before.
+	if err := deletePod(ctx, env.Client, env.Namespace, "matched-no-owner"); err != nil {
+		return err
+	}
+	if err := seedPod(ctx, env, "matched-no-owner", nil, nil); err == nil {
+		return fmt.Errorf("a pod with no owner label was admitted for an ordinary caller, so the match condition excludes more than the one identity it should")
+	}
+
+	// The exempt caller writes the same pod, and is never asked about.
+	if err := grantNamespaceWrite(ctx, env, exemptUser); err != nil {
+		return err
+	}
+	exempt, err := clientAs(env, exemptUser)
+	if err != nil {
+		return err
+	}
+
+	const skipped = "matched-exempt"
+	if err := deletePod(ctx, env.Client, env.Namespace, skipped); err != nil {
+		return err
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: skipped, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	var lastErr error
+	if err := waitFor(ctx, fmt.Sprintf("the write from %s to be accepted", exemptUser), 60*time.Second, func(ctx context.Context) (bool, error) {
+		_, err := exempt.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+		if err != nil && strings.Contains(err.Error(), "admission webhook") {
+			return false, fmt.Errorf("the webhook refused it: %w", err)
+		}
+		// A fresh RoleBinding takes a moment to reach the authorizer, and that
+		// refusal looks nothing like an admission refusal.
+		lastErr = err
+		return err == nil, nil
+	}); err != nil {
+		return fmt.Errorf("the write from %s never succeeded (%v): a request the match condition excludes never reaches this program, so nothing is left to refuse it: %w\nthe program said:\n%s", exemptUser, lastErr, err, tail(p.Stdout()))
+	}
+
+	// A later request that *is* judged proves the program's output has been
+	// read past the point where the exempt one would have appeared.
+	const judged = "matched-ordinary"
+	if err := deletePod(ctx, env.Client, env.Namespace, judged); err != nil {
+		return err
+	}
+	if err := seedPod(ctx, env, judged, map[string]string{"owner": "platform"}, nil); err != nil {
+		return fmt.Errorf("a pod carrying an owner label was refused: %w\nthe program said:\n%s", err, tail(p.Stdout()))
+	}
+	if err := awaitLine(ctx, p, judged, 60*time.Second); err != nil {
+		return fmt.Errorf("the program never logged the request for %s, so this stage cannot tell silence about %s from output it has not read yet: %w", judged, skipped, err)
+	}
+
+	if strings.Contains(p.Stdout(), skipped) {
+		return fmt.Errorf("pod %s was admitted, but this program logged a request for it: the exemption is being made in the handler, so the round trip was paid to reach a verdict the API server could have skipped, and it stops applying the moment this program is down\nthe program said:\n%s", skipped, tail(p.Stdout()))
 	}
 
 	return nil
@@ -2003,4 +2135,65 @@ func (r *warningRecorder) HandleWarningHeader(code int, _ string, text string) {
 		return
 	}
 	r.seen = append(r.seen, text)
+}
+
+// clientAs builds a client that acts as another user through impersonation.
+func clientAs(env *kube.Env, user string) (kubernetes.Interface, error) {
+	cfg := rest.CopyConfig(env.Config)
+	cfg.Impersonate = rest.ImpersonationConfig{UserName: user}
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build a client impersonating %s: %w", user, err)
+	}
+	return client, nil
+}
+
+// grantNamespaceWrite lets an impersonated user write pods in the stage's
+// namespace.
+//
+// Impersonation changes who the API server thinks is asking, and an identity
+// with no RBAC is refused before admission runs at all — a refusal that would
+// read exactly like the webhook's own.
+func grantNamespaceWrite(ctx context.Context, env *kube.Env, user string) error {
+	const name = "byok8s-exempt-writer"
+
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+			Verbs:     []string{"create", "get", "list", "delete"},
+		}},
+	}
+	if _, err := env.Client.RbacV1().Roles(env.Namespace).Create(ctx, role, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create a role for %s: %w", user, err)
+	}
+
+	binding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Subjects:   []rbacv1.Subject{{Kind: rbacv1.UserKind, Name: user, APIGroup: rbacv1.GroupName}},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name},
+	}
+	if _, err := env.Client.RbacV1().RoleBindings(env.Namespace).Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("bind that role to %s: %w", user, err)
+	}
+	return nil
+}
+
+// deletePod removes a pod left by an earlier run, so that a create which must
+// be judged is a real create.
+//
+// Stage namespaces outlive the stage and seedPod treats an existing pod as
+// success, which would otherwise let a replay pass without the API server ever
+// calling the webhook.
+func deletePod(ctx context.Context, client kubernetes.Interface, namespace, name string) error {
+	grace := int64(0)
+	err := client.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &grace})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete pod %s: %w", name, err)
+	}
+	return waitFor(ctx, fmt.Sprintf("pod %s to go away", name), 60*time.Second, func(ctx context.Context) (bool, error) {
+		_, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		return apierrors.IsNotFound(err), nil
+	})
 }

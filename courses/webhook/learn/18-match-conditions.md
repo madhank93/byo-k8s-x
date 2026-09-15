@@ -48,6 +48,21 @@ outage into a filter.
   `authorizer`.
 - `has(object.metadata.labels)` before indexing a map that may be absent.
 
+## What this stage checks
+
+- Both registrations carry at least one match condition, each with a name and
+  an expression — the validating one and the mutating one. An exemption that
+  covers one and not the other still pays for the round trip it was meant to
+  avoid.
+- Writes from the user `byok8s-exempt` never reach the handler: a pod that
+  your policy would refuse is created anyway, and nothing your program logs on
+  entry — in either handler — ever mentions it.
+- That exclusion happens in the API server, not in your code. A handler that
+  recognises the caller and allows the pod still logs the request, and this
+  stage fails it.
+- Every other identity is judged exactly as before — a pod with no `owner`
+  label is still refused.
+
 ## Hints
 
 <details><summary>Nudge</summary>
