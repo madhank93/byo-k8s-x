@@ -90,6 +90,7 @@ func init() {
 	register(Stage{Slug: "self-exclusion", Run: stageSelfExclusion})
 	register(Stage{Slug: "subresource-eviction", Run: stageSubresourceEviction})
 	register(Stage{Slug: "delete-old-object", Run: stageDeleteOldObject})
+	register(Stage{Slug: "connect-exec", Run: stageConnectExec})
 }
 
 // stageServeTLS checks the one thing every later stage rests on: that the
@@ -597,6 +598,94 @@ func stageValidatingAdmissionPolicy(ctx context.Context, env *kube.Env, bin stri
 	return nil
 }
 
+// stageConnectExec checks the webhook guards every way into a running pod.
+//
+// exec and attach create, update and delete nothing, so no earlier rule sees
+// them: they are CONNECT on their own subresources. Admission answers before
+// the stream is upgraded, so a plain request tells a refusal from an admission
+// without needing a shell in the container.
+func stageConnectExec(ctx context.Context, env *kube.Env, bin string) error {
+	port, err := freePort()
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://%s:%d/validate", externalHost, port)
+
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+	defer sweepRegistrations(context.WithoutCancel(ctx), env)
+
+	p, cleanup, err := launch(ctx, env, bin, port)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := waitFor(ctx, "the program to register itself", 60*time.Second, func(ctx context.Context) (bool, error) {
+		_, ok, err := findRegistration(ctx, env, url)
+		return ok, err
+	}); err != nil {
+		return fmt.Errorf("no ValidatingWebhookConfiguration points at %s: %w", url, err)
+	}
+
+	// The connect rule may sit on any webhook entry pointing at this program,
+	// not only the first.
+	list, err := env.Client.AdmissionregistrationV1().ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list webhook configurations: %w", err)
+	}
+	var asked *admissionregistrationv1.ValidatingWebhook
+	for _, item := range list.Items {
+		for _, w := range item.Webhooks {
+			if w.ClientConfig.URL == nil || *w.ClientConfig.URL != url {
+				continue
+			}
+			for _, rule := range w.Rules {
+				if slices.Contains(rule.Resources, "pods/exec") && slices.Contains(rule.Operations, admissionregistrationv1.Connect) {
+					asked = &w
+				}
+			}
+		}
+	}
+	if asked == nil {
+		return fmt.Errorf("no rule covers CONNECT on pods/exec: exec creates, updates and deletes nothing, so kubectl exec reaches a protected pod without this webhook ever being asked")
+	}
+	if s := asked.ObjectSelector; s != nil && (len(s.MatchLabels) > 0 || len(s.MatchExpressions) > 0) {
+		return fmt.Errorf("webhook %s covers CONNECT on pods/exec but carries an objectSelector: the object of a connect is PodExecOptions, which has no metadata, so no selector matches it — not even DoesNotExist — and the API server skips this webhook for every exec", asked.Name)
+	}
+
+	const guarded = "sealed-pod"
+	const ordinary = "open-pod"
+	if err := env.SeedLabeledPod(ctx, guarded, map[string]string{"owner": "byok8s", protectedLabel: "true"}); err != nil {
+		return fmt.Errorf("seeding pod %q failed: %w", guarded, err)
+	}
+	if err := env.SeedLabeledPod(ctx, ordinary, map[string]string{"owner": "byok8s"}); err != nil {
+		return fmt.Errorf("seeding pod %q failed: %w", ordinary, err)
+	}
+
+	var refusal error
+	if err := waitFor(ctx, "the API server to refuse an exec into a protected pod", 60*time.Second, func(ctx context.Context) (bool, error) {
+		refusal = connect(ctx, env, "exec", guarded)
+		return refusal != nil && strings.Contains(refusal.Error(), "denied the request"), nil
+	}); err != nil {
+		return fmt.Errorf("pod %q carries the %s label and an exec into it was not refused by this webhook (last answer: %v)\nthe program said:\n%s", guarded, protectedLabel, refusal, tail(p.Stdout()))
+	}
+
+	// The door beside exec: attach joins the process already running.
+	if err := connect(ctx, env, "attach", guarded); err == nil || !strings.Contains(err.Error(), "denied the request") {
+		return fmt.Errorf("pod %q carries the %s label and exec into it is refused, but attach is not (answer: %v): a rule naming pods/exec alone leaves kubectl attach open\nthe program said:\n%s", guarded, protectedLabel, err, tail(p.Stdout()))
+	}
+
+	// The half that fails when the options are read as a pod: they carry no
+	// labels, so every connect looks like a pod with no owner.
+	if err := connect(ctx, env, "exec", ordinary); err != nil && strings.Contains(err.Error(), "denied the request") {
+		return fmt.Errorf("pod %q carries no %s label and an exec into it was refused: the object under review is PodExecOptions, not the pod, so reading it as a pod judges a pod with no labels\nthe program said:\n%s", ordinary, protectedLabel, tail(p.Stdout()))
+	}
+
+	return nil
+}
+
 // stageDeleteOldObject checks the webhook judges what is being taken away.
 //
 // A delete carries no object. The pod being removed arrives in oldObject and
@@ -783,6 +872,14 @@ func evict(ctx context.Context, env *kube.Env, name string) error {
 	return env.Client.PolicyV1().Evictions(env.Namespace).Evict(ctx, &policyv1.Eviction{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
 	})
+}
+
+// connect asks for an exec or attach session without upgrading the connection.
+// Admission answers first, so a refusal comes back as a verdict and anything
+// admitted fails with "Upgrade request required" instead.
+func connect(ctx context.Context, env *kube.Env, subresource, name string) error {
+	return env.Client.CoreV1().RESTClient().Post().Namespace(env.Namespace).Resource("pods").Name(name).
+		SubResource(subresource).Param("command", "true").Param("stdout", "true").Do(ctx).Error()
 }
 
 // stageSelfExclusion checks the webhook leaves its own namespace alone.

@@ -69,3 +69,6 @@ stages:
   - slug: delete-old-object
     name: Judge what is being taken away
     difficulty: medium
+  - slug: connect-exec
+    name: Guard every way in
+    difficulty: medium
