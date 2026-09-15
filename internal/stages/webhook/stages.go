@@ -86,6 +86,7 @@ func init() {
 	register(Stage{Slug: "audit-annotations", Run: stageAuditAnnotations})
 	register(Stage{Slug: "match-conditions", Run: stageMatchConditions})
 	register(Stage{Slug: "validating-admission-policy", Run: stageValidatingAdmissionPolicy})
+	register(Stage{Slug: "self-exclusion", Run: stageSelfExclusion})
 }
 
 // stageServeTLS checks the one thing every later stage rests on: that the
@@ -591,6 +592,147 @@ func stageValidatingAdmissionPolicy(ctx context.Context, env *kube.Env, bin stri
 	}
 
 	return nil
+}
+
+// stageSelfExclusion checks the webhook leaves its own namespace alone.
+//
+// A webhook that gates the namespace it runs in cannot be restarted once it is
+// down: the replacement pod is refused by the webhook that pod would become,
+// and under a failure policy of Fail nothing about that state is transient. So
+// the selector saying so is only half the check — the other half is that a
+// write into that namespace still succeeds with the program dead.
+func stageSelfExclusion(ctx context.Context, env *kube.Env, bin string) error {
+	port, err := freePort()
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://%s:%d/validate", externalHost, port)
+	mutateURL := fmt.Sprintf("https://%s:%d/mutate", externalHost, port)
+
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+	defer sweepRegistrations(context.WithoutCancel(ctx), env)
+
+	// The namespace the program is told it runs in, by the same variable the
+	// downward API would set on a real pod. It is a real namespace here so that
+	// the claim can be tested with a real write.
+	own := fmt.Sprintf("byok8s-system-%d", port)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: own}}
+	if _, err := env.Client.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create namespace %s: %w", own, err)
+	}
+	defer func() {
+		_ = env.Client.CoreV1().Namespaces().Delete(context.WithoutCancel(ctx), own, metav1.DeleteOptions{})
+	}()
+
+	p, cleanup, err := launch(ctx, env, bin, port, "POD_NAMESPACE="+own)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	var hook admissionregistrationv1.ValidatingWebhook
+	if err := waitFor(ctx, "the program to register itself", 60*time.Second, func(ctx context.Context) (bool, error) {
+		found, ok, err := findRegistration(ctx, env, url)
+		if err != nil || !ok {
+			return false, err
+		}
+		hook = found
+		return true, nil
+	}); err != nil {
+		return fmt.Errorf("no ValidatingWebhookConfiguration points at %s: %w", url, err)
+	}
+	if err := excludesOwn(hook.NamespaceSelector, env.Namespace, own, "judging"); err != nil {
+		return err
+	}
+
+	// Both halves run in the same pod, so an exclusion on one and not the other
+	// leaves the same deadlock by another route.
+	mutating, ok, err := findMutatingRegistration(ctx, env, mutateURL)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no MutatingWebhookConfiguration points at %s", mutateURL)
+	}
+	if err := excludesOwn(mutating.NamespaceSelector, env.Namespace, own, "patching"); err != nil {
+		return err
+	}
+
+	// Narrowing must not turn into switching off: the rule still holds where it
+	// was meant to.
+	if err := waitFor(ctx, "the API server to refuse a pod with no owner label", 60*time.Second, func(ctx context.Context) (bool, error) {
+		err := env.SeedPods(ctx, "still-policed")
+		if err == nil {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(ctx, "still-policed", metav1.DeleteOptions{})
+			return false, nil
+		}
+		return strings.Contains(err.Error(), "denied the request"), nil
+	}); err != nil {
+		return fmt.Errorf("a pod with no owner label was admitted into %q, which this webhook still polices: %w\nthe program said:\n%s", env.Namespace, err, tail(p.Stdout()))
+	}
+
+	if err := createPodIn(ctx, env, own, "own-namespace-pod"); err != nil {
+		return fmt.Errorf("a pod with no owner label was refused in %q, the namespace this program runs in: %w\nthe program said:\n%s", own, err, tail(p.Stdout()))
+	}
+
+	// The deadlock itself. With the program gone and the judging half failing
+	// closed, a write into its own namespace has to keep working, or nothing
+	// could ever start the webhook again.
+	p.Kill()
+	if err := createPodIn(ctx, env, own, "replacement"); err != nil {
+		return fmt.Errorf("with the program down, a pod could not be created in %q: this is the deadlock the exclusion exists to prevent, where the webhook's own replacement is refused by the webhook it would become: %w", own, err)
+	}
+
+	return nil
+}
+
+// excludesOwn checks a selector leaves the program's own namespace out while
+// still covering the one it polices.
+func excludesOwn(sel *metav1.LabelSelector, gated, own, half string) error {
+	const nameLabel = "kubernetes.io/metadata.name"
+	if sel == nil {
+		return fmt.Errorf("the %s half has no namespaceSelector, so it is not excluding the namespace it runs in", half)
+	}
+
+	covers := sel.MatchLabels[nameLabel] == gated
+	excludes := false
+	for _, req := range sel.MatchExpressions {
+		if req.Key != nameLabel {
+			continue
+		}
+		switch req.Operator {
+		case metav1.LabelSelectorOpIn:
+			covers = covers || slices.Contains(req.Values, gated)
+		case metav1.LabelSelectorOpNotIn:
+			excludes = excludes || slices.Contains(req.Values, own)
+		}
+	}
+
+	if !excludes {
+		return fmt.Errorf("the %s half's namespaceSelector does not exclude %q, the namespace this program runs in, so while it is down its own replacement is refused by it", half, own)
+	}
+	if !covers {
+		return fmt.Errorf("the %s half's namespaceSelector no longer selects %q, so excluding its own namespace has switched the rule off rather than narrowed it", half, gated)
+	}
+	return nil
+}
+
+// createPodIn seeds a pod carrying no owner label in a namespace other than the
+// stage's own.
+func createPodIn(ctx context.Context, env *kube.Env, namespace, name string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	_, err := env.Client.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
 }
 
 // stageNamespaceSelector checks the webhook narrows itself to one namespace.
@@ -1121,8 +1263,8 @@ func stageDeny(ctx context.Context, env *kube.Env, bin string) error {
 // stages put to the webhook, and it would answer them in its own words. Every
 // stage but the policy stage therefore takes it back out, so that what the
 // webhook does is what gets measured.
-func launch(ctx context.Context, env *kube.Env, bin string, port int) (*runner.Process, func(), error) {
-	p, cleanup, err := launchKeepingPolicy(ctx, env, bin, port)
+func launch(ctx context.Context, env *kube.Env, bin string, port int, extraEnv ...string) (*runner.Process, func(), error) {
+	p, cleanup, err := launchKeepingPolicy(ctx, env, bin, port, extraEnv...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1146,11 +1288,12 @@ func launch(ctx context.Context, env *kube.Env, bin string, port int) (*runner.P
 // launchKeepingPolicy starts the learner's webhook with a kubeconfig scoped to
 // this stage's namespace, the port it should listen on, and the name the API
 // server will reach it by.
-func launchKeepingPolicy(ctx context.Context, env *kube.Env, bin string, port int) (*runner.Process, func(), error) {
+func launchKeepingPolicy(ctx context.Context, env *kube.Env, bin string, port int, extraEnv ...string) (*runner.Process, func(), error) {
 	kc, cleanupEnv, err := scoped(env)
 	if err != nil {
 		return nil, nil, err
 	}
+	kc = append(kc, extraEnv...)
 	args := []string{
 		fmt.Sprintf("--addr=0.0.0.0:%d", port),
 		fmt.Sprintf("--external-host=%s", externalHost),

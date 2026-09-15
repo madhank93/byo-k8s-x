@@ -40,8 +40,8 @@ up until the first time it is needed.
 
 - `metav1.LabelSelectorOpNotIn`, alongside the `In` requirement from stage 7.
 - The namespace a pod runs in comes from the downward API, usually as a
-  `POD_NAMESPACE` environment variable; running on the host, `cc.Namespace()`
-  is the same answer.
+  `POD_NAMESPACE` environment variable. It is a different value from the
+  namespace you police, and it is empty when nothing sets it.
 - `admissionregistrationv1.Fail` is what makes the deadlock permanent rather
   than merely embarrassing.
 
@@ -49,8 +49,10 @@ up until the first time it is needed.
 
 <details><summary>Nudge</summary>
 
-You already read your own namespace at startup for stage 7. That is the value
-to exclude — no new lookup is needed.
+The namespace you police and the namespace you run in are two different
+values. Stage 7 gave you the first; the second has to come from the
+environment. Excluding the first would switch the rule off rather than narrow
+it.
 </details>
 
 <details><summary>Approach</summary>
