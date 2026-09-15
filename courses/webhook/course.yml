@@ -72,3 +72,6 @@ stages:
   - slug: connect-exec
     name: Guard every way in
     difficulty: medium
+  - slug: namespace-teardown
+    name: Let the namespace go
+    difficulty: medium

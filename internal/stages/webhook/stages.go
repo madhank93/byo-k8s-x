@@ -91,6 +91,7 @@ func init() {
 	register(Stage{Slug: "subresource-eviction", Run: stageSubresourceEviction})
 	register(Stage{Slug: "delete-old-object", Run: stageDeleteOldObject})
 	register(Stage{Slug: "connect-exec", Run: stageConnectExec})
+	register(Stage{Slug: "namespace-teardown", Run: stageNamespaceTeardown})
 }
 
 // stageServeTLS checks the one thing every later stage rests on: that the
@@ -593,6 +594,79 @@ func stageValidatingAdmissionPolicy(ctx context.Context, env *kube.Env, bin stri
 	}
 	if err := seedPod(ctx, env, "policy-owned", map[string]string{"owner": "platform"}, nil); err != nil {
 		return fmt.Errorf("a pod carrying an owner label was refused by the policy: %w", err)
+	}
+
+	return nil
+}
+
+// stageNamespaceTeardown checks the webhook lets a namespace be deleted.
+//
+// The namespace controller empties a deleted namespace through the API, so its
+// pod deletes are admitted like anyone's, and so is the kubelet's final delete
+// once a pod has stopped. A webhook that refuses either holds the namespace in
+// Terminating until someone removes the webhook by hand.
+func stageNamespaceTeardown(ctx context.Context, env *kube.Env, bin string) error {
+	port, err := freePort()
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://%s:%d/validate", externalHost, port)
+
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+	defer sweepRegistrations(context.WithoutCancel(ctx), env)
+
+	p, cleanup, err := launch(ctx, env, bin, port)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := waitFor(ctx, "the program to register itself", 60*time.Second, func(ctx context.Context) (bool, error) {
+		_, ok, err := findRegistration(ctx, env, url)
+		return ok, err
+	}); err != nil {
+		return fmt.Errorf("no ValidatingWebhookConfiguration points at %s: %w", url, err)
+	}
+
+	const anchored = "anchored-pod"
+	if err := env.SeedLabeledPod(ctx, anchored, map[string]string{"owner": "byok8s", protectedLabel: "true"}); err != nil {
+		return fmt.Errorf("seeding pod %q failed: %w", anchored, err)
+	}
+
+	// Letting the namespace go must not mean letting every delete through. A
+	// dry run asks the same question without losing the pod if the answer is
+	// wrong.
+	var refusal error
+	if err := waitFor(ctx, "the API server to refuse the deletion of a protected pod", 60*time.Second, func(ctx context.Context) (bool, error) {
+		refusal = env.Client.CoreV1().Pods(env.Namespace).Delete(ctx, anchored, metav1.DeleteOptions{DryRun: []string{metav1.DryRunAll}})
+		return refusal != nil && strings.Contains(refusal.Error(), "denied the request"), nil
+	}); err != nil {
+		return fmt.Errorf("pod %q carries the %s label and its deletion was not refused (last answer: %v): the stage 22 protection has to survive this stage\nthe program said:\n%s", anchored, protectedLabel, refusal, tail(p.Stdout()))
+	}
+
+	if err := env.Client.CoreV1().Namespaces().Delete(ctx, env.Namespace, metav1.DeleteOptions{}); err != nil {
+		return fmt.Errorf("delete namespace %s: %w", env.Namespace, err)
+	}
+	if err := waitFor(ctx, "the namespace to finish being deleted", 120*time.Second, func(ctx context.Context) (bool, error) {
+		_, err := env.Client.CoreV1().Namespaces().Get(ctx, env.Namespace, metav1.GetOptions{})
+		return apierrors.IsNotFound(err), nil
+	}); err != nil {
+		// Whose delete was refused is the whole diagnosis, and the namespace
+		// records it.
+		why := "no condition on the namespace explains it"
+		if ns, err := env.Client.CoreV1().Namespaces().Get(ctx, env.Namespace, metav1.GetOptions{}); err == nil {
+			for _, c := range ns.Status.Conditions {
+				if c.Type == corev1.NamespaceDeletionContentFailure && c.Status == corev1.ConditionTrue {
+					why = c.Message
+				}
+			}
+		}
+		if pod, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, anchored, metav1.GetOptions{}); err == nil && pod.DeletionTimestamp != nil {
+			why += "; pod " + anchored + " is already terminating, so the delete being refused is the kubelet's final one, not the controller's"
+		}
+		return fmt.Errorf("namespace %s was deleted and is still Terminating: the namespace controller deletes its pods through this webhook, and one refused delete holds the namespace open (%s)\nthe program said:\n%s", env.Namespace, why, tail(p.Stdout()))
 	}
 
 	return nil
