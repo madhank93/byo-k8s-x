@@ -40,7 +40,10 @@ jobs:
           go-version-file: go.mod
       - uses: helm/kind-action@v1
         with:
-          cluster_name: byok8s
+          install_only: true
+      # Sized by the courses themselves (course.yml `workers`), so CI creates
+      # the cluster exactly the way a learner does.
+      - run: go run ./cmd/byok8s up
       - name: Verify every stage of every shipped course
         run: |
           for slug in $(go run ./cmd/byok8s courses --shipped); do
