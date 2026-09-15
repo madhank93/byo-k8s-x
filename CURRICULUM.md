@@ -103,7 +103,7 @@ Service, owned, repaired, reported on and cleaned up after.
 **Verified by** starting your binary, mutating the cluster, and waiting for it
 to converge — then stopping it and checking it let go cleanly.
 
-### `webhook` — Build your own admission webhook · 26 stages
+### [x] `webhook` — Build your own admission webhook · 26 stages
 
 Serving TLS, `AdmissionReview` in and out, mutation by JSON patch, and the
 operational traps that take clusters down.
