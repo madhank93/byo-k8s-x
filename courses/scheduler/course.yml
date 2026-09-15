@@ -9,3 +9,6 @@ stages:
   - slug: watch-unscheduled
     name: Find the pods waiting for you
     difficulty: easy
+  - slug: bind
+    name: Place a pod
+    difficulty: easy

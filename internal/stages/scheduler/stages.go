@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -42,6 +43,7 @@ func Lookup(slug string) (Stage, bool) {
 
 func init() {
 	register(Stage{Slug: "watch-unscheduled", Run: stageWatchUnscheduled})
+	register(Stage{Slug: "bind", Run: stageBind})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -81,6 +83,80 @@ func stageWatchUnscheduled(ctx context.Context, env *kube.Env, bin string) error
 		return fmt.Errorf("pod elsewhere names the default scheduler and was reported anyway: only pods naming %s are this program's\nthe program said:\n%s", schedulerName, tail(p.Stdout()))
 	}
 	return nil
+}
+
+// stageBind checks the program records a decision the way a scheduler must:
+// with a Binding, after which the API server sets the pod's node.
+//
+// The node is given on the command line, so this stage is about binding alone;
+// choosing a node comes later. A pod bound to a real node is then run by that
+// node's kubelet, which is the proof the binding named one.
+func stageBind(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	target := workers[len(workers)-1]
+
+	if err := seedPod(ctx, env, "before", schedulerName); err != nil {
+		return err
+	}
+	p, cleanup, err := launch(ctx, env, bin, "--node", target)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if err := seedPod(ctx, env, "after", schedulerName); err != nil {
+		return err
+	}
+
+	for _, name := range []string{"before", "after"} {
+		var pod *corev1.Pod
+		if err := waitFor(ctx, "pod "+name+" to be bound", 60*time.Second, func(ctx context.Context) (bool, error) {
+			got, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			pod = got
+			return got.Spec.NodeName != "", nil
+		}); err != nil {
+			return fmt.Errorf("pod %s names %s and was never bound to a node: %w\nthe program said:\n%s", name, schedulerName, err, tail(p.Stdout()))
+		}
+		if pod.Spec.NodeName != target {
+			return fmt.Errorf("pod %s was bound to %s, but --node named %s", name, pod.Spec.NodeName, target)
+		}
+	}
+
+	for _, name := range []string{"before", "after"} {
+		if err := waitFor(ctx, "pod "+name+" to run", 60*time.Second, func(ctx context.Context) (bool, error) {
+			got, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			return got.Status.Phase == corev1.PodRunning, nil
+		}); err != nil {
+			return fmt.Errorf("pod %s was bound to %s but never started running: %w", name, target, err)
+		}
+	}
+	return nil
+}
+
+// workerNodes lists the nodes a pod may be placed on, sorted by name: every
+// node that is not a control plane.
+func workerNodes(ctx context.Context, env *kube.Env) ([]string, error) {
+	list, err := env.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: "!node-role.kubernetes.io/control-plane"})
+	if err != nil {
+		return nil, fmt.Errorf("list worker nodes: %w", err)
+	}
+	var names []string
+	for _, n := range list.Items {
+		names = append(names, n.Name)
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("the cluster has no worker nodes\n  fix: byok8s down && byok8s up")
+	}
+	slices.Sort(names)
+	return names, nil
 }
 
 // seedPod creates a pod that names a scheduler. It asks for nothing and
