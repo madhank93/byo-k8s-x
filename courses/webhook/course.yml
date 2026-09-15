@@ -78,3 +78,6 @@ stages:
   - slug: policy-params
     name: The rule, as data
     difficulty: medium
+  - slug: match-policy
+    name: Every version of the same thing
+    difficulty: medium

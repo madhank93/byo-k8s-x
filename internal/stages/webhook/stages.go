@@ -96,6 +96,7 @@ func init() {
 	register(Stage{Slug: "connect-exec", Run: stageConnectExec})
 	register(Stage{Slug: "namespace-teardown", Run: stageNamespaceTeardown})
 	register(Stage{Slug: "policy-params", Run: stagePolicyParams})
+	register(Stage{Slug: "match-policy", Run: stageMatchPolicy})
 }
 
 // stageServeTLS checks the one thing every later stage rests on: that the
@@ -605,6 +606,124 @@ func stageValidatingAdmissionPolicy(ctx context.Context, env *kube.Env, bin stri
 		return last == nil, nil
 	}); err != nil {
 		return fmt.Errorf("a pod carrying an owner label was refused by the policy: %v", last)
+	}
+
+	return nil
+}
+
+// stageMatchPolicy checks the webhook is asked about every version of the
+// resources it names.
+//
+// A rule lists API versions, and a resource can be served at several. With
+// matchPolicy Equivalent the API server converts a write made through another
+// version to the one the rule names and asks anyway; with Exact that write
+// never reaches the webhook. The program's allowlist type is served at v1 and
+// v1beta1, and a malformed list written through either must be refused.
+func stageMatchPolicy(ctx context.Context, env *kube.Env, bin string) error {
+	port, err := freePort()
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://%s:%d/validate", externalHost, port)
+
+	if err := sweepRegistrations(ctx, env); err != nil {
+		return err
+	}
+	defer sweepRegistrations(context.WithoutCancel(ctx), env)
+
+	p, cleanup, err := launch(ctx, env, bin, port)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := waitFor(ctx, "the program to register itself", 60*time.Second, func(ctx context.Context) (bool, error) {
+		_, ok, err := findRegistration(ctx, env, url)
+		return ok, err
+	}); err != nil {
+		return fmt.Errorf("no ValidatingWebhookConfiguration points at %s: %w", url, err)
+	}
+
+	// The rule may sit on any webhook entry pointing at this program.
+	configs, err := env.Client.AdmissionregistrationV1().ValidatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list webhook configurations: %w", err)
+	}
+	var judge *admissionregistrationv1.ValidatingWebhook
+	for _, item := range configs.Items {
+		for _, w := range item.Webhooks {
+			if w.ClientConfig.URL == nil || *w.ClientConfig.URL != url {
+				continue
+			}
+			for _, rule := range w.Rules {
+				if slices.Contains(rule.APIGroups, "byok8s.dev") && slices.Contains(rule.Resources, "ownerlists") {
+					judge = &w
+				}
+			}
+		}
+	}
+	if judge == nil {
+		return fmt.Errorf("no rule covers ownerlists in byok8s.dev: the allowlist the policy reads is written with no check at all, and a malformed one locks the namespace out")
+	}
+
+	dyn, err := dynamic.NewForConfig(env.Config)
+	if err != nil {
+		return fmt.Errorf("build dynamic client: %w", err)
+	}
+	// try writes an OwnerList through one version by dry run: it is judged
+	// exactly like a real create and stores nothing.
+	try := func(version, name string, owners ...string) error {
+		items := make([]any, len(owners))
+		for i, owner := range owners {
+			items[i] = owner
+		}
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "byok8s.dev/" + version,
+			"kind":       "OwnerList",
+			"metadata":   map[string]any{"name": name, "namespace": env.Namespace},
+			"spec":       map[string]any{"owners": items},
+		}}
+		gvr := schema.GroupVersionResource{Group: "byok8s.dev", Version: version, Resource: "ownerlists"}
+		_, err := dyn.Resource(gvr).Namespace(env.Namespace).Create(ctx, obj, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+		return err
+	}
+	refused := func(err error) bool {
+		return err != nil && strings.Contains(err.Error(), "denied the request")
+	}
+
+	// The v1 write is the baseline: it proves the rule is live and the list is
+	// judged at all.
+	var last error
+	if err := waitFor(ctx, "the webhook to refuse a malformed OwnerList written as v1", 60*time.Second, func(ctx context.Context) (bool, error) {
+		last = try("v1", "typo-v1", "Platform Team")
+		return refused(last), nil
+	}); err != nil {
+		return fmt.Errorf("an OwnerList naming the owner \"Platform Team\", which no label can carry, was not refused when written as v1 (last answer: %v)\nthe program said:\n%s", last, tail(p.Stdout()))
+	}
+	if last = try("v1", "empty-v1"); !refused(last) {
+		return fmt.Errorf("an OwnerList with no owners was not refused (answer: %v): with Deny it refuses every pod in its namespace\nthe program said:\n%s", last, tail(p.Stdout()))
+	}
+
+	// The same malformed list through the other served version. A version the
+	// program has just added can take a moment to be served, so NotFound is
+	// retried.
+	if err := waitFor(ctx, "OwnerList to be served at v1beta1", 30*time.Second, func(ctx context.Context) (bool, error) {
+		last = try("v1beta1", "typo-v1beta1", "Platform Team")
+		return !apierrors.IsNotFound(last), nil
+	}); err != nil {
+		return fmt.Errorf("OwnerList is not served at v1beta1 (last answer: %v): the program's CRD has to serve both v1 and v1beta1", last)
+	}
+	if !refused(last) {
+		if judge.MatchPolicy != nil && *judge.MatchPolicy == admissionregistrationv1.Exact {
+			return fmt.Errorf("a malformed OwnerList written as v1beta1 was admitted (answer: %v): matchPolicy is Exact, so a rule naming only v1 never sees a write made through v1beta1 — Equivalent has the API server convert it and ask anyway", last)
+		}
+		return fmt.Errorf("a malformed OwnerList written as v1beta1 was admitted (answer: %v): the same list written as v1 is refused, so this webhook is not being asked about the other version\nthe program said:\n%s", last, tail(p.Stdout()))
+	}
+
+	// Converted, a well-formed list is still well-formed: the verdict must not
+	// depend on which version the client spoke.
+	if last = try("v1beta1", "good-v1beta1", "platform", "research"); last != nil {
+		return fmt.Errorf("a well-formed OwnerList written as v1beta1 was refused: %v\nthe program said:\n%s", last, tail(p.Stdout()))
 	}
 
 	return nil

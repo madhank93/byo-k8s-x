@@ -103,7 +103,7 @@ Service, owned, repaired, reported on and cleaned up after.
 **Verified by** starting your binary, mutating the cluster, and waiting for it
 to converge — then stopping it and checking it let go cleanly.
 
-### `webhook` — Build your own admission webhook · 25 stages
+### `webhook` — Build your own admission webhook · 26 stages
 
 Serving TLS, `AdmissionReview` in and out, mutation by JSON patch, and the
 operational traps that take clusters down.
@@ -113,7 +113,7 @@ operational traps that take clusters down.
 `mutate-patch` · `defaulting` · `sidecar-inject` · `dry-run` ·
 `failure-policy` · `timeout` · `reinvocation` · `cert-rotation` ·
 `audit-annotations` · `match-conditions` · `validating-admission-policy` ·
-`self-exclusion` · `subresource-eviction` · `delete-old-object` · `connect-exec` · `namespace-teardown` · `policy-params`
+`self-exclusion` · `subresource-eviction` · `delete-old-object` · `connect-exec` · `namespace-teardown` · `policy-params` · `match-policy`
 
 **Verified by** registering your webhook into the cluster and applying objects
 with `kubectl` — the verdict is whether the API server accepted or rejected
