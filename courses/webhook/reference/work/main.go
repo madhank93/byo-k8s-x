@@ -481,6 +481,20 @@ func decide(req *admissionv1.AdmissionRequest, name string) (bool, string) {
 		return true, ""
 	}
 
+	// A delete writes nothing, so request.object is null and the pod being
+	// removed is in oldObject. Only a protected pod is held back: a pod that
+	// predates the owner rule must still be removable.
+	if req.Operation == admissionv1.Delete {
+		var pod corev1.Pod
+		if err := json.Unmarshal(req.OldObject.Raw, &pod); err != nil {
+			return false, fmt.Sprintf("the pod being deleted could not be read: %v", err)
+		}
+		if pod.Labels[protectedLabel] == "true" {
+			return false, fmt.Sprintf("pod %q is protected: remove the %s label before deleting it", name, protectedLabel)
+		}
+		return true, ""
+	}
+
 	var pod corev1.Pod
 	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
 		return false, fmt.Sprintf("this object could not be read as a pod: %v", err)
@@ -822,9 +836,10 @@ func register(ctx context.Context, cs kubernetes.Interface, url string, caBundle
 			// A rule checked only on CREATE admits a correct pod and then lets
 			// anyone edit it into an incorrect one, and a rule wider than the
 			// objects the handler understands puts this program on the write
-			// path for objects it would misjudge.
+			// path for objects it would misjudge. DELETE is here so a protected
+			// pod cannot be removed by the plain verb.
 			Rules: []admissionregistrationv1.RuleWithOperations{{
-				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
+				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update, admissionregistrationv1.Delete},
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
 					APIVersions: []string{"v1"},
