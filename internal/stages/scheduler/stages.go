@@ -17,6 +17,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
@@ -44,6 +45,7 @@ func Lookup(slug string) (Stage, bool) {
 func init() {
 	register(Stage{Slug: "watch-unscheduled", Run: stageWatchUnscheduled})
 	register(Stage{Slug: "bind", Run: stageBind})
+	register(Stage{Slug: "node-list", Run: stageNodeList})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -157,6 +159,92 @@ func workerNodes(ctx context.Context, env *kube.Env) ([]string, error) {
 	}
 	slices.Sort(names)
 	return names, nil
+}
+
+// stageNodeList checks the program chooses its own node, and only one that can
+// run the pod.
+//
+// A fake node is added that the API server lists but no kubelet backs, marked
+// not Ready. Its name sorts first, so a scheduler that takes the first node, or
+// takes every node in turn, lands pods there; ten pods leave a random choice
+// little room to miss it.
+func stageNodeList(ctx context.Context, env *kube.Env, bin string) error {
+	const ghost = "byok8s-a-ghost"
+	// A run that died mid-stage can leave the node behind: start from none, and
+	// remove it however this run ends, including a failed add.
+	dropFakeNode(ctx, env, ghost)
+	defer dropFakeNode(context.WithoutCancel(ctx), env, ghost)
+	if err := addFakeNode(ctx, env, ghost, false); err != nil {
+		return err
+	}
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	var names []string
+	for i := 1; i <= 10; i++ {
+		name := fmt.Sprintf("pod-%02d", i)
+		names = append(names, name)
+		if err := seedPod(ctx, env, name, schedulerName); err != nil {
+			return err
+		}
+	}
+
+	for _, name := range names {
+		var node string
+		if err := waitFor(ctx, "pod "+name+" to be bound", 60*time.Second, func(ctx context.Context) (bool, error) {
+			got, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			node = got.Spec.NodeName
+			return node != "", nil
+		}); err != nil {
+			return fmt.Errorf("pod %s was never bound: with no --node the program has to choose a node itself: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
+		}
+		if node == ghost {
+			return fmt.Errorf("pod %s was bound to %s, whose Ready condition is False: the node is listed, but no kubelet will ever run the pod", name, ghost)
+		}
+	}
+	return nil
+}
+
+// addFakeNode creates a node the API server lists but no kubelet backs, with
+// its Ready condition set as given. Nothing ever runs a pod bound to it.
+func addFakeNode(ctx context.Context, env *kube.Env, name string, ready bool) error {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"byok8s.dev/fake": "true"}}}
+	if _, err := env.Client.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create fake node %s (left by an earlier run? kubectl delete node %s): %w", name, name, err)
+	}
+	status := corev1.ConditionFalse
+	if ready {
+		status = corev1.ConditionTrue
+	}
+	// A patch, not an update: the node controller edits a new node straight
+	// away, so an update built from the created object races it and conflicts.
+	now := time.Now().UTC().Format(time.RFC3339)
+	patch := fmt.Sprintf(`{"status":{"conditions":[{"type":"Ready","status":%q,"reason":"FakeNode","lastHeartbeatTime":%q,"lastTransitionTime":%q}]}}`, status, now, now)
+	if _, err := env.Client.CoreV1().Nodes().Patch(ctx, name, types.MergePatchType, []byte(patch), metav1.PatchOptions{}, "status"); err != nil {
+		return fmt.Errorf("set the status of fake node %s: %w", name, err)
+	}
+	return nil
+}
+
+// dropFakeNode removes a fake node and every pod bound to it, in any
+// namespace. Such a pod never finishes a graceful delete — no kubelet confirms
+// it — so it is forced, or its namespace would hang in Terminating.
+func dropFakeNode(ctx context.Context, env *kube.Env, name string) {
+	pods, err := env.Client.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: "spec.nodeName=" + name})
+	if err == nil {
+		zero := int64(0)
+		for _, p := range pods.Items {
+			_ = env.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}
+	_ = env.Client.CoreV1().Nodes().Delete(ctx, name, metav1.DeleteOptions{})
 }
 
 // seedPod creates a pod that names a scheduler. It asks for nothing and

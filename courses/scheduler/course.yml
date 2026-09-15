@@ -12,3 +12,6 @@ stages:
   - slug: bind
     name: Place a pod
     difficulty: easy
+  - slug: node-list
+    name: Choose a node that is there
+    difficulty: medium
