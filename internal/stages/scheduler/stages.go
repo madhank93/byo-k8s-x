@@ -50,6 +50,7 @@ func init() {
 	register(Stage{Slug: "fit-resources", Run: stageFitResources})
 	register(Stage{Slug: "fit-ports", Run: stageFitPorts})
 	register(Stage{Slug: "node-selector", Run: stageNodeSelector})
+	register(Stage{Slug: "node-affinity", Run: stageNodeAffinity})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -393,6 +394,104 @@ func seedPortPod(ctx context.Context, env *kube.Env, name string, port int32) er
 	return nil
 }
 
+// stageNodeAffinity checks the program honours required node affinity, whose
+// rules are not the node selector's.
+//
+// Two workers are labelled for the length of the stage: one zone=west and
+// disk=ssd, the other disk=nvme. Four pods then ask four different questions —
+// terms are ORed, the expressions inside a term are ANDed, NotIn is satisfied
+// by a node that lacks the key entirely, and a pod nothing matches waits.
+func stageNodeAffinity(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 2 {
+		return fmt.Errorf("this stage needs two worker nodes, and the cluster has %d\n  fix: byok8s down && byok8s up", len(workers))
+	}
+	west, other := workers[0], workers[1]
+	const zone, disk = "byok8s.dev/stage-zone", "byok8s.dev/stage-disk"
+	for _, l := range []struct{ node, key, value string }{
+		{west, zone, "west"}, {west, disk, "ssd"}, {other, disk, "nvme"},
+	} {
+		if err := labelNode(ctx, env, l.node, l.key, l.value); err != nil {
+			return err
+		}
+		defer labelNode(context.WithoutCancel(ctx), env, l.node, l.key, "")
+	}
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	in := func(key string, values ...string) corev1.NodeSelectorRequirement {
+		return corev1.NodeSelectorRequirement{Key: key, Operator: corev1.NodeSelectorOpIn, Values: values}
+	}
+	notIn := func(key string, values ...string) corev1.NodeSelectorRequirement {
+		return corev1.NodeSelectorRequirement{Key: key, Operator: corev1.NodeSelectorOpNotIn, Values: values}
+	}
+	exists := func(key string) corev1.NodeSelectorRequirement {
+		return corev1.NodeSelectorRequirement{Key: key, Operator: corev1.NodeSelectorOpExists}
+	}
+	term := func(reqs ...corev1.NodeSelectorRequirement) corev1.NodeSelectorTerm {
+		return corev1.NodeSelectorTerm{MatchExpressions: reqs}
+	}
+
+	// Nothing matches this one: created first, so the others being placed
+	// proves the program had its chance to decide about it.
+	if err := seedAffinityPod(ctx, env, "nowhere", []corev1.NodeSelectorTerm{term(in(zone, "south"))}); err != nil {
+		return err
+	}
+
+	cases := []struct {
+		name  string
+		terms []corev1.NodeSelectorTerm
+		want  string
+		why   string
+	}{
+		{"or-terms", []corev1.NodeSelectorTerm{term(in(zone, "south")), term(in(disk, "nvme"))}, other,
+			"terms are ORed, and only the second one matches any node"},
+		{"and-expressions", []corev1.NodeSelectorTerm{term(exists(disk), in(zone, "west"))}, west,
+			"the expressions in one term are ANDed, and only one node carries both labels"},
+	}
+	for _, c := range cases {
+		if err := seedAffinityPod(ctx, env, c.name, c.terms); err != nil {
+			return err
+		}
+		node, err := boundNode(ctx, env, c.name, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("pod %s was never bound, though %s: %w\nthe program said:\n%s", c.name, c.why, err, tail(p.Stdout()))
+		}
+		if node != c.want {
+			return fmt.Errorf("pod %s was bound to %s, but %s, so it belongs on %s", c.name, node, c.why, c.want)
+		}
+	}
+
+	// NotIn is satisfied by a node that does not carry the key at all, so this
+	// pod may go anywhere except the one node labelled zone=west.
+	if err := seedAffinityPod(ctx, env, "not-in-west", []corev1.NodeSelectorTerm{term(notIn(zone, "west"))}); err != nil {
+		return err
+	}
+	node, err := boundNode(ctx, env, "not-in-west", 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("pod not-in-west asks for a node whose zone is not west, which every node but %s satisfies — a node lacking the label entirely satisfies NotIn: %w\nthe program said:\n%s", west, err, tail(p.Stdout()))
+	}
+	if node == west {
+		return fmt.Errorf("pod not-in-west was bound to %s, which is labelled zone=west", west)
+	}
+
+	got, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, "nowhere", metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if got.Spec.NodeName != "" {
+		return fmt.Errorf("pod nowhere asks for zone=south, which no node carries, and was bound to %s", got.Spec.NodeName)
+	}
+	return nil
+}
+
 // stageNodeSelector checks the program keeps a pod to the nodes its selector
 // names.
 //
@@ -441,6 +540,27 @@ func stageNodeSelector(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if got.Spec.NodeName != "" {
 		return fmt.Errorf("pod nowhere selects %s=no-such-node, which no node carries, and was bound to %s: when the selector leaves no candidate, the pod waits", key, got.Spec.NodeName)
+	}
+	return nil
+}
+
+// seedAffinityPod creates a pod naming this scheduler whose required node
+// affinity is the given terms.
+func seedAffinityPod(ctx context.Context, env *kube.Env, name string, terms []corev1.NodeSelectorTerm) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName: schedulerName,
+			Affinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: terms},
+				},
+			},
+			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
 	}
 	return nil
 }

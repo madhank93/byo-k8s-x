@@ -24,3 +24,6 @@ stages:
   - slug: node-selector
     name: Only the nodes a pod asks for
     difficulty: medium
+  - slug: node-affinity
+    name: Rules richer than equality
+    difficulty: medium
