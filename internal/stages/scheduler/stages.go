@@ -48,6 +48,7 @@ func init() {
 	register(Stage{Slug: "bind", Run: stageBind})
 	register(Stage{Slug: "node-list", Run: stageNodeList})
 	register(Stage{Slug: "fit-resources", Run: stageFitResources})
+	register(Stage{Slug: "fit-ports", Run: stageFitPorts})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -268,29 +269,34 @@ func stageFitResources(ctx context.Context, env *kube.Env, bin string) error {
 		resource corev1.ResourceName
 		amount   string
 	}{{corev1.ResourceCPU, "6"}, {corev1.ResourceMemory, "5Gi"}} {
-		if err := fillNodes(ctx, env, p, ask.resource, ask.amount); err != nil {
+		done, err := fillNodes(ctx, env, p, string(ask.resource), ask.amount+" of "+string(ask.resource), func(name string) error {
+			return seedRequestingPod(ctx, env, name, ask.resource, ask.amount)
+		})
+		done()
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// fillNodes creates pods asking for amount of resource, one at a time, until
-// one is left waiting, then deletes them all.
-func fillNodes(ctx context.Context, env *kube.Env, p *runner.Process, resource corev1.ResourceName, amount string) error {
+// fillNodes creates pods with seed, one at a time, until one is left waiting,
+// and returns a cleanup that deletes them. Each pod must be one no node can
+// take twice; prefix names the pods and what describes what each asks for.
+func fillNodes(ctx context.Context, env *kube.Env, p *runner.Process, prefix, what string, seed func(name string) error) (func(), error) {
 	var created []string
-	defer func() {
+	cleanup := func() {
 		zero := int64(0)
 		for _, name := range created {
 			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
 		}
-	}()
+	}
 
 	holder := map[string]string{} // node -> the pod this batch put there
 	for i := 1; i <= 6; i++ {
-		name := fmt.Sprintf("%s-%d", resource, i)
-		if err := seedRequestingPod(ctx, env, name, resource, amount); err != nil {
-			return err
+		name := fmt.Sprintf("%s-%d", prefix, i)
+		if err := seed(name); err != nil {
+			return cleanup, err
 		}
 		created = append(created, name)
 
@@ -305,13 +311,13 @@ func fillNodes(ctx context.Context, env *kube.Env, p *runner.Process, resource c
 		}); err != nil {
 			// Left waiting is right once every worker holds one.
 			if len(holder) < 3 {
-				return fmt.Errorf("pod %s asks for %s of %s and was left waiting while only %d node(s) held such a pod: a worker still had room\nthe program said:\n%s", name, amount, resource, len(holder), tail(p.Stdout()))
+				return cleanup, fmt.Errorf("pod %s asks for %s and was left waiting while only %d node(s) held such a pod: a worker still had room\nthe program said:\n%s", name, what, len(holder), tail(p.Stdout()))
 			}
-			return nil
+			return cleanup, nil
 		}
 
 		if other, ok := holder[node]; ok {
-			return fmt.Errorf("pods %s and %s each ask for %s of %s, more than half of %s, and both were bound there: the second cannot fit beside the first", other, name, amount, resource, node)
+			return cleanup, fmt.Errorf("pods %s and %s each ask for %s, which a node can give only once, and both were bound to %s", other, name, what, node)
 		}
 		holder[node] = name
 
@@ -325,10 +331,65 @@ func fillNodes(ctx context.Context, env *kube.Env, p *runner.Process, resource c
 			}
 			return got.Status.Phase == corev1.PodRunning, nil
 		}); err != nil {
-			return fmt.Errorf("pod %s was bound to %s but did not run: %w", name, node, err)
+			return cleanup, fmt.Errorf("pod %s was bound to %s but did not run: %w", name, node, err)
 		}
 	}
-	return fmt.Errorf("six pods each asking for more than half of a node were all bound: at most one fits on each")
+	return cleanup, fmt.Errorf("six pods each asking for %s were all bound: a node can give it only once", what)
+}
+
+// stageFitPorts checks the program keeps a host port to one pod per node.
+//
+// Pods asking for host port 8080 are created one at a time until one has
+// nowhere to go. A pod asking for 8081 must then still find a node: a port is
+// held by its number and protocol, not by the node.
+func stageFitPorts(ctx context.Context, env *kube.Env, bin string) error {
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	done, err := fillNodes(ctx, env, p, "port", "host port 8080", func(name string) error {
+		return seedPortPod(ctx, env, name, 8080)
+	})
+	defer done()
+	if err != nil {
+		return err
+	}
+
+	if err := seedPortPod(ctx, env, "other-port", 8081); err != nil {
+		return err
+	}
+	if err := waitFor(ctx, "pod other-port to be bound", 30*time.Second, func(ctx context.Context) (bool, error) {
+		got, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, "other-port", metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		return got.Spec.NodeName != "", nil
+	}); err != nil {
+		return fmt.Errorf("pod other-port asks for host port 8081, which no node holds, and was left waiting: a port is held by its number and protocol, not by the node\nthe program said:\n%s", tail(p.Stdout()))
+	}
+	return nil
+}
+
+// seedPortPod creates a pod naming this scheduler that claims a TCP port on
+// its node's own network.
+func seedPortPod(ctx context.Context, env *kube.Env, name string, port int32) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName: schedulerName,
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Image: "registry.k8s.io/pause:3.9",
+				Ports: []corev1.ContainerPort{{ContainerPort: 80, HostPort: port, Protocol: corev1.ProtocolTCP}},
+			}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
 }
 
 // seedRequestingPod creates a pod naming this scheduler that asks for amount of
