@@ -49,6 +49,7 @@ func init() {
 	register(Stage{Slug: "node-list", Run: stageNodeList})
 	register(Stage{Slug: "fit-resources", Run: stageFitResources})
 	register(Stage{Slug: "fit-ports", Run: stageFitPorts})
+	register(Stage{Slug: "node-selector", Run: stageNodeSelector})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -390,6 +391,101 @@ func seedPortPod(ctx context.Context, env *kube.Env, name string, port int32) er
 		return fmt.Errorf("seed pod %s: %w", name, err)
 	}
 	return nil
+}
+
+// stageNodeSelector checks the program keeps a pod to the nodes its selector
+// names.
+//
+// One worker is labelled for the length of the stage. Pods selecting that
+// label must land there, and a pod selecting a label no node carries must be
+// left waiting. That pod is created first, so by the time the others are
+// placed the program has already decided about it.
+func stageNodeSelector(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	chosen := workers[0]
+	const key = "byok8s.dev/stage-selected"
+	if err := labelNode(ctx, env, chosen, key, "yes"); err != nil {
+		return err
+	}
+	defer labelNode(context.WithoutCancel(ctx), env, chosen, key, "")
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := seedSelectingPod(ctx, env, "nowhere", map[string]string{key: "no-such-node"}); err != nil {
+		return err
+	}
+	for i := 1; i <= 3; i++ {
+		name := fmt.Sprintf("selecting-%d", i)
+		if err := seedSelectingPod(ctx, env, name, map[string]string{key: "yes"}); err != nil {
+			return err
+		}
+		node, err := boundNode(ctx, env, name, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("pod %s selects %s=yes, which %s carries, and was never bound: a node needs at least the labels a selector names, not only them: %w\nthe program said:\n%s", name, key, chosen, err, tail(p.Stdout()))
+		}
+		if node != chosen {
+			return fmt.Errorf("pod %s selects %s=yes, which only %s carries, and was bound to %s", name, key, chosen, node)
+		}
+	}
+
+	got, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, "nowhere", metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if got.Spec.NodeName != "" {
+		return fmt.Errorf("pod nowhere selects %s=no-such-node, which no node carries, and was bound to %s: when the selector leaves no candidate, the pod waits", key, got.Spec.NodeName)
+	}
+	return nil
+}
+
+// labelNode sets a label on a node, or removes it when value is empty.
+func labelNode(ctx context.Context, env *kube.Env, node, key, value string) error {
+	v := "null"
+	if value != "" {
+		v = fmt.Sprintf("%q", value)
+	}
+	patch := fmt.Sprintf(`{"metadata":{"labels":{%q:%s}}}`, key, v)
+	if _, err := env.Client.CoreV1().Nodes().Patch(ctx, node, types.MergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("label node %s: %w", node, err)
+	}
+	return nil
+}
+
+// seedSelectingPod creates a pod naming this scheduler with a node selector.
+func seedSelectingPod(ctx context.Context, env *kube.Env, name string, selector map[string]string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName: schedulerName,
+			NodeSelector:  selector,
+			Containers:    []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
+}
+
+// boundNode waits for a pod to be bound and returns the node it went to.
+func boundNode(ctx context.Context, env *kube.Env, name string, within time.Duration) (string, error) {
+	var node string
+	err := waitFor(ctx, "pod "+name+" to be bound", within, func(ctx context.Context) (bool, error) {
+		got, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		node = got.Spec.NodeName
+		return node != "", nil
+	})
+	return node, err
 }
 
 // seedRequestingPod creates a pod naming this scheduler that asks for amount of
