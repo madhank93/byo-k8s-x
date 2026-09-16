@@ -51,6 +51,7 @@ func init() {
 	register(Stage{Slug: "fit-ports", Run: stageFitPorts})
 	register(Stage{Slug: "node-selector", Run: stageNodeSelector})
 	register(Stage{Slug: "node-affinity", Run: stageNodeAffinity})
+	register(Stage{Slug: "taints", Run: stageTaints})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -394,6 +395,66 @@ func seedPortPod(ctx context.Context, env *kube.Env, name string, port int32) er
 	return nil
 }
 
+// stageTaints checks the program keeps pods off nodes that say keep off.
+//
+// A taint is the node's own refusal, and nothing downstream enforces the
+// NoSchedule kind: a pod bound to a tainted node it does not tolerate is run by
+// the kubelet as if nothing were wrong. The control plane has carried such a
+// taint all course, so this stage also expects pods to stop landing there.
+func stageTaints(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	tainted := workers[0]
+	const key = "byok8s.dev/stage-dedicated"
+	if err := taintNode(ctx, env, tainted, key, "yes", corev1.TaintEffectNoSchedule); err != nil {
+		return err
+	}
+	defer taintNode(context.WithoutCancel(ctx), env, tainted, key, "", "")
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// Pods that tolerate nothing: none may land on the tainted worker, and none
+	// on the control plane, which carries a NoSchedule taint of its own.
+	for i := 1; i <= 4; i++ {
+		name := fmt.Sprintf("plain-%d", i)
+		if err := seedPod(ctx, env, name, schedulerName); err != nil {
+			return err
+		}
+		node, err := boundNode(ctx, env, name, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("pod %s tolerates nothing and was never bound, though two workers carry no taint: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
+		}
+		if node == tainted {
+			return fmt.Errorf("pod %s tolerates nothing and was bound to %s, which is tainted %s=yes:NoSchedule: nothing downstream refuses it, so the scheduler must", name, node, key)
+		}
+		if strings.HasSuffix(node, "control-plane") {
+			return fmt.Errorf("pod %s tolerates nothing and was bound to %s, which carries node-role.kubernetes.io/control-plane:NoSchedule", name, node)
+		}
+	}
+
+	// A pod that tolerates the taint may go there — and with every other node
+	// already holding one of the pods above, it is the only place left.
+	tolerations := []corev1.Toleration{{
+		Key:      key,
+		Operator: corev1.TolerationOpEqual,
+		Value:    "yes",
+		Effect:   corev1.TaintEffectNoSchedule,
+	}}
+	if err := seedToleratingPod(ctx, env, "tolerating", tolerations); err != nil {
+		return err
+	}
+	if _, err := boundNode(ctx, env, "tolerating", 60*time.Second); err != nil {
+		return fmt.Errorf("pod tolerating carries a toleration for %s=yes:NoSchedule and was never bound: a taint keeps out only the pods that do not answer it: %w\nthe program said:\n%s", key, err, tail(p.Stdout()))
+	}
+	return nil
+}
+
 // stageNodeAffinity checks the program honours required node affinity, whose
 // rules are not the node selector's.
 //
@@ -557,6 +618,47 @@ func seedAffinityPod(ctx context.Context, env *kube.Env, name string, terms []co
 				},
 			},
 			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
+}
+
+// taintNode adds a taint to a node, or removes the taint with that key when
+// effect is empty. The whole list is sent back, since a taint is an item in a
+// slice rather than a field of its own.
+func taintNode(ctx context.Context, env *kube.Env, node, key, value string, effect corev1.TaintEffect) error {
+	got, err := env.Client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read node %s: %w", node, err)
+	}
+	var keep []corev1.Taint
+	for _, t := range got.Spec.Taints {
+		if t.Key != key {
+			keep = append(keep, t)
+		}
+	}
+	if effect != "" {
+		keep = append(keep, corev1.Taint{Key: key, Value: value, Effect: effect})
+	}
+	got.Spec.Taints = keep
+	if _, err := env.Client.CoreV1().Nodes().Update(ctx, got, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("taint node %s: %w", node, err)
+	}
+	return nil
+}
+
+// seedToleratingPod creates a pod naming this scheduler that carries the given
+// tolerations.
+func seedToleratingPod(ctx context.Context, env *kube.Env, name string, tolerations []corev1.Toleration) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName: schedulerName,
+			Tolerations:   tolerations,
+			Containers:    []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
 		},
 	}
 	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {

@@ -27,3 +27,6 @@ stages:
   - slug: node-affinity
     name: Rules richer than equality
     difficulty: medium
+  - slug: taints
+    name: Nodes that say keep off
+    difficulty: medium
