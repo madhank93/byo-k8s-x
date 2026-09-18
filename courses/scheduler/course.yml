@@ -30,3 +30,6 @@ stages:
   - slug: taints
     name: Nodes that say keep off
     difficulty: medium
+  - slug: unschedulable
+    name: A node closed for new work
+    difficulty: easy

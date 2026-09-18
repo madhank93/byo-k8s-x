@@ -52,6 +52,7 @@ func init() {
 	register(Stage{Slug: "node-selector", Run: stageNodeSelector})
 	register(Stage{Slug: "node-affinity", Run: stageNodeAffinity})
 	register(Stage{Slug: "taints", Run: stageTaints})
+	register(Stage{Slug: "unschedulable", Run: stageUnschedulable})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -455,6 +456,70 @@ func stageTaints(ctx context.Context, env *kube.Env, bin string) error {
 	return nil
 }
 
+// stageUnschedulable checks the program respects a node closed to new work,
+// and the one thing that reopens it for a pod.
+//
+// Cordoning sets spec.unschedulable and the node controller adds
+// node.kubernetes.io/unschedulable:NoSchedule to match. Plain pods must go
+// elsewhere; a pod tolerating that taint may still be placed there, which is
+// what keeps a DaemonSet running on a node being drained. The tolerating pod
+// also carries a selector for the cordoned node, so that node is the only
+// candidate it has and being placed anywhere else is a failure.
+func stageUnschedulable(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	closed := workers[0]
+	const key = "byok8s.dev/stage-cordoned"
+	if err := labelNode(ctx, env, closed, key, "yes"); err != nil {
+		return err
+	}
+	defer labelNode(context.WithoutCancel(ctx), env, closed, key, "")
+	if err := cordonNode(ctx, env, closed, true); err != nil {
+		return err
+	}
+	defer cordonNode(context.WithoutCancel(ctx), env, closed, false)
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	for i := 1; i <= 3; i++ {
+		name := fmt.Sprintf("plain-%d", i)
+		if err := seedPod(ctx, env, name, schedulerName); err != nil {
+			return err
+		}
+		node, err := boundNode(ctx, env, name, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("pod %s tolerates nothing and was never bound, though two workers are open: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
+		}
+		if node == closed {
+			return fmt.Errorf("pod %s was bound to %s, which is cordoned: spec.unschedulable is the operator saying take nothing new, and nothing downstream refuses it", name, node)
+		}
+	}
+
+	// A pod that answers the cordon taint, and can go nowhere else.
+	tolerations := []corev1.Toleration{{
+		Key:      "node.kubernetes.io/unschedulable",
+		Operator: corev1.TolerationOpExists,
+		Effect:   corev1.TaintEffectNoSchedule,
+	}}
+	if err := seedPodWith(ctx, env, "tolerating", map[string]string{key: "yes"}, tolerations); err != nil {
+		return err
+	}
+	node, err := boundNode(ctx, env, "tolerating", 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("pod tolerating carries a toleration for node.kubernetes.io/unschedulable and a selector only %s satisfies, and was never bound: a cordoned node is still a candidate for a pod that tolerates being there: %w\nthe program said:\n%s", closed, err, tail(p.Stdout()))
+	}
+	if node != closed {
+		return fmt.Errorf("pod tolerating selects %s=yes, which only %s carries, and was bound to %s", key, closed, node)
+	}
+	return nil
+}
+
 // stageNodeAffinity checks the program honours required node affinity, whose
 // rules are not the node selector's.
 //
@@ -618,6 +683,35 @@ func seedAffinityPod(ctx context.Context, env *kube.Env, name string, terms []co
 				},
 			},
 			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
+}
+
+// cordonNode closes a node to new work, or opens it again. It is what kubectl
+// cordon does: set the field, and let the node controller add the taint.
+func cordonNode(ctx context.Context, env *kube.Env, node string, closed bool) error {
+	patch := fmt.Sprintf(`{"spec":{"unschedulable":%t}}`, closed)
+	if _, err := env.Client.CoreV1().Nodes().Patch(ctx, node, types.MergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("cordon node %s: %w", node, err)
+	}
+	return nil
+}
+
+// seedPodWith creates a pod naming this scheduler that carries both a node
+// selector and tolerations, for the stages where one without the other would
+// not pin the pod to a single node.
+func seedPodWith(ctx context.Context, env *kube.Env, name string, selector map[string]string, tolerations []corev1.Toleration) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName: schedulerName,
+			NodeSelector:  selector,
+			Tolerations:   tolerations,
+			Containers:    []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
 		},
 	}
 	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
