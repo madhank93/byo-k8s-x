@@ -16,6 +16,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -53,6 +54,7 @@ func init() {
 	register(Stage{Slug: "node-affinity", Run: stageNodeAffinity})
 	register(Stage{Slug: "taints", Run: stageTaints})
 	register(Stage{Slug: "unschedulable", Run: stageUnschedulable})
+	register(Stage{Slug: "events", Run: stageEvents})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -90,6 +92,73 @@ func stageWatchUnscheduled(ctx context.Context, env *kube.Env, bin string) error
 	// so if it was going to be reported, it would be before "after" was.
 	if strings.Contains(p.Stdout(), env.Namespace+"/elsewhere") {
 		return fmt.Errorf("pod elsewhere names the default scheduler and was reported anyway: only pods naming %s are this program's\nthe program said:\n%s", schedulerName, tail(p.Stdout()))
+	}
+	return nil
+}
+
+// stageEvents checks the program says what it did, where a person will look.
+//
+// kubectl describe pod is the first thing anyone runs when a pod is not where
+// they expected, so both answers belong there: a Normal event naming the node
+// when the pod is placed, and a Warning when nothing fits.
+func stageEvents(ctx context.Context, env *kube.Env, bin string) error {
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := seedPod(ctx, env, "placed", schedulerName); err != nil {
+		return err
+	}
+	node, err := boundNode(ctx, env, "placed", 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("pod placed was never bound: %w\nthe program said:\n%s", err, tail(p.Stdout()))
+	}
+
+	var scheduled eventsv1.Event
+	if err := waitFor(ctx, "an event about pod placed", 30*time.Second, func(ctx context.Context) (bool, error) {
+		events, err := podEvents(ctx, env, "placed")
+		if err != nil {
+			return false, err
+		}
+		for _, e := range events {
+			if e.Type == corev1.EventTypeNormal {
+				scheduled = e
+				return true, nil
+			}
+		}
+		return false, nil
+	}); err != nil {
+		return fmt.Errorf("pod placed was bound to %s and no Normal event says so: kubectl describe pod is where that answer belongs: %w\nthe program said:\n%s", node, err, tail(p.Stdout()))
+	}
+	if scheduled.Reason == "" {
+		return fmt.Errorf("the event about pod placed carries no reason: reason is the word people grep for, like Scheduled")
+	}
+	if !strings.Contains(scheduled.Note, node) {
+		return fmt.Errorf("the event about pod placed says %q, which does not name %s, the node it went to", scheduled.Note, node)
+	}
+	if scheduled.ReportingController == "" {
+		return fmt.Errorf("the event about pod placed names no reportingController, so kubectl describe cannot say who decided")
+	}
+
+	// A pod nothing can place: the reason is owed just as much.
+	if err := seedSelectingPod(ctx, env, "nowhere", map[string]string{"byok8s.dev/stage-nowhere": "yes"}); err != nil {
+		return err
+	}
+	if err := waitFor(ctx, "a warning event about pod nowhere", 60*time.Second, func(ctx context.Context) (bool, error) {
+		events, err := podEvents(ctx, env, "nowhere")
+		if err != nil {
+			return false, err
+		}
+		for _, e := range events {
+			if e.Type == corev1.EventTypeWarning && e.Reason != "" {
+				return true, nil
+			}
+		}
+		return false, nil
+	}); err != nil {
+		return fmt.Errorf("pod nowhere selects a label no node carries and no Warning event explains why it is still waiting: %w\nthe program said:\n%s", err, tail(p.Stdout()))
 	}
 	return nil
 }
@@ -689,6 +758,34 @@ func seedAffinityPod(ctx context.Context, env *kube.Env, name string, terms []co
 		return fmt.Errorf("seed pod %s: %w", name, err)
 	}
 	return nil
+}
+
+// podEvents returns the events a scheduler recorded about one pod in this
+// stage's namespace, in the current API — the one kubectl describe reads.
+//
+// Events are matched on the pod's UID, not its name. The namespace is per
+// stage and outlives a single run, and events stay for an hour, so a run that
+// matched on the name alone would read the previous run's answers about a pod
+// with the same name. The kubelet's own Normal events about a running pod
+// (Pulled, Created, Started) are left out too: they carry the right UID but
+// say nothing about scheduling, and they arrive in no fixed order relative to
+// the scheduler's.
+func podEvents(ctx context.Context, env *kube.Env, name string) ([]eventsv1.Event, error) {
+	pod, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get pod %s: %w", name, err)
+	}
+	list, err := env.Client.EventsV1().Events(env.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list events: %w", err)
+	}
+	var out []eventsv1.Event
+	for _, e := range list.Items {
+		if e.Regarding.UID == pod.UID && e.ReportingController != "kubelet" {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 // cordonNode closes a node to new work, or opens it again. It is what kubectl

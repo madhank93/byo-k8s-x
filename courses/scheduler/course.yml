@@ -33,3 +33,6 @@ stages:
   - slug: unschedulable
     name: A node closed for new work
     difficulty: easy
+  - slug: events
+    name: Say why, where people look
+    difficulty: easy
