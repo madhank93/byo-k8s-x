@@ -44,6 +44,23 @@ jobs:
       # Sized by the courses themselves (course.yml `workers`), so CI creates
       # the cluster exactly the way a learner does.
       - run: go run ./cmd/byok8s up
+      # The API server reaches a webhook running on the host by name, and
+      # host.docker.internal is a Docker Desktop convenience that a Linux
+      # runner does not provide. From inside a kind node the host is the kind
+      # network's gateway, so the graders are told to use that instead.
+      - name: Name the host in a way the cluster can resolve
+        run: |
+          # kind's network is dual-stack and the IPv6 entry can come first, so
+          # the IPv4 gateway is picked by shape rather than by position: the
+          # graders build "https://host:port/…", which a bare IPv6 literal
+          # would need brackets for.
+          gateway=$(docker network inspect kind --format '{{json .IPAM.Config}}' \
+            | jq -r 'first(.[] | select(.Gateway != null and (.Gateway | contains(":") | not)) | .Gateway)')
+          if [ -z "$gateway" ] || [ "$gateway" = "null" ]; then
+            echo "::error::no IPv4 gateway on the kind network"; exit 1
+          fi
+          echo "resolved host address: $gateway"
+          echo "BYOK8S_EXTERNAL_HOST=$gateway" >> "$GITHUB_ENV"
       - name: Verify every stage of every shipped course
         run: |
           for slug in $(go run ./cmd/byok8s courses --shipped); do
