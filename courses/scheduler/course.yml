@@ -1,0 +1,41 @@
+slug: scheduler
+name: Build your own scheduler
+language: go
+entrypoint: main.go
+# Stages assert which node a pod lands on, so the cluster needs nodes to choose
+# between: three workers beside the control plane.
+workers: 3
+stages:
+  - slug: watch-unscheduled
+    name: Find the pods waiting for you
+    difficulty: easy
+  - slug: bind
+    name: Place a pod
+    difficulty: easy
+  - slug: node-list
+    name: Choose a node that is there
+    difficulty: medium
+  - slug: fit-resources
+    name: Only where it fits
+    difficulty: medium
+  - slug: fit-ports
+    name: A port only one pod can hold
+    difficulty: medium
+  - slug: node-selector
+    name: Only the nodes a pod asks for
+    difficulty: medium
+  - slug: node-affinity
+    name: Rules richer than equality
+    difficulty: medium
+  - slug: taints
+    name: Nodes that say keep off
+    difficulty: medium
+  - slug: unschedulable
+    name: A node closed for new work
+    difficulty: easy
+  - slug: events
+    name: Say why, where people look
+    difficulty: easy
+  - slug: requeue
+    name: Try again when the cluster changes
+    difficulty: medium
