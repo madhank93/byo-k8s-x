@@ -55,6 +55,7 @@ func init() {
 	register(Stage{Slug: "taints", Run: stageTaints})
 	register(Stage{Slug: "unschedulable", Run: stageUnschedulable})
 	register(Stage{Slug: "events", Run: stageEvents})
+	register(Stage{Slug: "requeue", Run: stageRequeue})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -92,6 +93,54 @@ func stageWatchUnscheduled(ctx context.Context, env *kube.Env, bin string) error
 	// so if it was going to be reported, it would be before "after" was.
 	if strings.Contains(p.Stdout(), env.Namespace+"/elsewhere") {
 		return fmt.Errorf("pod elsewhere names the default scheduler and was reported anyway: only pods naming %s are this program's\nthe program said:\n%s", schedulerName, tail(p.Stdout()))
+	}
+	return nil
+}
+
+// stageRequeue checks a pod that found no node is tried again when the cluster
+// changes, which is the difference between deciding once and scheduling.
+//
+// Every worker is closed before the program starts, so the pod it is given has
+// nowhere to go. Opening the workers again is the only thing that happens
+// next: nothing touches the pod, and no new pod arrives.
+func stageRequeue(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	for _, n := range workers {
+		if err := cordonNode(ctx, env, n, true); err != nil {
+			return err
+		}
+	}
+	// The nodes are shared with every later run, so they are opened again
+	// whatever happens here.
+	defer func() {
+		for _, n := range workers {
+			_ = cordonNode(context.WithoutCancel(ctx), env, n, false)
+		}
+	}()
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := seedPod(ctx, env, "later", schedulerName); err != nil {
+		return err
+	}
+	if err := awaitLine(ctx, p, "waiting", 60*time.Second); err != nil {
+		return fmt.Errorf("every node is closed to new work and the program never reported pod later as waiting: %w\nthe program said:\n%s", err, tail(p.Stdout()))
+	}
+
+	for _, n := range workers {
+		if err := cordonNode(ctx, env, n, false); err != nil {
+			return err
+		}
+	}
+	if _, err := boundNode(ctx, env, "later", 90*time.Second); err != nil {
+		return fmt.Errorf("the nodes were opened again and pod later was never placed: a pod that could not be scheduled has to be tried again when the cluster changes, not decided once: %w\nthe program said:\n%s", err, tail(p.Stdout()))
 	}
 	return nil
 }

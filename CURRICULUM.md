@@ -126,7 +126,7 @@ pods, spreading, priority and preemption.
 
 `watch-unscheduled` · `bind` · `node-list` · `fit-resources` · `fit-ports` ·
 `node-selector` · `node-affinity` · `taints` · `unschedulable` · `events` ·
-`informer-cache` · `assumed-pods` · `score-least-allocated` ·
+`requeue` · `assumed-pods` · `score-least-allocated` ·
 `score-balanced` · `score-image-locality` · `spread-by-owner` ·
 `topology-spread` · `pod-affinity` · `volume-binding` · `priority` ·
 `preemption` · `framework-plugins` · `multi-profile` ·

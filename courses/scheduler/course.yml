@@ -36,3 +36,6 @@ stages:
   - slug: events
     name: Say why, where people look
     difficulty: easy
+  - slug: requeue
+    name: Try again when the cluster changes
+    difficulty: medium
