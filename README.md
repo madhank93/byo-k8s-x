@@ -17,9 +17,16 @@ reconcile loop that creates and owns a Deployment and a Service, repairs them
 when they drift, reports status and conditions, cleans up behind a finalizer,
 elects a leader and shuts down cleanly.
 
-The rest of the ladder — webhook, scheduler, apiserver, kubelet, CNI,
-kube-proxy and more — is written down in [CURRICULUM.md](CURRICULUM.md), with a
-stage list for each.
+**Build your own admission webhook** is the third: serve TLS the API server
+trusts, answer an AdmissionReview, register yourself, deny with a message and
+rewrite with a JSON patch, then survive what takes clusters down — failure
+policy and timeouts, reinvocation, certificate rotation, never gating your own
+namespace, evictions, deletes and exec, namespace teardown, and a
+ValidatingAdmissionPolicy that needs no webhook at all.
+
+The rest of the ladder — scheduler, apiserver, kubelet, CNI, kube-proxy and
+more — is written down in [CURRICULUM.md](CURRICULUM.md), with a stage list for
+each.
 
 ## Getting started
 

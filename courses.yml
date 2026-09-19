@@ -23,7 +23,7 @@ entries:
 
   - slug: webhook
     name: Build your own admission webhook
-    status: planned
+    status: shipped
     tier: control loops
     blurb: TLS, AdmissionReview, JSON patch, and the traps that take clusters down.
 
