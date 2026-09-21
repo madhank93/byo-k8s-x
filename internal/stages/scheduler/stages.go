@@ -56,6 +56,7 @@ func init() {
 	register(Stage{Slug: "unschedulable", Run: stageUnschedulable})
 	register(Stage{Slug: "events", Run: stageEvents})
 	register(Stage{Slug: "requeue", Run: stageRequeue})
+	register(Stage{Slug: "score-least-allocated", Run: stageScoreLeastAllocated})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -93,6 +94,88 @@ func stageWatchUnscheduled(ctx context.Context, env *kube.Env, bin string) error
 	// so if it was going to be reported, it would be before "after" was.
 	if strings.Contains(p.Stdout(), env.Namespace+"/elsewhere") {
 		return fmt.Errorf("pod elsewhere names the default scheduler and was reported anyway: only pods naming %s are this program's\nthe program said:\n%s", schedulerName, tail(p.Stdout()))
+	}
+	return nil
+}
+
+// stageScoreLeastAllocated checks the program prefers the node with room over
+// one that merely fits.
+//
+// One worker is loaded to roughly three quarters of its CPU by a pod pinned
+// with spec.nodeName, which no scheduler is involved in. Small pods then have
+// somewhere better to be, and a program that takes nodes in turn will put one
+// on the loaded node anyway.
+func stageScoreLeastAllocated(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 2 {
+		return fmt.Errorf("this stage needs at least two workers, found %d", len(workers))
+	}
+	loaded := workers[0]
+
+	node, err := env.Client.CoreV1().Nodes().Get(ctx, loaded, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", loaded, err)
+	}
+	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	ballast := cpu.MilliValue() * 75 / 100
+	if err := seedBallast(ctx, env, "ballast", loaded, ballast); err != nil {
+		return err
+	}
+	// The namespace outlives this run, and the ballast holds three quarters of
+	// a worker: left behind, it shrinks the cluster for every stage graded
+	// after this one.
+	zero := int64(0)
+	defer func() {
+		_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), "ballast",
+			metav1.DeleteOptions{GracePeriodSeconds: &zero})
+	}()
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// One pod per worker and one more: a program that ignores the scores and
+	// takes nodes in turn has to land on the loaded one within this many.
+	for _, name := range []string{"small-1", "small-2", "small-3", "small-4"} {
+		if err := seedPod(ctx, env, name, schedulerName); err != nil {
+			return err
+		}
+		where, err := boundNode(ctx, env, name, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("pod %s was never placed: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
+		}
+		if where == loaded {
+			return fmt.Errorf("pod %s went to %s, which is already %dm of %dm spoken for, while another worker sits empty: a node that fits is not the same as the best node for the pod\nthe program said:\n%s", name, loaded, ballast, cpu.MilliValue(), tail(p.Stdout()))
+		}
+	}
+	return nil
+}
+
+// seedBallast pins a pod to one node with spec.nodeName and a CPU request, so
+// that node is spoken for without any scheduler having chosen it.
+func seedBallast(ctx context.Context, env *kube.Env, name, node string, milli int64) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			NodeName: node,
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Image: "registry.k8s.io/pause:3.9",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU: *apiresource.NewMilliQuantity(milli, apiresource.DecimalSI),
+					},
+				},
+			}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed ballast pod %s: %w", name, err)
 	}
 	return nil
 }

@@ -39,3 +39,6 @@ stages:
   - slug: requeue
     name: Try again when the cluster changes
     difficulty: medium
+  - slug: score-least-allocated
+    name: Not just anywhere it fits
+    difficulty: medium
