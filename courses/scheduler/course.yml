@@ -45,3 +45,6 @@ stages:
   - slug: score-balanced
     name: Even, not only empty
     difficulty: medium
+  - slug: score-image-locality
+    name: Where it can start now
+    difficulty: easy

@@ -58,6 +58,7 @@ func init() {
 	register(Stage{Slug: "requeue", Run: stageRequeue})
 	register(Stage{Slug: "score-least-allocated", Run: stageScoreLeastAllocated})
 	register(Stage{Slug: "score-balanced", Run: stageScoreBalanced})
+	register(Stage{Slug: "score-image-locality", Run: stageScoreImageLocality})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -153,6 +154,130 @@ func stageScoreLeastAllocated(ctx context.Context, env *kube.Env, bin string) er
 		if where == loaded {
 			return fmt.Errorf("pod %s went to %s, which is already %dm of %dm spoken for, while another worker sits empty: a node that fits is not the same as the best node for the pod\nthe program said:\n%s", name, loaded, ballast, cpu.MilliValue(), tail(p.Stdout()))
 		}
+	}
+	return nil
+}
+
+// localityImage is the image this stage warms one node with: large enough to
+// be worth preferring a node for, and not one kind puts on every node.
+const localityImage = "registry.k8s.io/e2e-test-images/agnhost:2.53"
+
+// stageScoreImageLocality checks the program prefers a node that can start the
+// pod now over one that has to download it first.
+//
+// One worker is made to pull the image by a pod pinned to it, which no
+// scheduler is involved in; the pod is then deleted and the image stays in
+// that node's cache. The pods that follow ask for nothing, so every worker is
+// equal on room and on evenness, and the image is the only thing to tell them
+// apart.
+func stageScoreImageLocality(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 2 {
+		return fmt.Errorf("this stage needs at least two workers, found %d", len(workers))
+	}
+	warm := workers[len(workers)-1]
+
+	if err := warmImage(ctx, env, warm); err != nil {
+		return err
+	}
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// One per worker and one more: a program that cannot tell the nodes apart
+	// takes them in turn, so it has to miss within this many.
+	names := []string{"local-1", "local-2", "local-3", "local-4"}
+	zero := int64(0)
+	defer func() {
+		for _, name := range names {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	for _, name := range names {
+		if err := seedImagePod(ctx, env, name, localityImage, corev1.PullNever); err != nil {
+			return err
+		}
+		where, err := boundNode(ctx, env, name, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("pod %s was never placed: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
+		}
+		if where != warm {
+			return fmt.Errorf("pod %s runs %s, which %s already holds, and it went to %s, which has to download it first: every worker has the same room here, so the image is the only thing between them\nthe program said:\n%s",
+				name, localityImage, warm, where, tail(p.Stdout()))
+		}
+	}
+	return nil
+}
+
+// warmImage leaves the stage's image in one node's cache, by running a pod
+// there that pulls it. The pod is pinned with spec.nodeName, so no scheduler
+// decided this, and it is deleted again: the image is what stays behind.
+//
+// The node reports its images on its own schedule, so having run the pod is
+// not the same as the program being able to see the image, and the wait is for
+// the node to say so.
+func warmImage(ctx context.Context, env *kube.Env, node string) error {
+	zero := int64(0)
+	defer func() {
+		_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), "warm",
+			metav1.DeleteOptions{GracePeriodSeconds: &zero})
+	}()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "warm", Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			NodeName:      node,
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{{
+				Name:    "app",
+				Image:   localityImage,
+				Command: []string{"/agnhost", "pause"},
+			}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("pin a pod to %s to pull %s: %w", node, localityImage, err)
+	}
+
+	return waitFor(ctx, "node "+node+" to report "+localityImage, 5*time.Minute, func(ctx context.Context) (bool, error) {
+		got, err := env.Client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		for _, img := range got.Status.Images {
+			if slices.Contains(img.Names, localityImage) {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+}
+
+// seedImagePod creates a pod naming this scheduler that runs one image and
+// asks for nothing. Never pulling is what keeps a misplaced pod from warming
+// the cache of the node it should not have gone to, which would leave the
+// cluster with two warm nodes for the next run.
+func seedImagePod(ctx context.Context, env *kube.Env, name, image string, pull corev1.PullPolicy) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName: schedulerName,
+			Containers: []corev1.Container{{
+				Name:            "app",
+				Image:           image,
+				Command:         []string{"/agnhost", "pause"},
+				ImagePullPolicy: pull,
+			}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
 	}
 	return nil
 }
