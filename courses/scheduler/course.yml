@@ -42,3 +42,6 @@ stages:
   - slug: score-least-allocated
     name: Not just anywhere it fits
     difficulty: medium
+  - slug: score-balanced
+    name: Even, not only empty
+    difficulty: medium

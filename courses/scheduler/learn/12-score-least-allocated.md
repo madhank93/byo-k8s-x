@@ -48,6 +48,14 @@ Two details worth getting right:
 A pod with no requests scores every node equally, which is exactly right: you
 told the cluster nothing about what it needs, so nothing can be preferred.
 
+One thing your scores depend on that is not obvious: `Bind` returns before the
+pod comes back to you through the watch, so a scheduler that binds
+asynchronously scores its next pod against a node that still looks empty. The
+real scheduler keeps what it has bound in an *assume cache* and counts it until
+the informer catches up. Binding on the same goroutine that decides, as you do
+here, closes that window — each bind has returned before the next node is
+scored — which is why the arithmetic above is enough.
+
 ## Go APIs
 
 - `node.Status.Allocatable[corev1.ResourceCPU]` and `…ResourceMemory`, both

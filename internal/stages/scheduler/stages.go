@@ -57,6 +57,7 @@ func init() {
 	register(Stage{Slug: "events", Run: stageEvents})
 	register(Stage{Slug: "requeue", Run: stageRequeue})
 	register(Stage{Slug: "score-least-allocated", Run: stageScoreLeastAllocated})
+	register(Stage{Slug: "score-balanced", Run: stageScoreBalanced})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -121,7 +122,7 @@ func stageScoreLeastAllocated(ctx context.Context, env *kube.Env, bin string) er
 	}
 	cpu := node.Status.Allocatable[corev1.ResourceCPU]
 	ballast := cpu.MilliValue() * 75 / 100
-	if err := seedBallast(ctx, env, "ballast", loaded, ballast); err != nil {
+	if err := seedBallast(ctx, env, "ballast", loaded, milliCPU(ballast)); err != nil {
 		return err
 	}
 	// The namespace outlives this run, and the ballast holds three quarters of
@@ -156,21 +157,155 @@ func stageScoreLeastAllocated(ctx context.Context, env *kube.Env, bin string) er
 	return nil
 }
 
-// seedBallast pins a pod to one node with spec.nodeName and a CPU request, so
-// that node is spoken for without any scheduler having chosen it.
-func seedBallast(ctx context.Context, env *kube.Env, name, node string, milli int64) error {
+// stageScoreBalanced checks the program weighs how evenly a node is used, not
+// only how much of it is left.
+//
+// Each worker is loaded differently, so neither half of the score is enough on
+// its own. One is lopsided — 60% of its CPU spoken for and none of its memory
+// — and room alone prefers it, because the untouched memory carries the
+// average. One is evenly 70% through both, and evenness alone is happy with
+// it. Only the node that is even *and* has room, at 35% of each, is right by
+// both.
+func stageScoreBalanced(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 3 {
+		return fmt.Errorf("this stage needs three workers, found %d", len(workers))
+	}
+	lopsided, level, full := workers[0], workers[1], workers[2]
+
+	node, err := env.Client.CoreV1().Nodes().Get(ctx, lopsided, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", lopsided, err)
+	}
+	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	mem := node.Status.Allocatable[corev1.ResourceMemory]
+
+	// A pod asking for the same share of each: it leaves the level node level,
+	// so every pod in the run faces the same choice as the first.
+	ask := corev1.ResourceList{
+		corev1.ResourceCPU:    *apiresource.NewMilliQuantity(cpu.MilliValue()*5/100, apiresource.DecimalSI),
+		corev1.ResourceMemory: *apiresource.NewQuantity(mem.Value()*5/100, apiresource.BinarySI),
+	}
+
+	// Only these two nodes are in the running, so the choice is between them
+	// rather than between them and an empty third worker. The label is the
+	// cluster's, not this namespace's, so it goes whatever happens here.
+	const pickKey = "byok8s.io/score-balanced"
+	for _, n := range []string{lopsided, level, full} {
+		if err := labelNode(ctx, env, n, pickKey, "candidate"); err != nil {
+			return err
+		}
+		defer func() { _ = labelNode(context.WithoutCancel(ctx), env, n, pickKey, "") }()
+	}
+
+	ballasts := []struct {
+		name string
+		node string
+		asks corev1.ResourceList
+	}{
+		{"lopsided", lopsided, milliCPU(cpu.MilliValue() * 60 / 100)},
+		{"level", level, evenLoad(cpu, mem, 35)},
+		{"full", full, evenLoad(cpu, mem, 70)},
+	}
+	// Ballast left behind holds most of two workers: every stage graded after
+	// this one would be scheduling on a cluster this one shrank.
+	zero := int64(0)
+	defer func() {
+		for _, b := range ballasts {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), b.name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	for _, b := range ballasts {
+		if err := seedBallast(ctx, env, b.name, b.node, b.asks); err != nil {
+			return err
+		}
+	}
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// These ask for real cpu and memory, so one left behind on a failed run
+	// shrinks a worker for every stage graded after this one.
+	placed := []string{"even-1", "even-2", "even-3"}
+	defer func() {
+		for _, name := range placed {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	for _, name := range placed {
+		if err := seedAskingPod(ctx, env, name, map[string]string{pickKey: "candidate"}, ask); err != nil {
+			return err
+		}
+		where, err := boundNode(ctx, env, name, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("pod %s was never placed: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
+		}
+		if where != level {
+			why := "which is evenly 70% through both and has least room of the three"
+			if where == lopsided {
+				why = "which has 60% of its cpu spoken for and none of its memory, so free memory flatters its average while the cpu is what will run out"
+			}
+			return fmt.Errorf("pod %s asks for cpu and memory together and went to %s, %s, while %s is evenly 35%% through both\na node has to have room and be even in it, which is why the two scores are added\nthe program said:\n%s",
+				name, where, why, level, tail(p.Stdout()))
+		}
+	}
+	return nil
+}
+
+// evenLoad is a request list holding the same percentage of a node's cpu and
+// of its memory.
+func evenLoad(cpu, mem apiresource.Quantity, percent int64) corev1.ResourceList {
+	return corev1.ResourceList{
+		corev1.ResourceCPU:    *apiresource.NewMilliQuantity(cpu.MilliValue()*percent/100, apiresource.DecimalSI),
+		corev1.ResourceMemory: *apiresource.NewQuantity(mem.Value()*percent/100, apiresource.BinarySI),
+	}
+}
+
+// milliCPU is a request list for CPU alone.
+func milliCPU(milli int64) corev1.ResourceList {
+	return corev1.ResourceList{corev1.ResourceCPU: *apiresource.NewMilliQuantity(milli, apiresource.DecimalSI)}
+}
+
+// seedAskingPod creates a pod naming this scheduler with both a node selector
+// and resource requests.
+func seedAskingPod(ctx context.Context, env *kube.Env, name string, selector map[string]string, asks corev1.ResourceList) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName: schedulerName,
+			NodeSelector:  selector,
+			Containers: []corev1.Container{{
+				Name:      "app",
+				Image:     "registry.k8s.io/pause:3.9",
+				Resources: corev1.ResourceRequirements{Requests: asks},
+			}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
+}
+
+// seedBallast pins a pod to one node with spec.nodeName and the given
+// requests, so that node is spoken for without any scheduler having chosen it.
+func seedBallast(ctx context.Context, env *kube.Env, name, node string, asks corev1.ResourceList) error {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
 		Spec: corev1.PodSpec{
 			NodeName: node,
 			Containers: []corev1.Container{{
-				Name:  "app",
-				Image: "registry.k8s.io/pause:3.9",
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU: *apiresource.NewMilliQuantity(milli, apiresource.DecimalSI),
-					},
-				},
+				Name:      "app",
+				Image:     "registry.k8s.io/pause:3.9",
+				Resources: corev1.ResourceRequirements{Requests: asks},
 			}},
 		},
 	}
