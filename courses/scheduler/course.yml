@@ -63,3 +63,6 @@ stages:
   - slug: priority
     name: Who gets the room first
     difficulty: medium
+  - slug: preemption
+    name: Making room, not waiting for it
+    difficulty: hard
