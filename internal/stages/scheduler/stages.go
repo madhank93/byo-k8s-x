@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
@@ -59,6 +60,7 @@ func init() {
 	register(Stage{Slug: "score-least-allocated", Run: stageScoreLeastAllocated})
 	register(Stage{Slug: "score-balanced", Run: stageScoreBalanced})
 	register(Stage{Slug: "score-image-locality", Run: stageScoreImageLocality})
+	register(Stage{Slug: "spread-by-owner", Run: stageSpreadByOwner})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -156,6 +158,173 @@ func stageScoreLeastAllocated(ctx context.Context, env *kube.Env, bin string) er
 		}
 	}
 	return nil
+}
+
+// stageSpreadByOwner checks replicas of one thing are kept apart, even when
+// the node they are already on is the one with the most room.
+//
+// A ReplicaSet wants five pods. Two are put on one worker by hand, pinned with
+// spec.nodeName so no scheduler chose it, and the other two workers are given
+// a little ballast so that crowded worker is also the emptiest. Room says put
+// the remaining three there with their siblings; a node failing then takes the
+// whole ReplicaSet with it.
+func stageSpreadByOwner(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 3 {
+		return fmt.Errorf("this stage needs three workers, found %d", len(workers))
+	}
+	crowded, rest := workers[0], workers[1:]
+
+	node, err := env.Client.CoreV1().Nodes().Get(ctx, crowded, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", crowded, err)
+	}
+	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+
+	// Enough to make the crowded node the best answer on room, and not enough
+	// to stop anything fitting anywhere.
+	zero := int64(0)
+	defer func() {
+		for _, n := range rest {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), "ballast-"+n,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	for _, n := range rest {
+		if err := seedBallast(ctx, env, "ballast-"+n, n, milliCPU(cpu.MilliValue()*10/100)); err != nil {
+			return err
+		}
+	}
+
+	// A real owner, because a pod whose owner does not exist is garbage
+	// collected out from under the test. The ReplicaSet is what makes these
+	// pods replicas of one thing rather than five unrelated pods.
+	rs, err := seedReplicaSet(ctx, env, "web", 5)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		policy := metav1.DeletePropagationBackground
+		_ = env.Client.AppsV1().ReplicaSets(env.Namespace).Delete(context.WithoutCancel(ctx), "web",
+			metav1.DeleteOptions{PropagationPolicy: &policy, GracePeriodSeconds: &zero})
+	}()
+
+	// Two of the five, placed by hand where no scheduler would be blamed for
+	// them. The ReplicaSet counts them as its own, so it asks for three more.
+	for _, name := range []string{"sibling-1", "sibling-2"} {
+		if err := seedOwnedPod(ctx, env, name, crowded, rs); err != nil {
+			return err
+		}
+	}
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// The three the controller creates are the ones under test, and they are
+	// named by the controller, so they are found by what they are rather than
+	// by name.
+	var placed map[string]string
+	if err := waitFor(ctx, "the ReplicaSet's remaining pods to be placed", 90*time.Second, func(ctx context.Context) (bool, error) {
+		placed, err = ownedPlacements(ctx, env, rs.UID)
+		if err != nil {
+			return false, err
+		}
+		return len(placed) == 5, nil
+	}); err != nil {
+		return fmt.Errorf("%w: %d of the ReplicaSet's 5 pods have a node\nthe program said:\n%s", err, len(placed), tail(p.Stdout()))
+	}
+
+	var stacked []string
+	for name, where := range placed {
+		if where == crowded && name != "sibling-1" && name != "sibling-2" {
+			stacked = append(stacked, name)
+		}
+	}
+	if len(stacked) > 0 {
+		slices.Sort(stacked)
+		return fmt.Errorf("%s joined two pods of the same ReplicaSet on %s, which has the most room of the three workers: replicas on one node fail together, and room is not the only thing worth scoring\nthe program said:\n%s",
+			strings.Join(stacked, ", "), crowded, tail(p.Stdout()))
+	}
+	return nil
+}
+
+// seedReplicaSet creates a ReplicaSet whose pods name this scheduler. It is
+// the owner the spread is judged by; its pods ask for nothing, so room alone
+// would put them all in the same place.
+func seedReplicaSet(ctx context.Context, env *kube.Env, name string, replicas int32) (*appsv1.ReplicaSet, error) {
+	labels := map[string]string{"app": name}
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: appsv1.ReplicaSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: corev1.PodSpec{
+					SchedulerName: schedulerName,
+					Containers:    []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+				},
+			},
+		},
+	}
+	got, err := env.Client.AppsV1().ReplicaSets(env.Namespace).Create(ctx, rs, metav1.CreateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("create replicaset %s: %w", name, err)
+	}
+	return got, nil
+}
+
+// seedOwnedPod pins a pod to a node and gives it the ReplicaSet as its
+// controller, so the ReplicaSet counts it among its replicas and the learner's
+// program sees a sibling already placed.
+func seedOwnedPod(ctx context.Context, env *kube.Env, name, node string, rs *appsv1.ReplicaSet) error {
+	controller := true
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: env.Namespace,
+			Labels:    rs.Spec.Selector.MatchLabels,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       rs.Name,
+				UID:        rs.UID,
+				Controller: &controller,
+			}},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   node,
+			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed owned pod %s: %w", name, err)
+	}
+	return nil
+}
+
+// ownedPlacements maps the name of every bound pod this owner controls to the
+// node it is on.
+func ownedPlacements(ctx context.Context, env *kube.Env, owner types.UID) (map[string]string, error) {
+	pods, err := env.Client.CoreV1().Pods(env.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list pods: %w", err)
+	}
+	placed := map[string]string{}
+	for _, pod := range pods.Items {
+		for _, ref := range pod.OwnerReferences {
+			if ref.UID == owner && pod.Spec.NodeName != "" {
+				placed[pod.Name] = pod.Spec.NodeName
+			}
+		}
+	}
+	return placed, nil
 }
 
 // localityImage is the image this stage warms one node with: large enough to

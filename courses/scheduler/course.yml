@@ -48,3 +48,6 @@ stages:
   - slug: score-image-locality
     name: Where it can start now
     difficulty: easy
+  - slug: spread-by-owner
+    name: Replicas that do not fail together
+    difficulty: medium
