@@ -61,6 +61,7 @@ func init() {
 	register(Stage{Slug: "score-balanced", Run: stageScoreBalanced})
 	register(Stage{Slug: "score-image-locality", Run: stageScoreImageLocality})
 	register(Stage{Slug: "spread-by-owner", Run: stageSpreadByOwner})
+	register(Stage{Slug: "topology-spread", Run: stageTopologySpread})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -156,6 +157,141 @@ func stageScoreLeastAllocated(ctx context.Context, env *kube.Env, bin string) er
 		if where == loaded {
 			return fmt.Errorf("pod %s went to %s, which is already %dm of %dm spoken for, while another worker sits empty: a node that fits is not the same as the best node for the pod\nthe program said:\n%s", name, loaded, ballast, cpu.MilliValue(), tail(p.Stdout()))
 		}
+	}
+	return nil
+}
+
+// stageTopologySpread checks a pod's own spread constraint is obeyed, and
+// obeyed as a filter: DoNotSchedule means a node that would break it is not a
+// node, however good it looks otherwise.
+//
+// Two workers are put in one zone and one in another, and the zone with two
+// workers is given a matching pod on each. A pod spreading by zone with a max
+// skew of one then has only the far zone open to it — which is the zone with
+// the ballast on it, so room alone says the opposite.
+func stageTopologySpread(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 3 {
+		return fmt.Errorf("this stage needs three workers, found %d", len(workers))
+	}
+	near, far := workers[:2], workers[2]
+
+	const zoneKey = "topology.kubernetes.io/zone"
+	zones := map[string]string{near[0]: "near", near[1]: "near", far: "far"}
+	for node, zone := range zones {
+		if err := labelNode(ctx, env, node, zoneKey, zone); err != nil {
+			return err
+		}
+		defer func() { _ = labelNode(context.WithoutCancel(ctx), env, node, zoneKey, "") }()
+	}
+
+	node, err := env.Client.CoreV1().Nodes().Get(ctx, far, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", far, err)
+	}
+	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+
+	zero := int64(0)
+	seeded := []string{"ballast-far", "held-1", "held-2"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	// The far zone is the one the constraint leaves open, so it is the one
+	// given ballast: a program that reads the constraint goes there anyway.
+	if err := seedBallast(ctx, env, "ballast-far", far, milliCPU(cpu.MilliValue()*10/100)); err != nil {
+		return err
+	}
+	// One matching pod on each near worker, pinned, so the near zone holds two
+	// and the far zone none before the program starts.
+	spread := map[string]string{"app": "spread"}
+	for i, n := range near {
+		if err := seedLabelledPod(ctx, env, fmt.Sprintf("held-%d", i+1), n, spread); err != nil {
+			return err
+		}
+	}
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// near holds 2 and far holds 0, so a third in near would skew by 3, and a
+	// fourth by 2 once far holds one. Both belong in the far zone; a fifth
+	// would be free to go either way, so the run stops at two.
+	constraint := corev1.TopologySpreadConstraint{
+		MaxSkew:           1,
+		TopologyKey:       zoneKey,
+		WhenUnsatisfiable: corev1.DoNotSchedule,
+		LabelSelector:     &metav1.LabelSelector{MatchLabels: spread},
+	}
+	for _, name := range []string{"even-1", "even-2"} {
+		seeded = append(seeded, name)
+		if err := seedSpreadingPod(ctx, env, name, spread, constraint); err != nil {
+			return err
+		}
+		where, err := boundNode(ctx, env, name, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("pod %s spreads by %s with a max skew of 1 and %s is the only zone that keeps it: %w\nthe program said:\n%s", name, zoneKey, far, err, tail(p.Stdout()))
+		}
+		if where != far {
+			return fmt.Errorf("pod %s spreads by %s with a max skew of 1 and went to %s, in a zone already holding two matching pods against the other zone's none: a constraint that says DoNotSchedule takes the node away, however much room it has\nthe program said:\n%s",
+				name, zoneKey, where, tail(p.Stdout()))
+		}
+	}
+
+	// A key no node carries puts every node outside every domain, so there is
+	// nowhere the pod can go — not a node with a bad score, no node at all.
+	nowhere := constraint
+	nowhere.TopologyKey = "topology.kubernetes.io/rack"
+	seeded = append(seeded, "no-rack")
+	if err := seedSpreadingPod(ctx, env, "no-rack", spread, nowhere); err != nil {
+		return err
+	}
+	if err := awaitLine(ctx, p, env.Namespace+"/no-rack", 30*time.Second); err != nil {
+		return fmt.Errorf("pod no-rack was never reported: %w", err)
+	}
+	if where, err := boundNode(ctx, env, "no-rack", 20*time.Second); err == nil {
+		return fmt.Errorf("pod no-rack spreads by a topology key no node carries and was placed on %s anyway: a node with no value for the key is in no domain, so it cannot take a pod spreading across them\nthe program said:\n%s", where, tail(p.Stdout()))
+	}
+	return nil
+}
+
+// seedLabelledPod pins a labelled pod to a node with spec.nodeName, so it
+// counts towards a spread without any scheduler having placed it.
+func seedLabelledPod(ctx context.Context, env *kube.Env, name, node string, labels map[string]string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace, Labels: labels},
+		Spec: corev1.PodSpec{
+			NodeName:   node,
+			Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
+}
+
+// seedSpreadingPod creates a pod naming this scheduler that carries a topology
+// spread constraint, and the labels its own selector matches.
+func seedSpreadingPod(ctx context.Context, env *kube.Env, name string, labels map[string]string, constraint corev1.TopologySpreadConstraint) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace, Labels: labels},
+		Spec: corev1.PodSpec{
+			SchedulerName:             schedulerName,
+			TopologySpreadConstraints: []corev1.TopologySpreadConstraint{constraint},
+			Containers:                []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
 	}
 	return nil
 }

@@ -51,3 +51,6 @@ stages:
   - slug: spread-by-owner
     name: Replicas that do not fail together
     difficulty: medium
+  - slug: topology-spread
+    name: Spread the pod asked for
+    difficulty: hard
