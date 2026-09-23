@@ -54,3 +54,6 @@ stages:
   - slug: topology-spread
     name: Spread the pod asked for
     difficulty: hard
+  - slug: pod-affinity
+    name: Beside, or away from, other pods
+    difficulty: hard

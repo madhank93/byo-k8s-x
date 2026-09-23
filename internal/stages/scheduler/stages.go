@@ -62,6 +62,7 @@ func init() {
 	register(Stage{Slug: "score-image-locality", Run: stageScoreImageLocality})
 	register(Stage{Slug: "spread-by-owner", Run: stageSpreadByOwner})
 	register(Stage{Slug: "topology-spread", Run: stageTopologySpread})
+	register(Stage{Slug: "pod-affinity", Run: stagePodAffinity})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -259,6 +260,132 @@ func stageTopologySpread(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if where, err := boundNode(ctx, env, "no-rack", 20*time.Second); err == nil {
 		return fmt.Errorf("pod no-rack spreads by a topology key no node carries and was placed on %s anyway: a node with no value for the key is in no domain, so it cannot take a pod spreading across them\nthe program said:\n%s", where, tail(p.Stdout()))
+	}
+	return nil
+}
+
+// stagePodAffinity checks required inter-pod affinity and anti-affinity are
+// obeyed, and obeyed as filters: where a pod goes can depend on the pods
+// already there, and no score gets a say in it.
+//
+// One worker is given ballast and the pod others want to sit beside, so
+// affinity has to argue against room. The two emptiest workers are given the
+// pods an anti-affinity term refuses to share a node with, so anti-affinity
+// argues against room too. The last pod is then refused everywhere, by a pod
+// this scheduler placed itself.
+func stagePodAffinity(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 3 {
+		return fmt.Errorf("this stage needs three workers, found %d", len(workers))
+	}
+	empty, crowded := workers[:2], workers[2]
+
+	node, err := env.Client.CoreV1().Nodes().Get(ctx, crowded, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", crowded, err)
+	}
+	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+
+	zero := int64(0)
+	seeded := []string{"ballast-crowded", "cache", "web-1", "web-2"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	// The node the terms point at is the one room argues against.
+	if err := seedBallast(ctx, env, "ballast-crowded", crowded, milliCPU(cpu.MilliValue()*20/100)); err != nil {
+		return err
+	}
+	if err := seedLabelledPod(ctx, env, "cache", crowded, map[string]string{"app": "cache"}); err != nil {
+		return err
+	}
+	web := map[string]string{"app": "web"}
+	for i, n := range empty {
+		if err := seedLabelledPod(ctx, env, fmt.Sprintf("web-%d", i+1), n, web); err != nil {
+			return err
+		}
+	}
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	const hostKey = "kubernetes.io/hostname"
+	beside := &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+			TopologyKey:   hostKey,
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "cache"}},
+		}},
+	}}
+	seeded = append(seeded, "near-cache")
+	if err := seedCompanyPod(ctx, env, "near-cache", nil, beside); err != nil {
+		return err
+	}
+	where, err := boundNode(ctx, env, "near-cache", 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("pod near-cache requires a pod labelled app=cache on its node, and only %s has one: %w\nthe program said:\n%s", crowded, err, tail(p.Stdout()))
+	}
+	if where != crowded {
+		return fmt.Errorf("pod near-cache requires a pod labelled app=cache on its node and went to %s, which has none: required pod affinity takes every other node away, including the ones with more room\nthe program said:\n%s",
+			where, tail(p.Stdout()))
+	}
+
+	away := &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+			TopologyKey:   hostKey,
+			LabelSelector: &metav1.LabelSelector{MatchLabels: web},
+		}},
+	}}
+	seeded = append(seeded, "apart")
+	if err := seedCompanyPod(ctx, env, "apart", web, away); err != nil {
+		return err
+	}
+	where, err = boundNode(ctx, env, "apart", 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("pod apart refuses a node holding a pod labelled app=web, which leaves only %s: %w\nthe program said:\n%s", crowded, err, tail(p.Stdout()))
+	}
+	if where != crowded {
+		return fmt.Errorf("pod apart refuses a node holding a pod labelled app=web and went to %s, which holds one: anti-affinity removes the node however empty it is\nthe program said:\n%s",
+			where, tail(p.Stdout()))
+	}
+
+	// apart carries app=web itself, so the placement just made leaves every
+	// worker holding one, and the next pod refusing their company has nowhere
+	// left — counted from the pods, not from a snapshot taken at startup.
+	seeded = append(seeded, "crowded-out")
+	if err := seedCompanyPod(ctx, env, "crowded-out", web, away); err != nil {
+		return err
+	}
+	if err := awaitLine(ctx, p, env.Namespace+"/crowded-out", 30*time.Second); err != nil {
+		return fmt.Errorf("pod crowded-out was never reported: %w", err)
+	}
+	if where, err := boundNode(ctx, env, "crowded-out", 20*time.Second); err == nil {
+		return fmt.Errorf("pod crowded-out refuses a node holding a pod labelled app=web and every worker now holds one, but it was placed on %s anyway: a pod with no node left waits\nthe program said:\n%s",
+			where, tail(p.Stdout()))
+	}
+	return nil
+}
+
+// seedCompanyPod creates a pod naming this scheduler that carries inter-pod
+// affinity terms, and the labels another pod's terms select it by.
+func seedCompanyPod(ctx context.Context, env *kube.Env, name string, labels map[string]string, affinity *corev1.Affinity) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace, Labels: labels},
+		Spec: corev1.PodSpec{
+			SchedulerName: schedulerName,
+			Affinity:      affinity,
+			Containers:    []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.9"}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
 	}
 	return nil
 }
