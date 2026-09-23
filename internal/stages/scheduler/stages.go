@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,6 +64,7 @@ func init() {
 	register(Stage{Slug: "spread-by-owner", Run: stageSpreadByOwner})
 	register(Stage{Slug: "topology-spread", Run: stageTopologySpread})
 	register(Stage{Slug: "pod-affinity", Run: stagePodAffinity})
+	register(Stage{Slug: "volume-binding", Run: stageVolumeBinding})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -1839,4 +1841,219 @@ func tail(s string) string {
 		lines = append([]string{"…"}, lines[len(lines)-12:]...)
 	}
 	return "  " + strings.Join(lines, "\n  ")
+}
+
+// stageVolumeBinding checks a pod goes where its volume already is.
+//
+// Two local volumes are pinned to different workers, each with a claim bound to
+// it, and the worker holding the first is loaded so that room argues for
+// somewhere else. A pod whose claim resolves to a volume on one node has one
+// candidate, whatever the scores say; a pod whose claim does not exist has
+// none, and waits.
+func stageVolumeBinding(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 2 {
+		return fmt.Errorf("this stage needs at least two workers, found %d", len(workers))
+	}
+	spare, crowded := workers[0], workers[len(workers)-1]
+
+	node, err := env.Client.CoreV1().Nodes().Get(ctx, crowded, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", crowded, err)
+	}
+	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+
+	// PersistentVolumes are cluster scoped, so deleting the namespace does not
+	// take them with it and a name reused across runs would meet the leftover.
+	run := strconv.FormatInt(time.Now().UnixNano(), 36)
+	pvCrowded, pvSpare := "bko-sched-vol-"+run+"-a", "bko-sched-vol-"+run+"-b"
+
+	zero := int64(0)
+	seeded := []string{"ballast-crowded"}
+	defer func() {
+		back := context.WithoutCancel(ctx)
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(back, name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+		for _, name := range []string{"data-crowded", "data-spare", "data-pending"} {
+			_ = env.Client.CoreV1().PersistentVolumeClaims(env.Namespace).Delete(back, name, metav1.DeleteOptions{})
+		}
+		for _, name := range []string{pvCrowded, pvSpare} {
+			_ = env.Client.CoreV1().PersistentVolumes().Delete(back, name, metav1.DeleteOptions{})
+		}
+	}()
+
+	// The node the volume is on is the one room argues against.
+	if err := seedBallast(ctx, env, "ballast-crowded", crowded, milliCPU(cpu.MilliValue()*60/100)); err != nil {
+		return err
+	}
+	for _, v := range []struct{ pv, claim, node string }{
+		{pvCrowded, "data-crowded", crowded},
+		{pvSpare, "data-spare", spare},
+	} {
+		if err := seedLocalVolume(ctx, env, v.pv, v.node); err != nil {
+			return err
+		}
+		if err := seedBoundClaim(ctx, env, v.claim, v.pv); err != nil {
+			return err
+		}
+	}
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	for _, want := range []struct{ pod, claim, node, why string }{
+		{"on-disk", "data-crowded", crowded, "and " + crowded + " is loaded, so every score points elsewhere"},
+		{"on-spare-disk", "data-spare", spare, "so a node read from the volume, not a fixed one, is the only answer that works twice"},
+	} {
+		seeded = append(seeded, want.pod)
+		if err := seedClaimingPod(ctx, env, want.pod, want.claim); err != nil {
+			return err
+		}
+		where, err := boundNode(ctx, env, want.pod, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("pod %s mounts claim %s, whose volume only %s can reach: %w\nthe program said:\n%s",
+				want.pod, want.claim, want.node, err, tail(p.Stdout()))
+		}
+		if where != want.node {
+			return fmt.Errorf("pod %s mounts claim %s, whose volume only %s can reach, and went to %s: a volume's node affinity takes every other node away, %s\nthe program said:\n%s",
+				want.pod, want.claim, want.node, where, want.why, tail(p.Stdout()))
+		}
+	}
+
+	// A claim that resolves to no volume names no node either, whether it is
+	// missing or merely still waiting for the binder. Either way there is no
+	// node this scheduler may choose, so the pod waits.
+	if err := seedPendingClaim(ctx, env, "data-pending"); err != nil {
+		return err
+	}
+	for _, want := range []struct{ pod, claim, why string }{
+		{"no-disk", "data-missing", "mounts a claim that does not exist"},
+		{"pending-disk", "data-pending", "mounts a claim that is bound to no volume yet"},
+	} {
+		seeded = append(seeded, want.pod)
+		if err := seedClaimingPod(ctx, env, want.pod, want.claim); err != nil {
+			return err
+		}
+		if err := awaitLine(ctx, p, env.Namespace+"/"+want.pod, 30*time.Second); err != nil {
+			return fmt.Errorf("pod %s was never reported: %w", want.pod, err)
+		}
+		if where, err := boundNode(ctx, env, want.pod, 20*time.Second); err == nil {
+			return fmt.Errorf("pod %s %s and was placed on %s anyway: a pod whose volume cannot be resolved waits\nthe program said:\n%s",
+				want.pod, want.why, where, tail(p.Stdout()))
+		}
+	}
+	return nil
+}
+
+// seedPendingClaim creates a claim that stays unbound: an empty storage class
+// asks for no provisioner, and no volume names it back.
+func seedPendingClaim(ctx context.Context, env *kube.Env, name string) error {
+	empty := ""
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			StorageClassName: &empty,
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: apiresource.MustParse("64Mi")},
+			},
+		},
+	}
+	if _, err := env.Client.CoreV1().PersistentVolumeClaims(env.Namespace).Create(ctx, pvc, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed claim %s: %w", name, err)
+	}
+	return nil
+}
+
+// seedLocalVolume creates a PersistentVolume only one node can reach, which is
+// what node affinity on a volume means. The path need not exist: the assertion
+// is where the pod is bound, not whether the kubelet could mount it.
+func seedLocalVolume(ctx context.Context, env *kube.Env, name, node string) error {
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity:    corev1.ResourceList{corev1.ResourceStorage: apiresource.MustParse("64Mi")},
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			// An empty class, rather than none at all, keeps the cluster's
+			// default provisioner out of a claim that already has its volume.
+			StorageClassName:              "",
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				Local: &corev1.LocalVolumeSource{Path: "/var/local-path-provisioner"},
+			},
+			NodeAffinity: &corev1.VolumeNodeAffinity{Required: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      "kubernetes.io/hostname",
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{node},
+					}},
+				}},
+			}},
+		},
+	}
+	if _, err := env.Client.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed volume %s: %w", name, err)
+	}
+	return nil
+}
+
+// seedBoundClaim creates a claim on one named volume and waits for the binder,
+// so the pod that follows meets a claim the scheduler can resolve to a node.
+func seedBoundClaim(ctx context.Context, env *kube.Env, name, volume string) error {
+	empty := ""
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			VolumeName:       volume,
+			StorageClassName: &empty,
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: apiresource.MustParse("64Mi")},
+			},
+		},
+	}
+	if _, err := env.Client.CoreV1().PersistentVolumeClaims(env.Namespace).Create(ctx, pvc, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed claim %s: %w", name, err)
+	}
+	return waitFor(ctx, "claim "+name+" to bind to "+volume, 60*time.Second, func(ctx context.Context) (bool, error) {
+		got, err := env.Client.CoreV1().PersistentVolumeClaims(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		return got.Status.Phase == corev1.ClaimBound, nil
+	})
+}
+
+// seedClaimingPod creates a pod naming this scheduler that mounts one claim.
+func seedClaimingPod(ctx context.Context, env *kube.Env, name, claim string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName: schedulerName,
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim},
+				},
+			}},
+			Containers: []corev1.Container{{
+				Name:         "app",
+				Image:        "registry.k8s.io/pause:3.9",
+				VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
+			}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
 }

@@ -57,3 +57,6 @@ stages:
   - slug: pod-affinity
     name: Beside, or away from, other pods
     difficulty: hard
+  - slug: volume-binding
+    name: Where the data already is
+    difficulty: medium
