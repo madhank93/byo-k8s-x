@@ -60,3 +60,6 @@ stages:
   - slug: volume-binding
     name: Where the data already is
     difficulty: medium
+  - slug: priority
+    name: Who gets the room first
+    difficulty: medium

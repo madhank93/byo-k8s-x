@@ -19,6 +19,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -65,6 +66,7 @@ func init() {
 	register(Stage{Slug: "topology-spread", Run: stageTopologySpread})
 	register(Stage{Slug: "pod-affinity", Run: stagePodAffinity})
 	register(Stage{Slug: "volume-binding", Run: stageVolumeBinding})
+	register(Stage{Slug: "priority", Run: stagePriority})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -2056,4 +2058,221 @@ func seedClaimingPod(ctx context.Context, env *kube.Env, name, claim string) err
 		return fmt.Errorf("seed pod %s: %w", name, err)
 	}
 	return nil
+}
+
+// stagePriority checks the pods waiting for room are tried in the order of
+// their priority, not the order they arrived in.
+//
+// Every worker is cordoned before the pods exist, so all of them are waiting
+// on the same thing and none has been placed by arriving first. Each pod asks
+// for most of a node, so uncordoning one worker frees exactly one seat: who
+// takes it is the whole assertion. The low-priority pods are created first, so
+// a program that retries in arrival order — or in whatever order its map hands
+// back — gives the seat away.
+func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 3 {
+		return fmt.Errorf("this stage needs three workers, found %d", len(workers))
+	}
+
+	// PriorityClasses are cluster scoped, so deleting the namespace does not
+	// take them with it and a name reused across runs would meet the leftover.
+	run := strconv.FormatInt(time.Now().UnixNano(), 36)
+	low, high := "bko-sched-low-"+run, "bko-sched-high-"+run
+	defer func() {
+		back := context.WithoutCancel(ctx)
+		for _, name := range []string{low, high} {
+			_ = env.Client.SchedulingV1().PriorityClasses().Delete(back, name, metav1.DeleteOptions{})
+		}
+	}()
+	if err := seedPriorityClass(ctx, env, low, 100); err != nil {
+		return err
+	}
+	if err := seedPriorityClass(ctx, env, high, 1000); err != nil {
+		return err
+	}
+
+	for _, w := range workers {
+		if err := cordonNode(ctx, env, w, true); err != nil {
+			return err
+		}
+		defer cordonNode(context.WithoutCancel(ctx), env, w, false)
+	}
+
+	// Six against three: a program that picks without looking at priority is
+	// unlikely to be lucky three times over.
+	zero := int64(0)
+	var seeded []string
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	// The unimportant pods are created first, and so have waited longest.
+	for _, batch := range []struct {
+		prefix string
+		class  string
+		count  int
+	}{{"low", low, 6}, {"high", high, 3}} {
+		for i := 1; i <= batch.count; i++ {
+			name := fmt.Sprintf("%s-%d", batch.prefix, i)
+			if err := seedPriorityPod(ctx, env, name, batch.class); err != nil {
+				return err
+			}
+			seeded = append(seeded, name)
+		}
+	}
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// Every worker is closed, so the program has nowhere to put anything. No
+	// room opens until it has told each pod so, or a pod still being tried
+	// would meet an open node and be placed on the way past, rather than by
+	// the comparison this stage is about.
+	for _, name := range seeded {
+		if err := awaitLine(ctx, p, "unscheduled "+env.Namespace+"/"+name, 60*time.Second); err != nil {
+			return fmt.Errorf("pod %s was never reported: %w", name, err)
+		}
+		if err := awaitFailedScheduling(ctx, env, name, 60*time.Second); err != nil {
+			return fmt.Errorf("every worker is cordoned, so pod %s can go nowhere, and no FailedScheduling event says so: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
+		}
+	}
+	placed, err := placements(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(placed) > 0 {
+		return fmt.Errorf("every worker is cordoned and %d pod(s) were placed anyway: %v", len(placed), placed)
+	}
+
+	// One worker opens at a time, and a worker holds one of these pods. Who
+	// takes the seat is the whole assertion, and it is asked three times so
+	// that picking without comparing is unlikely to be lucky throughout.
+	for i, w := range workers {
+		if err := cordonNode(ctx, env, w, false); err != nil {
+			return err
+		}
+		placed, err = settledPlacements(ctx, env, i+1, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("worker %s was uncordoned, leaving room for one more pod, and %d of the nine waiting pods are placed: %w\nthe program said:\n%s",
+				w, len(placed), err, tail(p.Stdout()))
+		}
+		for name, node := range placed {
+			if !strings.HasPrefix(name, "high-") {
+				return fmt.Errorf("pod %s was placed on %s while a pod of class %s (value 1000) was still waiting: the pods waiting for room are compared by priority, not taken in the order they arrived\nthe program said:\n%s",
+					name, node, high, tail(p.Stdout()))
+			}
+		}
+		if len(placed) > i+1 {
+			return fmt.Errorf("%d workers are open and %d pods are placed: each of these pods asks for 6 of a worker's 11 cpus, so a worker can hold one\nthe program said:\n%s",
+				i+1, len(placed), tail(p.Stdout()))
+		}
+	}
+	return nil
+}
+
+// settledPlacements waits for want pods to be placed and then for the program
+// to stop placing them. An attempt already under way when the room appeared
+// lands a moment later, so an answer read the instant the count is reached is
+// read too early.
+func settledPlacements(ctx context.Context, env *kube.Env, want int, within time.Duration) (map[string]string, error) {
+	var placed map[string]string
+	err := waitFor(ctx, fmt.Sprintf("%d pod(s) to be placed", want), within, func(ctx context.Context) (bool, error) {
+		var err error
+		placed, err = placements(ctx, env)
+		return err == nil && len(placed) >= want, err
+	})
+	if err != nil {
+		return placed, err
+	}
+	const quiet = 3 * time.Second
+	for deadline := time.Now().Add(quiet); time.Now().Before(deadline); {
+		select {
+		case <-ctx.Done():
+			return placed, ctx.Err()
+		case <-time.After(time.Second):
+		}
+		next, err := placements(ctx, env)
+		if err != nil {
+			return placed, err
+		}
+		if len(next) != len(placed) {
+			placed, deadline = next, time.Now().Add(quiet)
+		}
+	}
+	return placed, nil
+}
+
+// awaitFailedScheduling waits for the program to say, where kubectl describe
+// shows it, that this pod has nowhere to go. It is how the stage knows an
+// attempt has finished rather than merely started.
+func awaitFailedScheduling(ctx context.Context, env *kube.Env, name string, within time.Duration) error {
+	return waitFor(ctx, "a FailedScheduling event on pod "+name, within, func(ctx context.Context) (bool, error) {
+		events, err := podEvents(ctx, env, name)
+		if err != nil {
+			return false, err
+		}
+		return slices.ContainsFunc(events, func(e eventsv1.Event) bool { return e.Reason == "FailedScheduling" }), nil
+	})
+}
+
+// seedPriorityClass creates a PriorityClass. Admission copies its value into
+// the spec.priority of every pod that names it; the pod never carries the
+// number itself, and the API server refuses one that tries.
+func seedPriorityClass(ctx context.Context, env *kube.Env, name string, value int32) error {
+	pc := &schedulingv1.PriorityClass{
+		ObjectMeta:  metav1.ObjectMeta{Name: name},
+		Value:       value,
+		Description: "byok8s course fixture",
+	}
+	if _, err := env.Client.SchedulingV1().PriorityClasses().Create(ctx, pc, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed priority class %s: %w", name, err)
+	}
+	return nil
+}
+
+// seedPriorityPod creates a pod naming this scheduler and one priority class,
+// asking for enough of a node that no worker can hold two.
+func seedPriorityPod(ctx context.Context, env *kube.Env, name, class string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName:     schedulerName,
+			PriorityClassName: class,
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Image: "registry.k8s.io/pause:3.9",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: apiresource.MustParse("6")},
+				},
+			}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
+}
+
+// placements is every pod in the stage's namespace that has a node, by name.
+func placements(ctx context.Context, env *kube.Env) (map[string]string, error) {
+	list, err := env.Client.CoreV1().Pods(env.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list pods: %w", err)
+	}
+	placed := map[string]string{}
+	for _, pod := range list.Items {
+		if pod.Spec.NodeName != "" {
+			placed[pod.Name] = pod.Spec.NodeName
+		}
+	}
+	return placed, nil
 }
