@@ -114,58 +114,6 @@ func (s *store) list(namespace string) ([]object, int64) {
 	return items, s.version
 }
 
-// update replaces an object that has to be there already, keeping the fields
-// identity is made of and refusing a write built on a version that has moved on.
-func (s *store) update(namespace, name string, obj object) (object, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := namespace + "/" + name
-	old, ok := s.objects[key]
-	if !ok {
-		return nil, errNotFound
-	}
-	// An empty resourceVersion is a caller saying it does not care what is
-	// there; one that disagrees is a caller describing an object that has
-	// since been written, and letting it through erases whoever wrote it.
-	if rv := metaString(obj, "resourceVersion"); rv != "" && rv != metaString(old, "resourceVersion") {
-		return nil, errConflict
-	}
-	s.version++
-
-	meta, _ := obj["metadata"].(map[string]any)
-	if meta == nil {
-		meta = map[string]any{}
-	}
-	meta["name"] = name
-	meta["namespace"] = namespace
-	// Identity is the server's and is set once. A client is free to send back
-	// a uid and a creation time it invented, and the server is not free to
-	// believe either.
-	meta["uid"] = metaString(old, "uid")
-	meta["creationTimestamp"] = metaString(old, "creationTimestamp")
-	meta["resourceVersion"] = strconv.FormatInt(s.version, 10)
-	obj["metadata"] = meta
-
-	s.objects[key] = obj
-	return obj, nil
-}
-
-// remove takes an object back out and returns it as it last was.
-func (s *store) remove(namespace, name string) (object, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := namespace + "/" + name
-	old, ok := s.objects[key]
-	if !ok {
-		return nil, errNotFound
-	}
-	// A delete is a write like any other, so it moves the counter: a watcher
-	// has to be able to place the removal after the create it already saw.
-	s.version++
-	delete(s.objects, key)
-	return old, nil
-}
-
 // metaString reads one metadata field, which is a string or is not there.
 func metaString(obj object, field string) string {
 	meta, _ := obj["metadata"].(map[string]any)
@@ -176,7 +124,6 @@ func metaString(obj object, field string) string {
 var (
 	errAlreadyExists = errors.New("already exists")
 	errNotFound      = errors.New("not found")
-	errConflict      = errors.New("the object has been modified")
 )
 
 // newUID is the identity the server gives an object, and the reason a name
@@ -249,17 +196,27 @@ func run() error {
 	mux.HandleFunc("POST /api/v1/namespaces/{namespace}/configmaps", func(w http.ResponseWriter, r *http.Request) {
 		namespace := r.PathValue("namespace")
 
-		obj, ok := decodeObject(w, r, namespace)
-		if !ok {
+		var obj object
+		if err := json.NewDecoder(r.Body).Decode(&obj); err != nil {
+			writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not valid JSON: "+err.Error())
 			return
 		}
-		name := metaString(obj, "name")
+		meta, _ := obj["metadata"].(map[string]any)
+		name, _ := meta["name"].(string)
 		if name == "" {
 			// 422 rather than 400: the request was understood and the object
 			// it carried is the thing that is wrong.
 			writeStatus(w, http.StatusUnprocessableEntity, "Invalid", "ConfigMap in version \"v1\" cannot be handled: metadata.name is required")
 			return
 		}
+		// A namespace in the body has to agree with the one in the path, or
+		// the URL a client authorized against is not the one it wrote to.
+		if got, _ := meta["namespace"].(string); got != "" && got != namespace {
+			writeStatus(w, http.StatusBadRequest, "BadRequest",
+				fmt.Sprintf("the namespace of the provided object does not match the namespace sent on the request: %q != %q", got, namespace))
+			return
+		}
+		obj["apiVersion"], obj["kind"] = "v1", "ConfigMap"
 
 		stored, err := objects.create(namespace, name, obj)
 		if err != nil {
@@ -296,56 +253,6 @@ func run() error {
 		writeJSON(w, http.StatusOK, obj)
 	})
 
-	mux.HandleFunc("PUT /api/v1/namespaces/{namespace}/configmaps/{name}", func(w http.ResponseWriter, r *http.Request) {
-		namespace, name := r.PathValue("namespace"), r.PathValue("name")
-
-		obj, ok := decodeObject(w, r, namespace)
-		if !ok {
-			return
-		}
-		// The name is in the URL and in the object, and an update is not a
-		// rename. Two names in one request is a request that cannot be carried
-		// out as asked, whichever one the server picked.
-		if got := metaString(obj, "name"); got != "" && got != name {
-			writeStatus(w, http.StatusBadRequest, "BadRequest",
-				fmt.Sprintf("the name of the object (%q) does not match the name on the URL (%q)", got, name))
-			return
-		}
-
-		stored, err := objects.update(namespace, name, obj)
-		switch {
-		case errors.Is(err, errNotFound):
-			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("configmaps %q not found", name))
-			return
-		case errors.Is(err, errConflict):
-			// The conflict every controller retries on: read it again, apply
-			// the change to what is there now, write it back.
-			writeStatus(w, http.StatusConflict, "Conflict",
-				fmt.Sprintf("Operation cannot be fulfilled on configmaps %q: the object has been modified; please apply your changes to the latest version and try again", name))
-			return
-		}
-		// 200, not 201: a client that asked to update an object it had read
-		// would otherwise have to wonder which of the two happened.
-		writeJSON(w, http.StatusOK, stored)
-	})
-
-	mux.HandleFunc("DELETE /api/v1/namespaces/{namespace}/configmaps/{name}", func(w http.ResponseWriter, r *http.Request) {
-		name := r.PathValue("name")
-		removed, err := objects.remove(r.PathValue("namespace"), name)
-		if err != nil {
-			// Deleting what is not there is a 404, and a cleanup that runs
-			// twice depends on it: "I removed it" and "it was already gone"
-			// have to be tellable apart without either being fatal.
-			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("configmaps %q not found", name))
-			return
-		}
-		// The object as it last was, so the caller learns what it deleted
-		// rather than inferring it. The real server answers some resources
-		// with a Status saying Success instead; both say the delete happened,
-		// and an empty body says nothing.
-		writeJSON(w, http.StatusOK, removed)
-	})
-
 	// Anything this server does not serve is a 404 carrying a Status, not an
 	// empty body: a client reads the reason out of it.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -367,27 +274,6 @@ func run() error {
 		return fmt.Errorf("serve on %s: %w", *addr, err)
 	}
 	return nil
-}
-
-// decodeObject reads one object out of a write request, answering the client
-// itself if it cannot, and reports whether the handler should carry on.
-//
-// A namespace in the body has to agree with the one in the path: the URL is
-// what a client was authorized against, and a body that names a different
-// namespace is asking to write somewhere nobody checked.
-func decodeObject(w http.ResponseWriter, r *http.Request, namespace string) (object, bool) {
-	var obj object
-	if err := json.NewDecoder(r.Body).Decode(&obj); err != nil {
-		writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not valid JSON: "+err.Error())
-		return nil, false
-	}
-	if got := metaString(obj, "namespace"); got != "" && got != namespace {
-		writeStatus(w, http.StatusBadRequest, "BadRequest",
-			fmt.Sprintf("the namespace of the provided object does not match the namespace sent on the request: %q != %q", got, namespace))
-		return nil, false
-	}
-	obj["apiVersion"], obj["kind"] = "v1", "ConfigMap"
-	return obj, true
 }
 
 // writeJSON sends one object. The content type is not decoration: a client

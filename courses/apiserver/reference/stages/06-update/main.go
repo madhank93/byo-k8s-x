@@ -150,22 +150,6 @@ func (s *store) update(namespace, name string, obj object) (object, error) {
 	return obj, nil
 }
 
-// remove takes an object back out and returns it as it last was.
-func (s *store) remove(namespace, name string) (object, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := namespace + "/" + name
-	old, ok := s.objects[key]
-	if !ok {
-		return nil, errNotFound
-	}
-	// A delete is a write like any other, so it moves the counter: a watcher
-	// has to be able to place the removal after the create it already saw.
-	s.version++
-	delete(s.objects, key)
-	return old, nil
-}
-
 // metaString reads one metadata field, which is a string or is not there.
 func metaString(obj object, field string) string {
 	meta, _ := obj["metadata"].(map[string]any)
@@ -327,23 +311,6 @@ func run() error {
 		// 200, not 201: a client that asked to update an object it had read
 		// would otherwise have to wonder which of the two happened.
 		writeJSON(w, http.StatusOK, stored)
-	})
-
-	mux.HandleFunc("DELETE /api/v1/namespaces/{namespace}/configmaps/{name}", func(w http.ResponseWriter, r *http.Request) {
-		name := r.PathValue("name")
-		removed, err := objects.remove(r.PathValue("namespace"), name)
-		if err != nil {
-			// Deleting what is not there is a 404, and a cleanup that runs
-			// twice depends on it: "I removed it" and "it was already gone"
-			// have to be tellable apart without either being fatal.
-			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("configmaps %q not found", name))
-			return
-		}
-		// The object as it last was, so the caller learns what it deleted
-		// rather than inferring it. The real server answers some resources
-		// with a Status saying Success instead; both say the delete happened,
-		// and an empty body says nothing.
-		writeJSON(w, http.StatusOK, removed)
 	})
 
 	// Anything this server does not serve is a 404 carrying a Status, not an

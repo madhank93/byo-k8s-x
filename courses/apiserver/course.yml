@@ -14,3 +14,15 @@ stages:
   - slug: resource-create
     name: The first thing worth storing
     difficulty: medium
+  - slug: resource-get
+    name: Ask for it by name
+    difficulty: easy
+  - slug: list
+    name: All of them, in order
+    difficulty: medium
+  - slug: update
+    name: The write that can lose a race
+    difficulty: medium
+  - slug: delete
+    name: Taking it back out
+    difficulty: medium
