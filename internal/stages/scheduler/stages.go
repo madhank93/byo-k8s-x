@@ -675,6 +675,52 @@ func stageScoreImageLocality(ctx context.Context, env *kube.Env, bin string) err
 // The node reports its images on its own schedule, so having run the pod is
 // not the same as the program being able to see the image, and the wait is for
 // the node to say so.
+// requestedOn is the cpu and memory already spoken for on each node, by node
+// name. A pod that has finished holds nothing, and neither does one the
+// kubelet rejected.
+func requestedOn(ctx context.Context, env *kube.Env) (map[string]int64, map[string]int64, error) {
+	pods, err := env.Client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("list pods: %w", err)
+	}
+	cpu, mem := map[string]int64{}, map[string]int64{}
+	for _, pod := range pods.Items {
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		for _, c := range pod.Spec.Containers {
+			cpu[pod.Spec.NodeName] += c.Resources.Requests.Cpu().MilliValue()
+			mem[pod.Spec.NodeName] += c.Resources.Requests.Memory().Value()
+		}
+	}
+	return cpu, mem, nil
+}
+
+// fillNode pins ballast on one node until only leave percent of its allocatable
+// cpu is unspoken for.
+//
+// It counts what is already there rather than taking a share of allocatable,
+// because the node's own system pods have some of it: a ballast sized from
+// allocatable alone asks for more than the node has left, and the kubelet
+// rejects it outright — which leaves the node emptier than the stage meant it
+// to be rather than fuller.
+func fillNode(ctx context.Context, env *kube.Env, name, node string, leave int64) error {
+	got, err := env.Client.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", node, err)
+	}
+	cpu, _, err := requestedOn(ctx, env)
+	if err != nil {
+		return err
+	}
+	allocatable := got.Status.Allocatable[corev1.ResourceCPU]
+	ballast := allocatable.MilliValue() - cpu[node] - allocatable.MilliValue()*leave/100
+	if ballast < 0 {
+		return fmt.Errorf("node %s has less than %d%% of its cpu free already", node, leave)
+	}
+	return seedBallast(ctx, env, name, node, milliCPU(ballast))
+}
+
 // levelWorkers pins ballast until every worker has the same cpu and memory
 // spoken for, and returns a cleanup that takes it away again.
 //
@@ -688,19 +734,9 @@ func levelWorkers(ctx context.Context, env *kube.Env) (func(), error) {
 	if err != nil {
 		return func() {}, err
 	}
-	pods, err := env.Client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	cpu, mem, err := requestedOn(ctx, env)
 	if err != nil {
-		return func() {}, fmt.Errorf("list pods: %w", err)
-	}
-	cpu, mem := map[string]int64{}, map[string]int64{}
-	for _, pod := range pods.Items {
-		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		for _, c := range pod.Spec.Containers {
-			cpu[pod.Spec.NodeName] += c.Resources.Requests.Cpu().MilliValue()
-			mem[pod.Spec.NodeName] += c.Resources.Requests.Memory().Value()
-		}
+		return func() {}, err
 	}
 	var mostCPU, mostMem int64
 	for _, w := range workers {
@@ -2628,12 +2664,7 @@ func stageFrameworkPlugins(ctx context.Context, env *kube.Env, bin string) error
 	for _, w := range workers[1:] {
 		name := "ballast-" + w
 		seeded = append(seeded, name)
-		node, err := env.Client.CoreV1().Nodes().Get(ctx, w, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("get node %s: %w", w, err)
-		}
-		cpu := node.Status.Allocatable[corev1.ResourceCPU]
-		if err := seedBallast(ctx, env, name, w, milliCPU(cpu.MilliValue()*95/100)); err != nil {
+		if err := fillNode(ctx, env, name, w, 5); err != nil {
 			return err
 		}
 	}
