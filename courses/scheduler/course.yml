@@ -69,3 +69,6 @@ stages:
   - slug: framework-plugins
     name: Every check with a name on it
     difficulty: medium
+  - slug: multi-profile
+    name: Two schedulers, one program
+    difficulty: medium

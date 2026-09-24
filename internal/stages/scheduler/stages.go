@@ -37,6 +37,10 @@ type Stage = stages.Stage
 // it; the default scheduler leaves any pod naming it alone.
 const schedulerName = "byok8s"
 
+// The second profile the program serves from stage 22 on: the same filters,
+// with the scores weighed to pack pods onto nodes already in use.
+const packingProfile = schedulerName + "-packing"
+
 var registry = map[string]Stage{}
 
 func register(s Stage) { registry[s.Slug] = s }
@@ -69,6 +73,7 @@ func init() {
 	register(Stage{Slug: "priority", Run: stagePriority})
 	register(Stage{Slug: "preemption", Run: stagePreemption})
 	register(Stage{Slug: "framework-plugins", Run: stageFrameworkPlugins})
+	register(Stage{Slug: "multi-profile", Run: stageMultiProfile})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -2553,4 +2558,108 @@ func awaitNote(ctx context.Context, env *kube.Env, p *runner.Process, name strin
 	}
 	return fmt.Errorf("pod %s %s, and its FailedScheduling note says %q, which does not carry every part of %q: a node is counted against the first plugin to turn it down, by that plugin's name\nthe program said:\n%s",
 		name, why, note, strings.Join(want, ", "), tail(p.Stdout()))
+}
+
+// stageMultiProfile checks one program serves two scheduler names, and weighs
+// the same nodes differently under each.
+//
+// A worker is loaded to roughly half its cpu. A pod naming the ordinary
+// profile wants the room and must go elsewhere; a pod naming the packing
+// profile wants the node already in use, so that the empty ones stay empty.
+// Same cluster, same moment, same filters: only the weights differ.
+func stageMultiProfile(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 2 {
+		return fmt.Errorf("this stage needs at least two workers, found %d", len(workers))
+	}
+	loaded := workers[0]
+
+	node, err := env.Client.CoreV1().Nodes().Get(ctx, loaded, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", loaded, err)
+	}
+	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+
+	zero := int64(0)
+	seeded := []string{"ballast-loaded", "spread-me", "pack-me", "not-ours"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	if err := seedBallast(ctx, env, "ballast-loaded", loaded, milliCPU(cpu.MilliValue()*50/100)); err != nil {
+		return err
+	}
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := seedProfilePod(ctx, env, "spread-me", schedulerName, "1"); err != nil {
+		return err
+	}
+	where, err := boundNode(ctx, env, "spread-me", 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("pod spread-me names %s and was never bound: %w\nthe program said:\n%s", schedulerName, err, tail(p.Stdout()))
+	}
+	if where == loaded {
+		return fmt.Errorf("pod spread-me names %s, whose scores prefer the node with the most room, and went to %s, which is half spoken for while other workers are empty\nthe program said:\n%s",
+			schedulerName, loaded, tail(p.Stdout()))
+	}
+
+	if err := seedProfilePod(ctx, env, "pack-me", packingProfile, "1"); err != nil {
+		return err
+	}
+	where, err = boundNode(ctx, env, "pack-me", 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("pod pack-me names %s, which this program serves as well as %s, and was never bound: a second profile is a second name on the same queue, not a second program: %w\nthe program said:\n%s",
+			packingProfile, schedulerName, err, tail(p.Stdout()))
+	}
+	if where != loaded {
+		return fmt.Errorf("pod pack-me names %s, whose scores prefer the fullest node that still fits, and went to %s rather than %s, which is half full and has room for it: a profile is the same filters with the scores weighed differently\nthe program said:\n%s",
+			packingProfile, where, loaded, tail(p.Stdout()))
+	}
+
+	// The field selector that used to keep other schedulers' pods out of this
+	// program is gone, since it cannot ask for either of two names. What takes
+	// its place has to be just as strict.
+	if err := seedProfilePod(ctx, env, "not-ours", schedulerName+"-nope", "1"); err != nil {
+		return err
+	}
+	if node, err := boundNode(ctx, env, "not-ours", 20*time.Second); err == nil {
+		return fmt.Errorf("pod not-ours names a scheduler this program does not serve and was bound to %s anyway: a pod belongs to the program whose profile it names, and no other\nthe program said:\n%s",
+			node, tail(p.Stdout()))
+	}
+	if strings.Contains(p.Stdout(), env.Namespace+"/not-ours") {
+		return fmt.Errorf("pod not-ours names a scheduler this program does not serve and was reported anyway: watching every unbound pod means deciding for yourself which are yours\nthe program said:\n%s",
+			tail(p.Stdout()))
+	}
+	return nil
+}
+
+// seedProfilePod creates a pod naming one scheduler profile and asking for cpu.
+func seedProfilePod(ctx context.Context, env *kube.Env, name, profile, cpu string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
+		Spec: corev1.PodSpec{
+			SchedulerName: profile,
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Image: "registry.k8s.io/pause:3.9",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: apiresource.MustParse(cpu)},
+				},
+			}},
+		},
+	}
+	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
 }
