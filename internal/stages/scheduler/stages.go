@@ -68,6 +68,7 @@ func init() {
 	register(Stage{Slug: "volume-binding", Run: stageVolumeBinding})
 	register(Stage{Slug: "priority", Run: stagePriority})
 	register(Stage{Slug: "preemption", Run: stagePreemption})
+	register(Stage{Slug: "framework-plugins", Run: stageFrameworkPlugins})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -2422,4 +2423,134 @@ func survivors(ctx context.Context, env *kube.Env, prefix string) ([]string, err
 		}
 	}
 	return names, nil
+}
+
+// stageFrameworkPlugins checks each filter is a named thing that reports what
+// it turned down, and that a pod nobody could place says so in those names.
+//
+// Nothing here reads the learner's source. What makes the structure visible is
+// the FailedScheduling note: counting nodes per reason is only possible once
+// every check has a name and the nodes it rejected are counted against it.
+func stageFrameworkPlugins(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 3 {
+		return fmt.Errorf("this stage needs three workers, found %d", len(workers))
+	}
+	// The control plane is a node too, and it turns pods down like any other.
+	all, err := env.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list nodes: %w", err)
+	}
+	total := len(all.Items)
+	// Every node that is not a worker is tainted against ordinary pods, and is
+	// turned down by that plugin before any other looks at it.
+	tainted := fmt.Sprintf("%d TaintToleration", total-len(workers))
+
+	zero := int64(0)
+	var seeded []string
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+
+	p, cleanup, err := launch(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// One plugin turning down every node: the simplest note there is.
+	seeded = append(seeded, "unlabelled")
+	if err := seedSelectingPod(ctx, env, "unlabelled", map[string]string{"byok8s.dev/stage-plugins": "yes"}); err != nil {
+		return err
+	}
+	if err := awaitNote(ctx, env, p, "unlabelled",
+		[]string{fmt.Sprintf("0/%d nodes are available", total), fmt.Sprintf("%d NodeAffinity", len(workers)), tainted},
+		"selects a label no node carries"); err != nil {
+		return err
+	}
+
+	// Asking for more than any node has is a different plugin, and it must be
+	// named as that one rather than as whatever refused the last pod.
+	seeded = append(seeded, "enormous")
+	if err := seedRequestingPod(ctx, env, "enormous", corev1.ResourceCPU, "500"); err != nil {
+		return err
+	}
+	if err := awaitNote(ctx, env, p, "enormous",
+		[]string{fmt.Sprintf("0/%d nodes are available", total), fmt.Sprintf("%d NodeResourcesFit", len(workers)), tainted},
+		"asks for 500 cpus"); err != nil {
+		return err
+	}
+
+	// Two plugins at once, each counting only the nodes it turned down. The
+	// control plane is tainted, the cordoned worker is closed, and the two
+	// workers left have no room.
+	closed := workers[0]
+	if err := cordonNode(ctx, env, closed, true); err != nil {
+		return err
+	}
+	defer cordonNode(context.WithoutCancel(ctx), env, closed, false)
+	for _, w := range workers[1:] {
+		name := "ballast-" + w
+		seeded = append(seeded, name)
+		node, err := env.Client.CoreV1().Nodes().Get(ctx, w, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get node %s: %w", w, err)
+		}
+		cpu := node.Status.Allocatable[corev1.ResourceCPU]
+		if err := seedBallast(ctx, env, name, w, milliCPU(cpu.MilliValue()*95/100)); err != nil {
+			return err
+		}
+	}
+	seeded = append(seeded, "mixed")
+	if err := seedRequestingPod(ctx, env, "mixed", corev1.ResourceCPU, "2"); err != nil {
+		return err
+	}
+	if err := awaitNote(ctx, env, p, "mixed",
+		[]string{
+			fmt.Sprintf("0/%d nodes are available", total),
+			"1 NodeUnschedulable",
+			fmt.Sprintf("%d NodeResourcesFit", len(workers)-1),
+			tainted,
+		},
+		"asks for 2 cpus with one worker cordoned and the rest full"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// awaitNote waits for a FailedScheduling event on the pod whose note contains
+// every one of want. The whole note is quoted on failure, since the answer is
+// usually one count away from right.
+func awaitNote(ctx context.Context, env *kube.Env, p *runner.Process, name string, want []string, why string) error {
+	var note string
+	err := waitFor(ctx, "a FailedScheduling note about pod "+name, 60*time.Second, func(ctx context.Context) (bool, error) {
+		events, err := podEvents(ctx, env, name)
+		if err != nil {
+			return false, err
+		}
+		for _, e := range events {
+			if e.Reason != "FailedScheduling" {
+				continue
+			}
+			note = e.Note
+			if !slices.ContainsFunc(want, func(s string) bool { return !strings.Contains(note, s) }) {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	if err == nil {
+		return nil
+	}
+	if note == "" {
+		return fmt.Errorf("pod %s %s and no FailedScheduling event says why: %w\nthe program said:\n%s", name, why, err, tail(p.Stdout()))
+	}
+	return fmt.Errorf("pod %s %s, and its FailedScheduling note says %q, which does not carry every part of %q: a node is counted against the first plugin to turn it down, by that plugin's name\nthe program said:\n%s",
+		name, why, note, strings.Join(want, ", "), tail(p.Stdout()))
 }

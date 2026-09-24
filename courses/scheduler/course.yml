@@ -66,3 +66,6 @@ stages:
   - slug: preemption
     name: Making room, not waiting for it
     difficulty: hard
+  - slug: framework-plugins
+    name: Every check with a name on it
+    difficulty: medium
