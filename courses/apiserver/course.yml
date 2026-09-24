@@ -1,0 +1,16 @@
+slug: apiserver
+name: Build your own kube-apiserver
+language: go
+entrypoint: main.go
+# No cluster: this course builds the thing the others are clients of, so its
+# stages talk to the learner's own server over HTTP.
+stages:
+  - slug: serve
+    name: Something that answers
+    difficulty: easy
+  - slug: discovery-root
+    name: What this server can do
+    difficulty: medium
+  - slug: resource-create
+    name: The first thing worth storing
+    difficulty: medium

@@ -25,19 +25,30 @@ import (
 	"github.com/madhank93/byo-k8s-x/internal/kube"
 	"github.com/madhank93/byo-k8s-x/internal/runner"
 	"github.com/madhank93/byo-k8s-x/internal/stages"
+	apiserverstages "github.com/madhank93/byo-k8s-x/internal/stages/apiserver"
 	controllerstages "github.com/madhank93/byo-k8s-x/internal/stages/controller"
 	kubectlstages "github.com/madhank93/byo-k8s-x/internal/stages/kubectl"
 	schedulerstages "github.com/madhank93/byo-k8s-x/internal/stages/scheduler"
 	webhookstages "github.com/madhank93/byo-k8s-x/internal/stages/webhook"
 )
 
-// courses maps a course slug to its assertions. A course is gradable exactly
-// when it appears here — the one line a new course adds to this command.
-var courses = map[string]stages.Lookup{
-	"kubectl":    kubectlstages.Lookup,
-	"controller": controllerstages.Lookup,
-	"webhook":    webhookstages.Lookup,
-	"scheduler":  schedulerstages.Lookup,
+// course is how one course is graded: its assertions, and whether its stages
+// want a namespace on the kind cluster prepared for them.
+type course struct {
+	lookup  stages.Lookup
+	cluster bool
+}
+
+// courses maps a course slug to that — the one line a new course adds to this
+// command. The apiserver course builds the thing the others are clients of, so
+// its stages talk to the learner's own server over HTTP and there is no
+// cluster for the harness to prepare.
+var courses = map[string]course{
+	"kubectl":    {kubectlstages.Lookup, true},
+	"controller": {controllerstages.Lookup, true},
+	"webhook":    {webhookstages.Lookup, true},
+	"scheduler":  {schedulerstages.Lookup, true},
+	"apiserver":  {apiserverstages.Lookup, false},
 }
 
 type testCase struct {
@@ -57,7 +68,7 @@ func run() error {
 	if slug == "" {
 		return fmt.Errorf("BYOK8S_COURSE is not set")
 	}
-	lookup, ok := courses[slug]
+	c, ok := courses[slug]
 	if !ok {
 		return fmt.Errorf("no assertions are registered for course %q", slug)
 	}
@@ -86,7 +97,7 @@ func run() error {
 	defer os.RemoveAll(filepath.Dir(bin))
 
 	for i, tc := range cases {
-		stage, ok := lookup(tc.Slug)
+		stage, ok := c.lookup(tc.Slug)
 		if !ok {
 			return fmt.Errorf("no assertions registered for stage %q", tc.Slug)
 		}
@@ -97,9 +108,16 @@ func run() error {
 		}
 		fmt.Printf("\n[%s] running\n", title)
 
-		env, cancel, err := kube.Begin(ctx, slug, tc.Slug, stages.Timeout+30*time.Second)
-		if err != nil {
-			return fmt.Errorf("[%s] preparing the cluster: %w", title, err)
+		// A course graded without a cluster gets no Env: there is no namespace
+		// to put anything in, and a stage that asked for one would be reaching
+		// for the very thing the learner is building.
+		var env *kube.Env
+		cancel := func() {}
+		if c.cluster {
+			env, cancel, err = kube.Begin(ctx, slug, tc.Slug, stages.Timeout+30*time.Second)
+			if err != nil {
+				return fmt.Errorf("[%s] preparing the cluster: %w", title, err)
+			}
 		}
 		err = stage.Run(ctx, env, bin)
 		cancel()
