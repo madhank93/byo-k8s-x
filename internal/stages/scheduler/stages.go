@@ -624,6 +624,14 @@ func stageScoreImageLocality(ctx context.Context, env *kube.Env, bin string) err
 	}
 	warm := workers[len(workers)-1]
 
+	// The image is meant to be the only thing between the workers, so whatever
+	// earlier stages left on them is levelled out first.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
+	if err != nil {
+		return err
+	}
+
 	if err := warmImage(ctx, env, warm); err != nil {
 		return err
 	}
@@ -667,6 +675,62 @@ func stageScoreImageLocality(ctx context.Context, env *kube.Env, bin string) err
 // The node reports its images on its own schedule, so having run the pod is
 // not the same as the program being able to see the image, and the wait is for
 // the node to say so.
+// levelWorkers pins ballast until every worker has the same cpu and memory
+// spoken for, and returns a cleanup that takes it away again.
+//
+// A stage that asserts on any score other than room needs room not to be the
+// thing that differs. Earlier stages leave their pods behind until their own
+// namespace is next reset, and on a four-cpu runner one leftover request is
+// worth more than the score under test — which passes on a big machine and
+// fails on a small one.
+func levelWorkers(ctx context.Context, env *kube.Env) (func(), error) {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return func() {}, err
+	}
+	pods, err := env.Client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return func() {}, fmt.Errorf("list pods: %w", err)
+	}
+	cpu, mem := map[string]int64{}, map[string]int64{}
+	for _, pod := range pods.Items {
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		for _, c := range pod.Spec.Containers {
+			cpu[pod.Spec.NodeName] += c.Resources.Requests.Cpu().MilliValue()
+			mem[pod.Spec.NodeName] += c.Resources.Requests.Memory().Value()
+		}
+	}
+	var mostCPU, mostMem int64
+	for _, w := range workers {
+		mostCPU, mostMem = max(mostCPU, cpu[w]), max(mostMem, mem[w])
+	}
+
+	var created []string
+	cleanup := func() {
+		zero := int64(0)
+		for _, name := range created {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}
+	for _, w := range workers {
+		if cpu[w] == mostCPU && mem[w] == mostMem {
+			continue
+		}
+		name := "level-" + w
+		created = append(created, name)
+		if err := seedBallast(ctx, env, name, w, corev1.ResourceList{
+			corev1.ResourceCPU:    *apiresource.NewMilliQuantity(mostCPU-cpu[w], apiresource.DecimalSI),
+			corev1.ResourceMemory: *apiresource.NewQuantity(mostMem-mem[w], apiresource.BinarySI),
+		}); err != nil {
+			return cleanup, err
+		}
+	}
+	return cleanup, nil
+}
+
 func warmImage(ctx context.Context, env *kube.Env, node string) error {
 	zero := int64(0)
 	defer func() {
