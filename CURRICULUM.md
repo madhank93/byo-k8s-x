@@ -119,10 +119,11 @@ operational traps that take clusters down.
 with `kubectl` — the verdict is whether the API server accepted or rejected
 them, and what came back changed.
 
-### `scheduler` — Build your own scheduler · 23 stages
+### [x] `scheduler` — Build your own scheduler · 23 stages
 
-Filter, score, bind. Then the parts that make it a real scheduler: spreading,
-topology, priority and preemption.
+Shipped. Filter, score, bind — then the parts that make it a real scheduler:
+spreading, topology, volumes, priority, preemption, and the framework the last
+three stages rebuild the whole program into.
 
 `watch-unscheduled` · `bind` · `node-list` · `fit-resources` · `fit-ports` ·
 `node-selector` · `node-affinity` · `taints` · `unschedulable` · `events` ·

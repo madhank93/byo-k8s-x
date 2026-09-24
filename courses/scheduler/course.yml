@@ -72,3 +72,6 @@ stages:
   - slug: multi-profile
     name: Two schedulers, one program
     difficulty: medium
+  - slug: percentage-of-nodes
+    name: Good enough, and moving on
+    difficulty: medium

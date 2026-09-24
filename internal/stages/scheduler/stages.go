@@ -74,6 +74,7 @@ func init() {
 	register(Stage{Slug: "preemption", Run: stagePreemption})
 	register(Stage{Slug: "framework-plugins", Run: stageFrameworkPlugins})
 	register(Stage{Slug: "multi-profile", Run: stageMultiProfile})
+	register(Stage{Slug: "percentage-of-nodes", Run: stagePercentageOfNodes})
 }
 
 // stageWatchUnscheduled checks the program finds the pods it is responsible
@@ -2660,6 +2661,94 @@ func seedProfilePod(ctx context.Context, env *kube.Env, name, profile, cpu strin
 	}
 	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("seed pod %s: %w", name, err)
+	}
+	return nil
+}
+
+// stagePercentageOfNodes checks the program will settle for a good enough node
+// when told to, and that the part of the cluster it looks at moves.
+//
+// Two workers are loaded and one is left empty, so scoring every node has one
+// answer and gives it every time. Asked to look at a third of the cluster, the
+// program has to take what it finds — and because the scan resumes where the
+// last one stopped, six pods reach all three workers rather than one.
+//
+// The pod nothing can take is the other half: a sample is enough to place a
+// pod, never enough to declare there is nowhere to put it.
+func stagePercentageOfNodes(ctx context.Context, env *kube.Env, bin string) error {
+	workers, err := workerNodes(ctx, env)
+	if err != nil {
+		return err
+	}
+	if len(workers) < 3 {
+		return fmt.Errorf("this stage needs three workers, found %d", len(workers))
+	}
+	all, err := env.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list nodes: %w", err)
+	}
+	total := len(all.Items)
+
+	zero := int64(0)
+	var seeded []string
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	for _, w := range workers[1:] {
+		name := "ballast-" + w
+		seeded = append(seeded, name)
+		node, err := env.Client.CoreV1().Nodes().Get(ctx, w, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get node %s: %w", w, err)
+		}
+		cpu := node.Status.Allocatable[corev1.ResourceCPU]
+		if err := seedBallast(ctx, env, name, w, milliCPU(cpu.MilliValue()*50/100)); err != nil {
+			return err
+		}
+	}
+
+	// A third of four nodes is one: the first feasible node each scan meets.
+	p, cleanup, err := launch(ctx, env, bin, "-percentage-of-nodes=34")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	used := map[string]int{}
+	for i := 1; i <= 2*len(workers); i++ {
+		name := fmt.Sprintf("sampled-%d", i)
+		seeded = append(seeded, name)
+		if err := seedPod(ctx, env, name, schedulerName); err != nil {
+			return err
+		}
+		node, err := boundNode(ctx, env, name, 60*time.Second)
+		if err != nil {
+			return fmt.Errorf("pod %s asks for nothing and every worker can take it: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
+		}
+		if !slices.Contains(workers, node) {
+			return fmt.Errorf("pod %s was bound to %s, which is not a worker: a node the filters turn down is skipped over, not counted towards the sample\nthe program said:\n%s",
+				name, node, tail(p.Stdout()))
+		}
+		used[node]++
+	}
+	if len(used) != len(workers) {
+		return fmt.Errorf("%d pods that ask for nothing reached %d of the %d workers (%v), with -percentage-of-nodes=34: one node is scored per pod, and the scan resumes where the last one stopped, or every pod in the cluster is weighed against the same few nodes\nthe program said:\n%s",
+			2*len(workers), len(used), len(workers), used, tail(p.Stdout()))
+	}
+
+	// Stopping early is for finding somewhere good enough. Finding nowhere has
+	// to mean nowhere at all.
+	seeded = append(seeded, "nowhere")
+	if err := seedSelectingPod(ctx, env, "nowhere", map[string]string{"byok8s.dev/stage-sampled": "yes"}); err != nil {
+		return err
+	}
+	if err := awaitNote(ctx, env, p, "nowhere",
+		[]string{fmt.Sprintf("0/%d nodes are available", total), fmt.Sprintf("%d NodeAffinity", len(workers))},
+		"selects a label no node carries"); err != nil {
+		return err
 	}
 	return nil
 }
