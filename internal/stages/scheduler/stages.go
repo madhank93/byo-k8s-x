@@ -1057,6 +1057,35 @@ func stageBind(ctx context.Context, env *kube.Env, bin string) error {
 
 // workerNodes lists the nodes a pod may be placed on, sorted by name: every
 // node that is not a control plane.
+// workerAllocatable is the smallest worker's allocatable resources, which is
+// what a stage sizes its pods against. A request in whole cpus means one thing
+// on a laptop with sixteen of them and another on a CI runner with four, and
+// these stages assert on how many such pods a node can hold.
+func workerAllocatable(ctx context.Context, env *kube.Env) (corev1.ResourceList, error) {
+	list, err := env.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: "!node-role.kubernetes.io/control-plane"})
+	if err != nil {
+		return nil, fmt.Errorf("list worker nodes: %w", err)
+	}
+	smallest := corev1.ResourceList{}
+	for _, n := range list.Items {
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			have := n.Status.Allocatable[name]
+			if held, ok := smallest[name]; !ok || have.Cmp(held) < 0 {
+				smallest[name] = have
+			}
+		}
+	}
+	if len(smallest) == 0 {
+		return nil, fmt.Errorf("the cluster has no worker nodes\n  fix: byok8s down && byok8s up")
+	}
+	return smallest, nil
+}
+
+// shareOfCPU is percent of a quantity of cpu, as a request to put on a pod.
+func shareOfCPU(cpu apiresource.Quantity, percent int64) string {
+	return fmt.Sprintf("%dm", cpu.MilliValue()*percent/100)
+}
+
 func workerNodes(ctx context.Context, env *kube.Env) ([]string, error) {
 	list, err := env.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: "!node-role.kubernetes.io/control-plane"})
 	if err != nil {
@@ -1174,10 +1203,20 @@ func stageFitResources(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	defer cleanup()
 
+	alloc, err := workerAllocatable(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu, mem := alloc[corev1.ResourceCPU], alloc[corev1.ResourceMemory]
+	// More than half a worker: one such pod fits on a node and two never do,
+	// whatever size the workers happen to be.
 	for _, ask := range []struct {
 		resource corev1.ResourceName
 		amount   string
-	}{{corev1.ResourceCPU, "6"}, {corev1.ResourceMemory, "5Gi"}} {
+	}{
+		{corev1.ResourceCPU, shareOfCPU(cpu, 60)},
+		{corev1.ResourceMemory, apiresource.NewQuantity(mem.Value()*60/100, apiresource.BinarySI).String()},
+	} {
 		done, err := fillNodes(ctx, env, p, string(ask.resource), ask.amount+" of "+string(ask.resource), func(name string) error {
 			return seedRequestingPod(ctx, env, name, ask.resource, ask.amount)
 		})
@@ -2110,6 +2149,13 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 		defer cordonNode(context.WithoutCancel(ctx), env, w, false)
 	}
 
+	alloc, err := workerAllocatable(ctx, env)
+	if err != nil {
+		return err
+	}
+	// More than half a worker each, so a worker that opens has room for one.
+	seat := shareOfCPU(alloc[corev1.ResourceCPU], 60)
+
 	// Six against three: a program that picks without looking at priority is
 	// unlikely to be lucky three times over.
 	zero := int64(0)
@@ -2128,7 +2174,7 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 	}{{"low", low, 6}, {"high", high, 3}} {
 		for i := 1; i <= batch.count; i++ {
 			name := fmt.Sprintf("%s-%d", batch.prefix, i)
-			if err := seedPriorityPod(ctx, env, name, batch.class, "6"); err != nil {
+			if err := seedPriorityPod(ctx, env, name, batch.class, seat); err != nil {
 				return err
 			}
 			seeded = append(seeded, name)
@@ -2180,8 +2226,8 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 			}
 		}
 		if len(placed) > i+1 {
-			return fmt.Errorf("%d workers are open and %d pods are placed: each of these pods asks for 6 of a worker's 11 cpus, so a worker can hold one\nthe program said:\n%s",
-				i+1, len(placed), tail(p.Stdout()))
+			return fmt.Errorf("%d workers are open and %d pods are placed: each of these pods asks for %s, three fifths of a worker, so a worker can hold one\nthe program said:\n%s",
+				i+1, len(placed), seat, tail(p.Stdout()))
 		}
 	}
 	return nil
@@ -2332,20 +2378,30 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	defer cleanup()
 
-	// Three pods of 3 cpus on each of three workers, which leaves no worker
-	// with the 6 the important pod wants: two of the three have to go, and
-	// only two, for it to have them.
+	alloc, err := workerAllocatable(ctx, env)
+	if err != nil {
+		return err
+	}
+	// Three of these fill a worker, and what the important pod asks for is
+	// more than one of them leaves behind and less than two do: the answer is
+	// two victims, whatever size the workers are.
+	small := shareOfCPU(alloc[corev1.ResourceCPU], 30)
+	large := shareOfCPU(alloc[corev1.ResourceCPU], 55)
+
+	// Three pods on each of three workers, which leaves no worker with the
+	// room the important pod wants: two of the three have to go, and only two,
+	// for it to have it.
 	const perNode = 3
 	held := map[string][]string{} // node -> the pods this stage put there
 	for i := 1; i <= len(workers)*perNode; i++ {
 		name := fmt.Sprintf("low-%d", i)
-		if err := seedPriorityPod(ctx, env, name, low, "3"); err != nil {
+		if err := seedPriorityPod(ctx, env, name, low, small); err != nil {
 			return err
 		}
 		seeded = append(seeded, name)
 		node, err := boundNode(ctx, env, name, 60*time.Second)
 		if err != nil {
-			return fmt.Errorf("pod %s asks for 3 of a worker's 11 cpus and a worker with fewer than three such pods is free: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
+			return fmt.Errorf("pod %s asks for %s, and a worker holding fewer than %d such pods is free: %w\nthe program said:\n%s", name, small, perNode, err, tail(p.Stdout()))
 		}
 		held[node] = append(held[node], name)
 	}
@@ -2356,7 +2412,7 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 	}
 
 	seeded = append(seeded, "important")
-	if err := seedPriorityPod(ctx, env, "important", high, "6"); err != nil {
+	if err := seedPriorityPod(ctx, env, "important", high, large); err != nil {
 		return err
 	}
 	where, err := boundNode(ctx, env, "important", 75*time.Second)
@@ -2373,8 +2429,8 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 	// leaves too little, and evicting three empties a worker for no reason.
 	const want = 2
 	if gone := len(workers)*perNode - len(left); gone != want {
-		return fmt.Errorf("pod important asks for 6 cpus and %d pods of 3 were evicted for it: two of a worker's three leave it the room, and preemption takes the least it can\nthe program said:\n%s",
-			gone, tail(p.Stdout()))
+		return fmt.Errorf("pod important asks for %s and %d pods of %s were evicted for it: two of a worker's three leave it that room, and preemption takes the least it can\nthe program said:\n%s",
+			large, gone, small, tail(p.Stdout()))
 	}
 	for node, pods := range held {
 		var stayed int
@@ -2392,7 +2448,7 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 	// Equal priority is not lower priority: this one has nowhere to go and
 	// nobody it may take room from.
 	seeded = append(seeded, "another")
-	if err := seedPriorityPod(ctx, env, "another", low, "3"); err != nil {
+	if err := seedPriorityPod(ctx, env, "another", low, small); err != nil {
 		return err
 	}
 	if err := awaitLine(ctx, p, "unscheduled "+env.Namespace+"/another", 30*time.Second); err != nil {
@@ -2496,6 +2552,10 @@ func stageFrameworkPlugins(ctx context.Context, env *kube.Env, bin string) error
 	// Two plugins at once, each counting only the nodes it turned down. The
 	// control plane is tainted, the cordoned worker is closed, and the two
 	// workers left have no room.
+	alloc, err := workerAllocatable(ctx, env)
+	if err != nil {
+		return err
+	}
 	closed := workers[0]
 	if err := cordonNode(ctx, env, closed, true); err != nil {
 		return err
@@ -2514,7 +2574,9 @@ func stageFrameworkPlugins(ctx context.Context, env *kube.Env, bin string) error
 		}
 	}
 	seeded = append(seeded, "mixed")
-	if err := seedRequestingPod(ctx, env, "mixed", corev1.ResourceCPU, "2"); err != nil {
+	// A fifth of a worker: more than the twentieth the ballast leaves behind.
+	mixed := shareOfCPU(alloc[corev1.ResourceCPU], 20)
+	if err := seedRequestingPod(ctx, env, "mixed", corev1.ResourceCPU, mixed); err != nil {
 		return err
 	}
 	if err := awaitNote(ctx, env, p, "mixed",
@@ -2524,7 +2586,7 @@ func stageFrameworkPlugins(ctx context.Context, env *kube.Env, bin string) error
 			fmt.Sprintf("%d NodeResourcesFit", len(workers)-1),
 			tainted,
 		},
-		"asks for 2 cpus with one worker cordoned and the rest full"); err != nil {
+		"asks for "+mixed+" with one worker cordoned and the rest full"); err != nil {
 		return err
 	}
 	return nil
@@ -2602,7 +2664,9 @@ func stageMultiProfile(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	defer cleanup()
 
-	if err := seedProfilePod(ctx, env, "spread-me", schedulerName, "1"); err != nil {
+	// A tenth of a worker, which the half-loaded node has room for.
+	ask := shareOfCPU(cpu, 10)
+	if err := seedProfilePod(ctx, env, "spread-me", schedulerName, ask); err != nil {
 		return err
 	}
 	where, err := boundNode(ctx, env, "spread-me", 60*time.Second)
@@ -2614,7 +2678,7 @@ func stageMultiProfile(ctx context.Context, env *kube.Env, bin string) error {
 			schedulerName, loaded, tail(p.Stdout()))
 	}
 
-	if err := seedProfilePod(ctx, env, "pack-me", packingProfile, "1"); err != nil {
+	if err := seedProfilePod(ctx, env, "pack-me", packingProfile, ask); err != nil {
 		return err
 	}
 	where, err = boundNode(ctx, env, "pack-me", 60*time.Second)
@@ -2630,7 +2694,7 @@ func stageMultiProfile(ctx context.Context, env *kube.Env, bin string) error {
 	// The field selector that used to keep other schedulers' pods out of this
 	// program is gone, since it cannot ask for either of two names. What takes
 	// its place has to be just as strict.
-	if err := seedProfilePod(ctx, env, "not-ours", schedulerName+"-nope", "1"); err != nil {
+	if err := seedProfilePod(ctx, env, "not-ours", schedulerName+"-nope", ask); err != nil {
 		return err
 	}
 	if node, err := boundNode(ctx, env, "not-ours", 20*time.Second); err == nil {
