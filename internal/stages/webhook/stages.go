@@ -58,7 +58,17 @@ type Stage = stages.Stage
 // publishes the host under this name, and it is passed to the program rather
 // than compiled into it, so the same program would work unchanged against a
 // cluster that reaches it some other way.
-const externalHost = "host.docker.internal"
+// Docker Desktop and OrbStack publish the host under that name; a Linux
+// runner's Docker does not, and there the host is the kind network's gateway,
+// so the address can be given explicitly.
+var externalHost = hostTheAPIServerCanReach()
+
+func hostTheAPIServerCanReach() string {
+	if h := os.Getenv("BYOK8S_EXTERNAL_HOST"); h != "" {
+		return h
+	}
+	return "host.docker.internal"
+}
 
 var registry = map[string]Stage{}
 

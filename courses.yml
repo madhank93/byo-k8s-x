@@ -29,7 +29,7 @@ entries:
 
   - slug: scheduler
     name: Build your own scheduler
-    status: planned
+    status: shipped
     tier: control loops
     blurb: Filter, score, bind — then priority and preemption.
 
