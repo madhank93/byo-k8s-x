@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -50,6 +51,9 @@ func init() {
 	register(Stage{Slug: "etcd", Run: stageEtcd})
 	register(Stage{Slug: "resourceversion", Run: stageResourceVersion})
 	register(Stage{Slug: "namespaces", Run: stageNamespaces})
+	register(Stage{Slug: "field-selector", Run: stageFieldSelector})
+	register(Stage{Slug: "label-selector", Run: stageLabelSelector})
+	register(Stage{Slug: "pagination", Run: stagePagination})
 }
 
 // stageServe checks the program serves HTTP where it was told to, says it is
@@ -1056,6 +1060,395 @@ type server struct {
 	url string
 }
 
+// stageFieldSelector checks a list can be narrowed on the server, on the
+// fields the server is willing to be asked about.
+//
+// A selector is not a convenience: it is the difference between a kubelet
+// watching the pods assigned to one node and every pod in the cluster arriving
+// at every node. The rule worth taking from this stage is that a server which
+// cannot answer a selector says so, because a client whose filter was silently
+// dropped acts on the whole collection.
+func stageFieldSelector(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	for _, name := range []string{"alpha", "beta"} {
+		if _, err := srv.create(ctx, "/api/v1/namespaces/default/configmaps", map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   map[string]any{"name": name},
+			"data":       map[string]any{"colour": "blue"},
+		}); err != nil {
+			return err
+		}
+	}
+	if _, err := srv.create(ctx, "/api/v1/namespaces/kube-public/configmaps", map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": "alpha"},
+	}); err != nil {
+		return err
+	}
+
+	// The selector kubectl sends for `get cm alpha` once it is listing rather
+	// than getting: one term, the plain = operator.
+	for _, selector := range []string{"metadata.name=alpha", "metadata.name==alpha"} {
+		names, list, err := srv.names(ctx, "/api/v1/namespaces/default/configmaps?fieldSelector="+url.QueryEscape(selector))
+		if err != nil {
+			return err
+		}
+		if strings.Join(names, ",") != "alpha" {
+			return fmt.Errorf("listing default with fieldSelector=%s answered %v, and only alpha matches: default holds alpha and beta\nthe body was:\n%v",
+				selector, names, list)
+		}
+		// Narrowing a list does not change what the answer is. kubectl decodes
+		// the reply the same way whether or not it asked for a subset.
+		if list["kind"] != "ConfigMapList" || metaField(list, "resourceVersion") == "" {
+			return fmt.Errorf("listing with fieldSelector=%s answered kind %v with resourceVersion %q, and a filtered list is still a ConfigMapList carrying the list's own resourceVersion: the selector narrows the items, not the envelope",
+				selector, list["kind"], metaField(list, "resourceVersion"))
+		}
+	}
+
+	// != is the other half of the operator, and a server that reads every
+	// operator as equality answers this one exactly backwards.
+	names, _, err := srv.names(ctx, "/api/v1/namespaces/default/configmaps?fieldSelector="+url.QueryEscape("metadata.name!=alpha"))
+	if err != nil {
+		return err
+	}
+	if strings.Join(names, ",") != "beta" {
+		return fmt.Errorf("listing default with fieldSelector=metadata.name!=alpha answered %v, and everything but alpha is beta", names)
+	}
+
+	// metadata.namespace on the cluster-wide URL, which is how a client asks
+	// one endpoint for one namespace's objects — and the only reason the field
+	// is selectable at all.
+	names, _, err = srv.names(ctx, "/api/v1/configmaps?fieldSelector="+url.QueryEscape("metadata.namespace=kube-public"))
+	if err != nil {
+		return err
+	}
+	if strings.Join(names, ",") != "alpha" {
+		return fmt.Errorf("listing /api/v1/configmaps with fieldSelector=metadata.namespace=kube-public answered %v, and kube-public holds one configmap named alpha: the other alpha is in default and is a different object",
+			names)
+	}
+
+	// Two terms, and the comma between them is an AND. There is no OR in this
+	// syntax at all, which is why a client wanting a union sends two requests.
+	names, _, err = srv.names(ctx, "/api/v1/configmaps?fieldSelector="+url.QueryEscape("metadata.namespace=default,metadata.name=beta"))
+	if err != nil {
+		return err
+	}
+	if strings.Join(names, ",") != "beta" {
+		return fmt.Errorf("listing /api/v1/configmaps with fieldSelector=metadata.namespace=default,metadata.name=beta answered %v, and one object is in default and named beta: the comma between two terms is an AND, not an OR",
+			names)
+	}
+
+	// A selector nothing matches is an empty list, not a 404: the collection
+	// is there, and the answer is that none of it was selected.
+	empty, err := srv.getJSON(ctx, "/api/v1/namespaces/default/configmaps?fieldSelector="+url.QueryEscape("metadata.name=nothing"))
+	if err != nil {
+		return fmt.Errorf("%w\n\na selector that matches nothing is a 200 with an empty list: the resource exists, and the filter is the client's question rather than the server's", err)
+	}
+	if items, ok := empty["items"].([]any); !ok || len(items) != 0 {
+		return fmt.Errorf("listing with a selector nothing matches answered items %v rather than an empty array", empty["items"])
+	}
+
+	// Cluster-scoped resources take a selector too, on the one field they have.
+	names, _, err = srv.names(ctx, "/api/v1/namespaces?fieldSelector="+url.QueryEscape("metadata.name=default"))
+	if err != nil {
+		return err
+	}
+	if strings.Join(names, ",") != "default" {
+		return fmt.Errorf("listing /api/v1/namespaces with fieldSelector=metadata.name=default answered %v, and one namespace is named default: every resource is selectable on metadata.name, namespaces included",
+			names)
+	}
+
+	// The field that is not indexed. This is the stage's real assertion: the
+	// server refuses rather than ignoring, because a filter that was dropped
+	// on the floor sends the whole collection to a client that asked for one.
+	for _, selector := range []string{"data.colour=blue", "metadata.labels.team=a"} {
+		path := "/api/v1/namespaces/default/configmaps?fieldSelector=" + url.QueryEscape(selector)
+		res, body, err := srv.send(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return err
+		}
+		if err := wantStatus("listing with fieldSelector="+selector, res, body, http.StatusBadRequest, "BadRequest"); err != nil {
+			return fmt.Errorf("%w\n\na field selector is answered from what the server indexes, so a field it does not index is refused: metadata.name and metadata.namespace are the two every resource supports, and the real server declares the rest per resource — status.phase for pods, spec.nodeName for the one the kubelet watches with",
+				err)
+		}
+	}
+
+	// A term with no operator in it at all is not a selector.
+	res, body, err := srv.send(ctx, http.MethodGet, "/api/v1/namespaces/default/configmaps?fieldSelector=metadata.name", nil)
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("listing with fieldSelector=metadata.name, which has no operator", res, body, http.StatusBadRequest, "BadRequest"); err != nil {
+		return fmt.Errorf("%w\n\nfield selectors have no existence form: every term is a field, an operator and a value", err)
+	}
+	return nil
+}
+
+// stageLabelSelector checks the selector the rest of Kubernetes is built out
+// of: labels the client wrote, matched by a syntax richer than the fields.
+//
+// A Service finds its pods this way, a Deployment owns its ReplicaSets this
+// way, and neither of them stores a list of names anywhere. The two negative
+// forms are where servers get this wrong — != and notin match an object that
+// has no such label at all, and a server that skips those objects answers
+// "everything not in production" with the wrong set.
+func stageLabelSelector(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	labelled := map[string]map[string]any{
+		"web-1": {"app": "web", "tier": "frontend"},
+		"web-2": {"app": "web", "tier": "backend"},
+		"db-1":  {"app": "db"},
+		"plain": nil,
+	}
+	for _, name := range []string{"db-1", "plain", "web-1", "web-2"} {
+		meta := map[string]any{"name": name}
+		if labels := labelled[name]; labels != nil {
+			meta["labels"] = labels
+		}
+		if _, err := srv.create(ctx, "/api/v1/namespaces/default/configmaps", map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   meta,
+		}); err != nil {
+			return err
+		}
+	}
+
+	const base = "/api/v1/namespaces/default/configmaps?labelSelector="
+	for _, c := range []struct {
+		selector string
+		want     string
+		why      string
+	}{
+		{"app=web", "web-1,web-2", "two objects carry app=web; db-1 carries app=db and plain has no labels at all"},
+		{"app==web", "web-1,web-2", "== is the same operator as =, and a server that knows only one of them answers half the clients"},
+		{"app=web,tier=frontend", "web-1", "the comma is an AND: both terms have to hold on the same object"},
+		{"app!=web", "db-1,plain", "!= matches an object that has no such label at all — plain has none, and it is not app=web"},
+		{"app", "db-1,web-1,web-2", "a bare key is an existence test: every object that has the label, whatever its value"},
+		{"!app", "plain", "!key is the absence test, and plain is the only object without an app label"},
+		{"app in (web,db)", "db-1,web-1,web-2", "set membership: the commas inside the parentheses belong to the set, not to the AND between terms"},
+		{"tier notin (frontend)", "db-1,plain,web-2", "notin matches an object with no tier label too: db-1 and plain have none, and neither of them is in frontend"},
+		{"app in (web),tier=backend", "web-2", "a set term and an equality term, ANDed — which is what makes splitting on every comma wrong"},
+	} {
+		names, _, err := srv.names(ctx, base+url.QueryEscape(c.selector))
+		if err != nil {
+			return err
+		}
+		if strings.Join(names, ",") != c.want {
+			return fmt.Errorf("listing default with labelSelector=%s answered %v, and the answer is %s: %s",
+				c.selector, names, c.want, c.why)
+		}
+	}
+
+	// Both selectors on one request, and an object has to pass both. They
+	// narrow the same list rather than one overriding the other.
+	names, _, err := srv.names(ctx, base+url.QueryEscape("app=web")+"&fieldSelector="+url.QueryEscape("metadata.name=web-2"))
+	if err != nil {
+		return err
+	}
+	if strings.Join(names, ",") != "web-2" {
+		return fmt.Errorf("listing with labelSelector=app=web and fieldSelector=metadata.name=web-2 answered %v, and one object is both: a request carrying both selectors is narrowed by both",
+			names)
+	}
+
+	// Labels are the client's, so any key can be selected on — there is no
+	// list of allowed ones the way there is for fields.
+	names, _, err = srv.names(ctx, base+url.QueryEscape("tier=frontend"))
+	if err != nil {
+		return fmt.Errorf("%w\n\nunlike a field selector, a label selector cannot be refused for the key it names: labels are written by whoever created the object, so the server has no set of them to check against", err)
+	}
+	if strings.Join(names, ",") != "web-1" {
+		return fmt.Errorf("listing with labelSelector=tier=frontend answered %v rather than web-1", names)
+	}
+
+	// A selector nothing matches is an empty list, as with any other filter.
+	empty, err := srv.getJSON(ctx, base+url.QueryEscape("app=nothing"))
+	if err != nil {
+		return err
+	}
+	if items, ok := empty["items"].([]any); !ok || len(items) != 0 {
+		return fmt.Errorf("listing with a label selector nothing matches answered items %v rather than an empty array", empty["items"])
+	}
+
+	// Nonsense is refused rather than read as something else. A trailing comma
+	// leaves an empty term, and an empty term is not "match everything".
+	for _, selector := range []string{"app=web,", "!", "app inside (web)"} {
+		path := base + url.QueryEscape(selector)
+		res, body, err := srv.send(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return err
+		}
+		if err := wantStatus("listing with labelSelector="+selector, res, body, http.StatusBadRequest, "BadRequest"); err != nil {
+			return fmt.Errorf("%w\n\na selector that cannot be parsed is a 400: a server that treats it as empty hands back the whole collection to a client that asked for part of it", err)
+		}
+	}
+	return nil
+}
+
+// stagePagination checks a collection can be read a page at a time, and that
+// the pages join up into the collection exactly once.
+//
+// The failure this prevents is not slowness: it is a server holding every
+// object of a large resource in memory, serialising it, and sending it — which
+// is how an apiserver dies when somebody runs `kubectl get pods -A` on a big
+// cluster. kubectl chunks at 500 for exactly this reason.
+func stagePagination(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// Five objects, three of them labelled: enough for three pages of two, and
+	// enough to tell selecting-then-paging from paging-then-selecting.
+	for _, name := range []string{"c", "a", "e", "b", "d"} {
+		meta := map[string]any{"name": name}
+		if name == "a" || name == "c" || name == "e" {
+			meta["labels"] = map[string]any{"app": "web"}
+		}
+		if _, err := srv.create(ctx, "/api/v1/namespaces/default/configmaps", map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   meta,
+		}); err != nil {
+			return err
+		}
+	}
+
+	const path = "/api/v1/namespaces/default/configmaps"
+
+	// Page one. The answer carries the cursor to the next page, and the count
+	// of what did not fit.
+	names, list, err := srv.names(ctx, path+"?limit=2")
+	if err != nil {
+		return err
+	}
+	if strings.Join(names, ",") != "a,b" {
+		return fmt.Errorf("GET %s?limit=2 answered %v, and the first two of a,b,c,d,e are a,b: a page is the front of the same order an unpaged list comes back in", path, names)
+	}
+	cursor := metaField(list, "continue")
+	if cursor == "" {
+		return fmt.Errorf("GET %s?limit=2 has no metadata.continue, and three of the five objects did not fit in it: the cursor is the only way a client can ask for the rest, and a page without one says the collection ended here",
+			path)
+	}
+	if remaining, ok := list["metadata"].(map[string]any)["remainingItemCount"]; !ok {
+		return fmt.Errorf("GET %s?limit=2 has no metadata.remainingItemCount: it is what kubectl prints as the number still to come", path)
+	} else if remaining != float64(3) {
+		return fmt.Errorf("GET %s?limit=2 says remainingItemCount %v, and three of the five objects are still to come", path, remaining)
+	}
+	first := metaField(list, "resourceVersion")
+	if first == "" {
+		return fmt.Errorf("GET %s?limit=2 has no metadata.resourceVersion on the list itself", path)
+	}
+
+	// A write somewhere else in the cluster, between two pages of this list.
+	// It moves the store's counter and not this collection, which is what
+	// makes the pages' own resourceVersion worth checking: it comes from the
+	// cursor, not from wherever the store has got to by the time page two is
+	// asked for.
+	if _, err := srv.create(ctx, "/api/v1/namespaces/kube-public/configmaps", map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": "unrelated"},
+	}); err != nil {
+		return err
+	}
+
+	// The rest of the collection, one page at a time, ending when the server
+	// stops handing back a cursor.
+	got := names
+	for page := 2; cursor != ""; page++ {
+		if page > 5 {
+			return fmt.Errorf("GET %s?limit=2 was still handing back a continue token after five pages of a five-object collection: the last page carries no cursor, and a client that is always given one pages for ever",
+				path)
+		}
+		names, list, err = srv.names(ctx, path+"?limit=2&continue="+url.QueryEscape(cursor))
+		if err != nil {
+			return fmt.Errorf("%w\n\nthe continue token from the previous page is sent back exactly as it was received: it is the server's own cursor, and nothing but this server reads it", err)
+		}
+		// Every page of one list describes the same point in the store's
+		// history. A client paging through a collection is reading one answer
+		// in instalments, not several answers in a row.
+		if rv := metaField(list, "resourceVersion"); rv != first {
+			return fmt.Errorf("page %d of %s?limit=2 has resourceVersion %q where the first page had %q: the pages of one list are one answer, taken at one point in the store's history — the cursor carries that version so the later pages can report it",
+				page, path, rv, first)
+		}
+		got = append(got, names...)
+		cursor = metaField(list, "continue")
+	}
+	if strings.Join(got, ",") != "a,b,c,d,e" {
+		return fmt.Errorf("paging through %s two at a time produced %v, and the collection is a,b,c,d,e: every object appears once, in order, and the cursor starts the next page after the last one sent — not at the item it names",
+			path, got)
+	}
+
+	// A limit bigger than what is there is not a page: there is no more, so
+	// there is no cursor.
+	_, list, err = srv.names(ctx, path+"?limit=50")
+	if err != nil {
+		return err
+	}
+	if metaField(list, "continue") != "" {
+		return fmt.Errorf("GET %s?limit=50 answered all five objects and still carried a continue token: a cursor means there is more, and a client that follows this one asks for a sixth object that was never there",
+			path)
+	}
+
+	// Selecting happens first, paging second. A limit is how much of the
+	// answer to send, not how much of the store to look at.
+	names, list, err = srv.names(ctx, path+"?limit=2&labelSelector="+url.QueryEscape("app=web"))
+	if err != nil {
+		return err
+	}
+	if strings.Join(names, ",") != "a,c" {
+		return fmt.Errorf("GET %s?limit=2&labelSelector=app=web answered %v, and the labelled objects are a, c and e: the selector narrows the collection and the limit cuts what is left, in that order — the other way round pages a client through answers that are mostly empty",
+			path, names)
+	}
+	names, _, err = srv.names(ctx, path+"?limit=2&labelSelector="+url.QueryEscape("app=web")+"&continue="+url.QueryEscape(metaField(list, "continue")))
+	if err != nil {
+		return err
+	}
+	if strings.Join(names, ",") != "e" {
+		return fmt.Errorf("the second page of %s?limit=2&labelSelector=app=web answered %v, and the third labelled object is e: the selector is sent again with the cursor, and both still apply",
+			path, names)
+	}
+
+	// A limit that is not a number is refused rather than ignored: a client
+	// that asked for a page and was sent a cluster is the failure this whole
+	// stage exists to prevent.
+	for _, limit := range []string{"abc", "-1"} {
+		res, body, err := srv.send(ctx, http.MethodGet, path+"?limit="+url.QueryEscape(limit), nil)
+		if err != nil {
+			return err
+		}
+		if err := wantStatus("GET "+path+"?limit="+limit, res, body, http.StatusBadRequest, "BadRequest"); err != nil {
+			return err
+		}
+	}
+
+	// A cursor this server did not make points nowhere. Reading it as "start
+	// again" hands a paging client the first page for ever.
+	res, body, err := srv.send(ctx, http.MethodGet, path+"?limit=2&continue=not-a-real-cursor", nil)
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("GET "+path+"?limit=2&continue=not-a-real-cursor", res, body, http.StatusBadRequest, "BadRequest"); err != nil {
+		return fmt.Errorf("%w\n\nthe continue token is opaque to the client but not to the server: one it cannot read is a 400, and the real server answers 410 Gone with reason Expired for one it can read but whose place in etcd's history has since been compacted away",
+			err)
+	}
+	return nil
+}
+
 // serve starts the program on a free port of the harness's choosing, with any
 // further flags a stage needs, and waits for it to answer. It returns the
 // server and the cleanup that stops it.
@@ -1116,6 +1509,28 @@ func (s *server) getJSON(ctx context.Context, path string) (map[string]any, erro
 		return nil, fmt.Errorf("GET %s did not answer JSON (%w)\nthe body was:\n%s", path, err, tail(string(body)))
 	}
 	return obj, nil
+}
+
+// names reads a collection and returns what is in it, in the order the server
+// listed it, together with the list itself for anything else a stage asks.
+func (s *server) names(ctx context.Context, path string) ([]string, map[string]any, error) {
+	list, err := s.getJSON(ctx, path)
+	if err != nil {
+		return nil, nil, err
+	}
+	items, ok := list["items"].([]any)
+	if !ok {
+		return nil, nil, fmt.Errorf("GET %s has no items array: a collection holds its objects under items, beside the list's own metadata\nthe body was:\n%v", path, list)
+	}
+	names := []string{}
+	for _, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			return nil, nil, fmt.Errorf("GET %s has an item that is not an object: a list holds whole objects, not names", path)
+		}
+		names = append(names, metaField(obj, "name"))
+	}
+	return names, list, nil
 }
 
 // send makes one request, with an optional object as its JSON body, and does

@@ -7,7 +7,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -639,22 +638,11 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 		if !freshEnough(w, r, objects) {
 			return
 		}
-		selected, err := parseSelectors(r)
+		selected, err := parseFieldSelector(r.URL.Query().Get("fieldSelector"))
 		if err != nil {
 			// A selector the server cannot answer is refused rather than
 			// ignored: a client that asked for one object and was handed the
 			// whole collection would act on every one of them.
-			writeStatus(w, http.StatusBadRequest, "BadRequest", err.Error())
-			return
-		}
-
-		limit, err := pageSize(r.URL.Query().Get("limit"))
-		if err != nil {
-			writeStatus(w, http.StatusBadRequest, "BadRequest", err.Error())
-			return
-		}
-		token, err := decodeContinue(r.URL.Query().Get("continue"))
-		if err != nil {
 			writeStatus(w, http.StatusBadRequest, "BadRequest", err.Error())
 			return
 		}
@@ -666,237 +654,15 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 				items = append(items, obj)
 			}
 		}
-
-		// Selecting happens before paging, always: limit is how much of the
-		// answer to send, not how much of the store to look at. A page of 10
-		// out of a collection of 10,000 that then filters down to nothing
-		// would be a client paging forever through empty answers.
-		listVersion := version
-		if token != nil {
-			if token.Version > version {
-				// A cursor into a history this server does not have. The real
-				// one answers the same way once etcd has compacted the
-				// revision the first page was read at, and the client's only
-				// move is to start the list again.
-				writeStatus(w, http.StatusGone, "Expired",
-					fmt.Sprintf("continue parameter is too old to be honoured: %d, current: %d", token.Version, version))
-				return
-			}
-			listVersion = token.Version
-			rest := []object{}
-			for _, obj := range items {
-				if objectKey(resource, obj) > token.Start {
-					rest = append(rest, obj)
-				}
-			}
-			items = rest
-		}
-
-		meta := map[string]any{"resourceVersion": strconv.FormatInt(listVersion, 10)}
-		if limit > 0 && len(items) > limit {
-			// There is more, so the answer carries the cursor to it — and
-			// only then. An empty continue on the last page is what tells a
-			// client to stop, and a client that is handed one forever pages
-			// forever.
-			meta["continue"] = continueToken{Version: listVersion, Start: objectKey(resource, items[limit-1])}.encode()
-			// A hint rather than a promise: it is what was left when this page
-			// was cut, and kubectl prints it as "(N remaining)".
-			meta["remainingItemCount"] = len(items) - limit
-			items = items[:limit]
-		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"kind":       kind,
 			"apiVersion": "v1",
 			// The list's own resourceVersion, which is not any item's: it is
-			// where a watch started from this answer would begin, and it stays
-			// the same across every page of one list.
-			"metadata": meta,
+			// where a watch started from this answer would begin.
+			"metadata": map[string]any{"resourceVersion": strconv.FormatInt(version, 10)},
 			"items":    items,
 		})
 	}
-}
-
-// continueToken is the cursor a paged list hands back: where the next page
-// starts, and the point in the store's history every page of this list
-// describes.
-//
-// It is opaque to the client on purpose. A client stores it and sends it back
-// untouched, which leaves the server free to change what is in it — the real
-// one carries this same pair, a resource version and a key, as base64 JSON.
-type continueToken struct {
-	Version int64  `json:"rv"`
-	Start   string `json:"start"`
-}
-
-func (t continueToken) encode() string {
-	// Two scalars into JSON cannot fail, and a cursor is not worth an error
-	// path that can never be taken.
-	raw, _ := json.Marshal(t)
-	return base64.RawURLEncoding.EncodeToString(raw)
-}
-
-// decodeContinue reads the cursor back, and returns nil for the first page of
-// a list, which carries none.
-//
-// Anything that is not a cursor this server made is refused. Guessing at it
-// would restart the list from the beginning, and a client paging through a
-// collection would quietly see the first page over and over.
-func decodeContinue(raw string) (*continueToken, error) {
-	if raw == "" {
-		return nil, nil
-	}
-	blob, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil {
-		return nil, fmt.Errorf("continue parameter is invalid: %w", err)
-	}
-	var token continueToken
-	if err := json.Unmarshal(blob, &token); err != nil {
-		return nil, fmt.Errorf("continue parameter is invalid: %w", err)
-	}
-	if token.Start == "" || token.Version <= 0 {
-		return nil, fmt.Errorf("continue parameter is invalid: %q", raw)
-	}
-	return &token, nil
-}
-
-// pageSize reads ?limit=, where absent means the whole collection.
-func pageSize(raw string) (int, error) {
-	if raw == "" {
-		return 0, nil
-	}
-	limit, err := strconv.Atoi(raw)
-	if err != nil || limit < 0 {
-		return 0, fmt.Errorf("limit: Invalid value: %q: must be a non-negative integer", raw)
-	}
-	return limit, nil
-}
-
-// objectKey is where a stored object sits in the key space, which is the order
-// a list comes back in and therefore the only thing a cursor can point at.
-func objectKey(resource string, obj object) string {
-	return registryKey(resource, metaString(obj, "namespace"), metaString(obj, "name"))
-}
-
-// parseSelectors builds the one test a list is narrowed by. A request can
-// carry both selectors, and an object has to pass both to be listed: the
-// fields are what the server indexes, the labels are what whoever created the
-// object wrote on it.
-func parseSelectors(r *http.Request) (func(object) bool, error) {
-	query := r.URL.Query()
-	fields, err := parseFieldSelector(query.Get("fieldSelector"))
-	if err != nil {
-		return nil, err
-	}
-	labels, err := parseLabelSelector(query.Get("labelSelector"))
-	if err != nil {
-		return nil, err
-	}
-	return matchAll([]func(object) bool{fields, labels}), nil
-}
-
-// parseLabelSelector turns ?labelSelector= into a test on an object's labels.
-//
-// Labels are not indexed and any of them can be selected on, which is the
-// whole difference from a field selector: the value is the client's, so the
-// server cannot have a list of the ones it will accept. The cost is a scan,
-// and that is why the syntax is richer — set membership and existence as well
-// as equality.
-//
-// This is the selector every controller in Kubernetes is built on. A Service
-// finds its pods with one, a Deployment owns its ReplicaSets by one, and
-// neither holds a list of names anywhere.
-func parseLabelSelector(raw string) (func(object) bool, error) {
-	var tests []func(object) bool
-	for _, term := range splitSelector(raw) {
-		test, err := labelRequirement(strings.TrimSpace(term))
-		if err != nil {
-			return nil, err
-		}
-		tests = append(tests, test)
-	}
-	return matchAll(tests), nil
-}
-
-// labelRequirement reads one term of a label selector.
-//
-// The forms are equality (key=value, key==value, key!=value), set membership
-// (key in (a,b), key notin (a,b)) and existence (key, !key). The two negative
-// forms — != and notin — match an object that has no such label at all, which
-// is the rule people are surprised by and the one that makes "everything not
-// in production" mean what it says.
-func labelRequirement(term string) (func(object) bool, error) {
-	if open := strings.Index(term, "("); open >= 0 {
-		head := strings.Fields(term[:open])
-		if len(head) != 2 || !strings.HasSuffix(term, ")") {
-			return nil, fmt.Errorf("invalid selector: %q", term)
-		}
-		key, op := head[0], head[1]
-		if op != "in" && op != "notin" {
-			return nil, fmt.Errorf("invalid selector: %q: expected in or notin", term)
-		}
-		set := map[string]bool{}
-		for _, value := range strings.Split(term[open+1:len(term)-1], ",") {
-			set[strings.TrimSpace(value)] = true
-		}
-		outside := op == "notin"
-		return func(obj object) bool {
-			value, ok := labelsOf(obj)[key]
-			return (ok && set[value]) != outside
-		}, nil
-	}
-	if key, negated := strings.CutPrefix(term, "!"); negated {
-		key = strings.TrimSpace(key)
-		if err := validLabelKey(key, term); err != nil {
-			return nil, err
-		}
-		return func(obj object) bool {
-			_, ok := labelsOf(obj)[key]
-			return !ok
-		}, nil
-	}
-	if !strings.ContainsAny(term, "=!") {
-		key := term
-		if err := validLabelKey(key, term); err != nil {
-			return nil, err
-		}
-		return func(obj object) bool {
-			_, ok := labelsOf(obj)[key]
-			return ok
-		}, nil
-	}
-	key, op, want, err := requirement(term)
-	if err != nil {
-		return nil, err
-	}
-	negated := op == "!="
-	return func(obj object) bool {
-		value, ok := labelsOf(obj)[key]
-		return (ok && value == want) != negated
-	}, nil
-}
-
-// validLabelKey rejects what cannot be a key, which is what an empty term and
-// a stray comma both come through as.
-func validLabelKey(key, term string) error {
-	if key == "" || strings.ContainsAny(key, " \t") {
-		return fmt.Errorf("invalid selector: %q", term)
-	}
-	return nil
-}
-
-// labelsOf reads an object's labels as strings. A label whose value is not a
-// string cannot be selected on and is not an error here: the object was stored
-// before this stage existed, and a list is not the place to complain about it.
-func labelsOf(obj object) map[string]string {
-	meta, _ := obj["metadata"].(map[string]any)
-	raw, _ := meta["labels"].(map[string]any)
-	out := make(map[string]string, len(raw))
-	for key, value := range raw {
-		if s, ok := value.(string); ok {
-			out[key] = s
-		}
-	}
-	return out
 }
 
 // parseFieldSelector turns ?fieldSelector= into a test on an object, and
@@ -930,29 +696,11 @@ func parseFieldSelector(raw string) (func(object) bool, error) {
 // splitSelector cuts a selector into its terms. The comma between them is an
 // AND, and there is no OR anywhere in this syntax: a client that wants a union
 // makes two requests.
-//
-// The commas inside a set — key in (a,b) — belong to that term, so the split
-// has to know where the parentheses are rather than cutting on every comma.
 func splitSelector(raw string) []string {
 	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
-	var terms []string
-	depth, start := 0, 0
-	for i, r := range raw {
-		switch r {
-		case '(':
-			depth++
-		case ')':
-			depth--
-		case ',':
-			if depth == 0 {
-				terms = append(terms, raw[start:i])
-				start = i + 1
-			}
-		}
-	}
-	return append(terms, raw[start:])
+	return strings.Split(raw, ",")
 }
 
 // requirement splits one term into the field, the operator and the value it is

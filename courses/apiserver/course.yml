@@ -35,3 +35,12 @@ stages:
   - slug: namespaces
     name: The object every other object is in
     difficulty: medium
+  - slug: field-selector
+    name: Only the ones that match
+    difficulty: medium
+  - slug: label-selector
+    name: The way everything finds everything
+    difficulty: medium
+  - slug: pagination
+    name: A collection too big for one answer
+    difficulty: medium

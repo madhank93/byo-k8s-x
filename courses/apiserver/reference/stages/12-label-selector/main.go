@@ -7,7 +7,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -648,17 +647,6 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 			return
 		}
 
-		limit, err := pageSize(r.URL.Query().Get("limit"))
-		if err != nil {
-			writeStatus(w, http.StatusBadRequest, "BadRequest", err.Error())
-			return
-		}
-		token, err := decodeContinue(r.URL.Query().Get("continue"))
-		if err != nil {
-			writeStatus(w, http.StatusBadRequest, "BadRequest", err.Error())
-			return
-		}
-
 		all, version := objects.list(resource, r.PathValue("namespace"))
 		items := []object{}
 		for _, obj := range all {
@@ -666,115 +654,15 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 				items = append(items, obj)
 			}
 		}
-
-		// Selecting happens before paging, always: limit is how much of the
-		// answer to send, not how much of the store to look at. A page of 10
-		// out of a collection of 10,000 that then filters down to nothing
-		// would be a client paging forever through empty answers.
-		listVersion := version
-		if token != nil {
-			if token.Version > version {
-				// A cursor into a history this server does not have. The real
-				// one answers the same way once etcd has compacted the
-				// revision the first page was read at, and the client's only
-				// move is to start the list again.
-				writeStatus(w, http.StatusGone, "Expired",
-					fmt.Sprintf("continue parameter is too old to be honoured: %d, current: %d", token.Version, version))
-				return
-			}
-			listVersion = token.Version
-			rest := []object{}
-			for _, obj := range items {
-				if objectKey(resource, obj) > token.Start {
-					rest = append(rest, obj)
-				}
-			}
-			items = rest
-		}
-
-		meta := map[string]any{"resourceVersion": strconv.FormatInt(listVersion, 10)}
-		if limit > 0 && len(items) > limit {
-			// There is more, so the answer carries the cursor to it — and
-			// only then. An empty continue on the last page is what tells a
-			// client to stop, and a client that is handed one forever pages
-			// forever.
-			meta["continue"] = continueToken{Version: listVersion, Start: objectKey(resource, items[limit-1])}.encode()
-			// A hint rather than a promise: it is what was left when this page
-			// was cut, and kubectl prints it as "(N remaining)".
-			meta["remainingItemCount"] = len(items) - limit
-			items = items[:limit]
-		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"kind":       kind,
 			"apiVersion": "v1",
 			// The list's own resourceVersion, which is not any item's: it is
-			// where a watch started from this answer would begin, and it stays
-			// the same across every page of one list.
-			"metadata": meta,
+			// where a watch started from this answer would begin.
+			"metadata": map[string]any{"resourceVersion": strconv.FormatInt(version, 10)},
 			"items":    items,
 		})
 	}
-}
-
-// continueToken is the cursor a paged list hands back: where the next page
-// starts, and the point in the store's history every page of this list
-// describes.
-//
-// It is opaque to the client on purpose. A client stores it and sends it back
-// untouched, which leaves the server free to change what is in it — the real
-// one carries this same pair, a resource version and a key, as base64 JSON.
-type continueToken struct {
-	Version int64  `json:"rv"`
-	Start   string `json:"start"`
-}
-
-func (t continueToken) encode() string {
-	// Two scalars into JSON cannot fail, and a cursor is not worth an error
-	// path that can never be taken.
-	raw, _ := json.Marshal(t)
-	return base64.RawURLEncoding.EncodeToString(raw)
-}
-
-// decodeContinue reads the cursor back, and returns nil for the first page of
-// a list, which carries none.
-//
-// Anything that is not a cursor this server made is refused. Guessing at it
-// would restart the list from the beginning, and a client paging through a
-// collection would quietly see the first page over and over.
-func decodeContinue(raw string) (*continueToken, error) {
-	if raw == "" {
-		return nil, nil
-	}
-	blob, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil {
-		return nil, fmt.Errorf("continue parameter is invalid: %w", err)
-	}
-	var token continueToken
-	if err := json.Unmarshal(blob, &token); err != nil {
-		return nil, fmt.Errorf("continue parameter is invalid: %w", err)
-	}
-	if token.Start == "" || token.Version <= 0 {
-		return nil, fmt.Errorf("continue parameter is invalid: %q", raw)
-	}
-	return &token, nil
-}
-
-// pageSize reads ?limit=, where absent means the whole collection.
-func pageSize(raw string) (int, error) {
-	if raw == "" {
-		return 0, nil
-	}
-	limit, err := strconv.Atoi(raw)
-	if err != nil || limit < 0 {
-		return 0, fmt.Errorf("limit: Invalid value: %q: must be a non-negative integer", raw)
-	}
-	return limit, nil
-}
-
-// objectKey is where a stored object sits in the key space, which is the order
-// a list comes back in and therefore the only thing a cursor can point at.
-func objectKey(resource string, obj object) string {
-	return registryKey(resource, metaString(obj, "namespace"), metaString(obj, "name"))
 }
 
 // parseSelectors builds the one test a list is narrowed by. A request can
