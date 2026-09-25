@@ -58,21 +58,8 @@ func newStore(dir string) *store { return &store{objects: map[string]object{}, d
 // holds a real cluster in: one flat key space, and the path is the query. A
 // list is a scan of everything under a prefix, which is the only kind of
 // question this store has to be able to answer quickly.
-//
-// A cluster-scoped resource — a Namespace is one — has no namespace segment,
-// which is the whole of what "cluster-scoped" means down here.
-func registryKey(resource, namespace, name string) string {
-	return listPrefix(resource, namespace) + name
-}
-
-// listPrefix is everything a list of this resource in this namespace scans,
-// and every key in the store belongs to exactly one of them. An empty
-// namespace is a list across all of them, which is what kubectl -A asks for.
-func listPrefix(resource, namespace string) string {
-	if namespace == "" {
-		return "/registry/" + resource + "/"
-	}
-	return "/registry/" + resource + "/" + namespace + "/"
+func registryKey(namespace, name string) string {
+	return "/registry/configmaps/" + namespace + "/" + name
 }
 
 // snapshot is the store as it is written down.
@@ -143,10 +130,10 @@ func (s *store) write(next map[string]object, version int64) error {
 
 // create stores an object that must not be there already, stamping it with
 // what only the server can know.
-func (s *store) create(resource, namespace, name string, obj object) (object, error) {
+func (s *store) create(namespace, name string, obj object) (object, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := registryKey(resource, namespace, name)
+	key := registryKey(namespace, name)
 	if _, ok := s.objects[key]; ok {
 		return nil, errAlreadyExists
 	}
@@ -157,9 +144,7 @@ func (s *store) create(resource, namespace, name string, obj object) (object, er
 		meta = map[string]any{}
 	}
 	meta["name"] = name
-	if namespace != "" {
-		meta["namespace"] = namespace
-	}
+	meta["namespace"] = namespace
 	meta["uid"] = newUID()
 	meta["creationTimestamp"] = time.Now().UTC().Format(time.RFC3339)
 	meta["resourceVersion"] = strconv.FormatInt(version, 10)
@@ -178,10 +163,10 @@ func (s *store) create(resource, namespace, name string, obj object) (object, er
 // The key is both halves: a name is unique inside its namespace and nowhere
 // else, so "settings" in default and "settings" in kube-system are two objects
 // that never see each other.
-func (s *store) get(resource, namespace, name string) (object, bool) {
+func (s *store) get(namespace, name string) (object, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	obj, ok := s.objects[registryKey(resource, namespace, name)]
+	obj, ok := s.objects[registryKey(namespace, name)]
 	return obj, ok
 }
 
@@ -196,34 +181,28 @@ func (s *store) get(resource, namespace, name string) (object, bool) {
 // The order is the server's to decide, and it is by name. The real thing gets
 // that order for free — etcd hands back a key range sorted — and a client that
 // prints a list relies on it being the same twice in a row.
-func (s *store) list(resource, namespace string) ([]object, int64) {
+func (s *store) list(namespace string) ([]object, int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prefix := listPrefix(resource, namespace)
-	var keys []string
-	for key := range s.objects {
-		if strings.HasPrefix(key, prefix) {
-			keys = append(keys, key)
-		}
-	}
-	// Sorted by key, which is namespace then name: the order etcd hands a
-	// range back in, and the order kubectl prints.
-	sort.Strings(keys)
 	// Not a nil slice: an empty collection has to marshal to [] rather than
 	// null, because a client reads the field before it knows it is empty.
 	items := []object{}
-	for _, key := range keys {
-		items = append(items, s.objects[key])
+	prefix := registryKey(namespace, "")
+	for key, obj := range s.objects {
+		if strings.HasPrefix(key, prefix) {
+			items = append(items, obj)
+		}
 	}
+	sort.Slice(items, func(i, j int) bool { return metaString(items[i], "name") < metaString(items[j], "name") })
 	return items, s.version
 }
 
 // update replaces an object that has to be there already, keeping the fields
 // identity is made of and refusing a write built on a version that has moved on.
-func (s *store) update(resource, namespace, name string, obj object) (object, error) {
+func (s *store) update(namespace, name string, obj object) (object, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := registryKey(resource, namespace, name)
+	key := registryKey(namespace, name)
 	old, ok := s.objects[key]
 	if !ok {
 		return nil, errNotFound
@@ -241,9 +220,7 @@ func (s *store) update(resource, namespace, name string, obj object) (object, er
 		meta = map[string]any{}
 	}
 	meta["name"] = name
-	if namespace != "" {
-		meta["namespace"] = namespace
-	}
+	meta["namespace"] = namespace
 	// Identity is the server's and is set once. A client is free to send back
 	// a uid and a creation time it invented, and the server is not free to
 	// believe either.
@@ -261,10 +238,10 @@ func (s *store) update(resource, namespace, name string, obj object) (object, er
 }
 
 // remove takes an object back out and returns it as it last was.
-func (s *store) remove(resource, namespace, name string) (object, error) {
+func (s *store) remove(namespace, name string) (object, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := registryKey(resource, namespace, name)
+	key := registryKey(namespace, name)
 	old, ok := s.objects[key]
 	if !ok {
 		return nil, errNotFound
@@ -273,45 +250,10 @@ func (s *store) remove(resource, namespace, name string) (object, error) {
 	// has to be able to place the removal after the create it already saw.
 	next := maps.Clone(s.objects)
 	delete(next, key)
-	// A namespace is not a folder, and deleting one is not a folder delete:
-	// the real cluster marks it Terminating and a controller removes what is
-	// inside it before the namespace itself goes. Here it is one write, but
-	// the rule it stands for is the same — nothing outlives the namespace it
-	// was in, or a name freed up comes back pointing at somebody's old data.
-	if resource == "namespaces" {
-		for k := range next {
-			if strings.HasPrefix(k, "/registry/configmaps/"+name+"/") {
-				delete(next, k)
-			}
-		}
-	}
 	if err := s.write(next, s.version+1); err != nil {
 		return nil, err
 	}
 	return old, nil
-}
-
-// bootstrap creates the namespaces a cluster is born with, and only when there
-// are none: a restart reads them back rather than making them again.
-//
-// default is the one every client falls back to when a kubeconfig names none,
-// so a server without it answers 404 to the simplest request there is.
-func (s *store) bootstrap() error {
-	if items, _ := s.list("namespaces", ""); len(items) > 0 {
-		return nil
-	}
-	for _, name := range []string{"default", "kube-system", "kube-public", "kube-node-lease"} {
-		_, err := s.create("namespaces", "", name, object{
-			"apiVersion": "v1",
-			"kind":       "Namespace",
-			"metadata":   map[string]any{"name": name},
-			"status":     map[string]any{"phase": "Active"},
-		})
-		if err != nil {
-			return fmt.Errorf("create the namespace %s: %w", name, err)
-		}
-	}
-	return nil
 }
 
 // currentVersion is how far the store has got, which is what a read asking for
@@ -357,9 +299,6 @@ func run() error {
 	if err := objects.load(); err != nil {
 		return err
 	}
-	if err := objects.bootstrap(); err != nil {
-		return err
-	}
 
 	mux := http.NewServeMux()
 
@@ -398,27 +337,14 @@ func run() error {
 			"kind":         "APIResourceList",
 			"apiVersion":   "v1",
 			"groupVersion": "v1",
-			"resources": []any{
-				map[string]any{
-					"name":         "configmaps",
-					"singularName": "configmap",
-					"namespaced":   true,
-					"kind":         "ConfigMap",
-					"verbs":        []string{"create", "delete", "get", "list", "update", "watch"},
-					"shortNames":   []string{"cm"},
-				},
-				// namespaced: false is the whole difference, and it is what
-				// tells a client to build /api/v1/namespaces/<name> rather
-				// than putting a namespace in front of it.
-				map[string]any{
-					"name":         "namespaces",
-					"singularName": "namespace",
-					"namespaced":   false,
-					"kind":         "Namespace",
-					"verbs":        []string{"create", "delete", "get", "list", "watch"},
-					"shortNames":   []string{"ns"},
-				},
-			},
+			"resources": []any{map[string]any{
+				"name":         "configmaps",
+				"singularName": "configmap",
+				"namespaced":   true,
+				"kind":         "ConfigMap",
+				"verbs":        []string{"create", "delete", "get", "list", "update", "watch"},
+				"shortNames":   []string{"cm"},
+			}},
 		})
 	})
 
@@ -437,16 +363,7 @@ func run() error {
 			return
 		}
 
-		// The namespace has to be there first. It is an object like any other,
-		// and writing into one that was never created leaves objects nothing
-		// will ever clean up — no quota applies to them, no delete reaches
-		// them, and nothing lists them but the namespace nobody made.
-		if _, ok := objects.get("namespaces", "", namespace); !ok {
-			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("namespaces %q not found", namespace))
-			return
-		}
-
-		stored, err := objects.create("configmaps", namespace, name, obj)
+		stored, err := objects.create(namespace, name, obj)
 		if errors.Is(err, errAlreadyExists) {
 			writeStatus(w, http.StatusConflict, "AlreadyExists",
 				fmt.Sprintf("configmaps %q already exists", name))
@@ -468,7 +385,7 @@ func run() error {
 		if !freshEnough(w, r, objects) {
 			return
 		}
-		items, version := objects.list("configmaps", r.PathValue("namespace"))
+		items, version := objects.list(r.PathValue("namespace"))
 		writeJSON(w, http.StatusOK, map[string]any{
 			"kind":       "ConfigMapList",
 			"apiVersion": "v1",
@@ -484,7 +401,7 @@ func run() error {
 			return
 		}
 		name := r.PathValue("name")
-		obj, ok := objects.get("configmaps", r.PathValue("namespace"), name)
+		obj, ok := objects.get(r.PathValue("namespace"), name)
 		if !ok {
 			// The name goes in the message because a person reads that, and
 			// the reason goes in the object because a program branches on it.
@@ -510,7 +427,7 @@ func run() error {
 			return
 		}
 
-		stored, err := objects.update("configmaps", namespace, name, obj)
+		stored, err := objects.update(namespace, name, obj)
 		switch {
 		case errors.Is(err, errNotFound):
 			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("configmaps %q not found", name))
@@ -532,7 +449,7 @@ func run() error {
 
 	mux.HandleFunc("DELETE /api/v1/namespaces/{namespace}/configmaps/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
-		removed, err := objects.remove("configmaps", r.PathValue("namespace"), name)
+		removed, err := objects.remove(r.PathValue("namespace"), name)
 		if err != nil && !errors.Is(err, errNotFound) {
 			writeStatus(w, http.StatusInternalServerError, "InternalError", "the object could not be removed: "+err.Error())
 			return
@@ -549,93 +466,6 @@ func run() error {
 		// with a Status saying Success instead; both say the delete happened,
 		// and an empty body says nothing.
 		writeJSON(w, http.StatusOK, removed)
-	})
-
-	// Namespaces are cluster-scoped: no namespace in their URLs, because they
-	// are what a namespace in a URL refers to.
-	mux.HandleFunc("POST /api/v1/namespaces", func(w http.ResponseWriter, r *http.Request) {
-		obj, ok := decodeObject(w, r, "")
-		if !ok {
-			return
-		}
-		name := metaString(obj, "name")
-		if name == "" {
-			writeStatus(w, http.StatusUnprocessableEntity, "Invalid", "Namespace in version \"v1\" cannot be handled: metadata.name is required")
-			return
-		}
-		obj["apiVersion"], obj["kind"] = "v1", "Namespace"
-		// Active is the only phase this server has. The real one also has
-		// Terminating, which is a namespace that has been deleted and whose
-		// contents are still being removed — writes into it are refused for
-		// as long as it lasts.
-		obj["status"] = map[string]any{"phase": "Active"}
-
-		stored, err := objects.create("namespaces", "", name, obj)
-		if errors.Is(err, errAlreadyExists) {
-			writeStatus(w, http.StatusConflict, "AlreadyExists", fmt.Sprintf("namespaces %q already exists", name))
-			return
-		}
-		if err != nil {
-			writeStatus(w, http.StatusInternalServerError, "InternalError", "the object could not be stored: "+err.Error())
-			return
-		}
-		writeJSON(w, http.StatusCreated, stored)
-	})
-
-	mux.HandleFunc("GET /api/v1/namespaces", func(w http.ResponseWriter, r *http.Request) {
-		if !freshEnough(w, r, objects) {
-			return
-		}
-		items, version := objects.list("namespaces", "")
-		writeJSON(w, http.StatusOK, map[string]any{
-			"kind":       "NamespaceList",
-			"apiVersion": "v1",
-			"metadata":   map[string]any{"resourceVersion": strconv.FormatInt(version, 10)},
-			"items":      items,
-		})
-	})
-
-	mux.HandleFunc("GET /api/v1/namespaces/{name}", func(w http.ResponseWriter, r *http.Request) {
-		if !freshEnough(w, r, objects) {
-			return
-		}
-		name := r.PathValue("name")
-		obj, ok := objects.get("namespaces", "", name)
-		if !ok {
-			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("namespaces %q not found", name))
-			return
-		}
-		writeJSON(w, http.StatusOK, obj)
-	})
-
-	mux.HandleFunc("DELETE /api/v1/namespaces/{name}", func(w http.ResponseWriter, r *http.Request) {
-		name := r.PathValue("name")
-		removed, err := objects.remove("namespaces", "", name)
-		if errors.Is(err, errNotFound) {
-			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("namespaces %q not found", name))
-			return
-		}
-		if err != nil {
-			writeStatus(w, http.StatusInternalServerError, "InternalError", "the object could not be removed: "+err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, removed)
-	})
-
-	// The same resource with no namespace in the path: every configmap in the
-	// cluster, which is what kubectl get cm -A asks for. A client tells the
-	// two URLs apart from discovery alone.
-	mux.HandleFunc("GET /api/v1/configmaps", func(w http.ResponseWriter, r *http.Request) {
-		if !freshEnough(w, r, objects) {
-			return
-		}
-		items, version := objects.list("configmaps", "")
-		writeJSON(w, http.StatusOK, map[string]any{
-			"kind":       "ConfigMapList",
-			"apiVersion": "v1",
-			"metadata":   map[string]any{"resourceVersion": strconv.FormatInt(version, 10)},
-			"items":      items,
-		})
 	})
 
 	// Anything this server does not serve is a 404 carrying a Status, not an
@@ -684,7 +514,7 @@ func freshEnough(w http.ResponseWriter, r *http.Request, s *store) bool {
 	}
 	if current := s.currentVersion(); want > current {
 		// The client is describing a write this server has not made. In a real
-		// cluster it may have read that version from another apiserver a
+		// cluster it may have read that number from another apiserver a
 		// moment ago, so the answer is "ask again", not "you are mistaken".
 		writeStatus(w, http.StatusGatewayTimeout, "Timeout",
 			fmt.Sprintf("Too large resource version: %d, current: %d", want, current))

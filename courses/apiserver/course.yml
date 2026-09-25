@@ -26,3 +26,12 @@ stages:
   - slug: delete
     name: Taking it back out
     difficulty: medium
+  - slug: etcd
+    name: The part that survives a restart
+    difficulty: medium
+  - slug: resourceversion
+    name: How fresh an answer has to be
+    difficulty: medium
+  - slug: namespaces
+    name: The object every other object is in
+    difficulty: medium
