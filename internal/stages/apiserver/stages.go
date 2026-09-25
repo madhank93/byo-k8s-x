@@ -54,6 +54,9 @@ func init() {
 	register(Stage{Slug: "field-selector", Run: stageFieldSelector})
 	register(Stage{Slug: "label-selector", Run: stageLabelSelector})
 	register(Stage{Slug: "pagination", Run: stagePagination})
+	register(Stage{Slug: "watch", Run: stageWatch})
+	register(Stage{Slug: "watch-from-rv", Run: stageWatchFromRV})
+	register(Stage{Slug: "bookmarks", Run: stageBookmarks})
 }
 
 // stageServe checks the program serves HTTP where it was told to, says it is
@@ -1509,6 +1512,594 @@ func (s *server) getJSON(ctx context.Context, path string) (map[string]any, erro
 		return nil, fmt.Errorf("GET %s did not answer JSON (%w)\nthe body was:\n%s", path, err, tail(string(body)))
 	}
 	return obj, nil
+}
+
+// stageWatch checks the endpoint the rest of Kubernetes is built on: one
+// request that stays open and reports every change as it happens.
+//
+// Every controller, the scheduler, the kubelet and kube-proxy are a cache
+// filled from one of these and kept in step by it. Nothing polls, which is the
+// only reason a cluster of any size works — and it is why the two things
+// graded hardest here are that the events are written as they happen rather
+// than when a buffer fills, and that an open watch does not stop the server
+// answering anybody else.
+func stageWatch(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	const path = "/api/v1/namespaces/default/configmaps"
+	configmap := func(name string, labels map[string]any) map[string]any {
+		meta := map[string]any{"name": name}
+		if labels != nil {
+			meta["labels"] = labels
+		}
+		return map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta, "data": map[string]any{"colour": "blue"}}
+	}
+
+	// Stored before anyone is watching, so it can only reach the watch as the
+	// state it starts from.
+	if _, err := srv.create(ctx, path, configmap("alpha", nil)); err != nil {
+		return err
+	}
+
+	w, err := srv.watch(ctx, path+"?watch=true")
+	if err != nil {
+		return fmt.Errorf("%w\n\na watch is the list URL with ?watch=true on it: same resource, same namespace, a different shape of answer", err)
+	}
+	defer w.stop()
+
+	// A watch that was told nothing about what the client already has starts
+	// by telling it everything: the state when the watch opened, as ADDED.
+	kind, obj, err := w.next(ctx, "the state the watch starts from")
+	if err != nil {
+		return err
+	}
+	if kind != "ADDED" || metaField(obj, "name") != "alpha" {
+		return fmt.Errorf("the first event on a watch with no resourceVersion was %s %s, and it is ADDED alpha: a client that said nothing about what it has holds nothing, so everything already stored is new to it",
+			kind, metaField(obj, "name"))
+	}
+	// Whole objects, not names: a client builds its entire cache out of these
+	// and never gets an object individually.
+	for _, field := range []string{"uid", "resourceVersion"} {
+		if metaField(obj, field) == "" {
+			return fmt.Errorf("the object in the ADDED event has no metadata.%s: the object in an event is the stored object, complete", field)
+		}
+	}
+	firstVersion := metaField(obj, "resourceVersion")
+
+	// The three kinds of change, in the order they were made.
+	if _, err := srv.create(ctx, path, configmap("beta", nil)); err != nil {
+		return err
+	}
+	if err := w.want(ctx, "ADDED", "beta"); err != nil {
+		return err
+	}
+
+	res, body, err := srv.send(ctx, http.MethodPut, path+"/alpha", configmap("alpha", nil))
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PUT %s/alpha answered %d rather than 200\nthe body was:\n%s", path, res.StatusCode, tail(string(body)))
+	}
+	kind, obj, err = w.next(ctx, "MODIFIED alpha")
+	if err != nil {
+		return err
+	}
+	if kind != "MODIFIED" || metaField(obj, "name") != "alpha" {
+		return fmt.Errorf("an update sent %s %s, and a write to an object that was already there is MODIFIED: a client that is told ADDED twice for one object has no way to know whether it missed a delete",
+			kind, metaField(obj, "name"))
+	}
+	if metaField(obj, "resourceVersion") == firstVersion {
+		return fmt.Errorf("the MODIFIED event carries resourceVersion %q, the same as the ADDED event before it: the object in an event is the object as it now is, and its version is the one that write got",
+			firstVersion)
+	}
+
+	if res, body, err = srv.send(ctx, http.MethodDelete, path+"/beta", nil); err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("DELETE %s/beta answered %d rather than 200\nthe body was:\n%s", path, res.StatusCode, tail(string(body)))
+	}
+	kind, obj, err = w.next(ctx, "DELETED beta")
+	if err != nil {
+		return err
+	}
+	if kind != "DELETED" || metaField(obj, "name") != "beta" {
+		return fmt.Errorf("a delete sent %s %s, and it is DELETED beta carrying the object as it last was: a client is told what went, not that something went",
+			kind, metaField(obj, "name"))
+	}
+
+	// A write somewhere else in the cluster. A watch is scoped like the list
+	// it was opened on, so this one must not see it — and the write after it,
+	// in the watched namespace, is what proves the stream is still live rather
+	// than simply slow.
+	if _, err := srv.create(ctx, "/api/v1/namespaces/kube-public/configmaps", configmap("elsewhere", nil)); err != nil {
+		return err
+	}
+	if _, err := srv.create(ctx, path, configmap("gamma", nil)); err != nil {
+		return err
+	}
+	kind, obj, err = w.next(ctx, "ADDED gamma")
+	if err != nil {
+		return err
+	}
+	if metaField(obj, "name") == "elsewhere" {
+		return fmt.Errorf("a watch on %s was sent the object elsewhere, which was created in kube-public: a watch is scoped exactly like the list it was opened on, and a client subscribed to one namespace that receives the cluster is the failure this endpoint exists to avoid",
+			path)
+	}
+	if kind != "ADDED" || metaField(obj, "name") != "gamma" {
+		return fmt.Errorf("the next event was %s %s rather than ADDED gamma", kind, metaField(obj, "name"))
+	}
+
+	// The server is still a server. A watch that is holding a lock the writes
+	// need, or a process that serves one request at a time, fails here.
+	if _, _, err := srv.names(ctx, path); err != nil {
+		return fmt.Errorf("%w\n\nthis list was made while a watch was open on the same collection: an open watch must not stop the server answering anything else, and a lock held for the life of a stream stops everything", err)
+	}
+
+	// Selectors narrow a watch exactly as they narrow a list. This is what
+	// makes the kubelet's watch proportional to its node rather than to the
+	// cluster.
+	//
+	// Nothing matches this selector yet, so the watch opens with nothing to
+	// send — and it still has to open. This is where a server that leaves its
+	// header in Go's buffer until the first event is caught: every client of
+	// it blocks on a response that has not started.
+	selected, err := srv.watch(ctx, path+"?watch=true&labelSelector="+url.QueryEscape("app=web"))
+	if err != nil {
+		return err
+	}
+	defer selected.stop()
+	if _, err := srv.create(ctx, path, configmap("unlabelled", nil)); err != nil {
+		return err
+	}
+	if _, err := srv.create(ctx, path, configmap("labelled", map[string]any{"app": "web"})); err != nil {
+		return err
+	}
+	kind, obj, err = selected.next(ctx, "ADDED labelled")
+	if err != nil {
+		return err
+	}
+	if metaField(obj, "name") != "labelled" {
+		return fmt.Errorf("a watch with labelSelector=app=web was sent %s %s: the selectors on a watch are the selectors on a list, applied to every event before it is written",
+			kind, metaField(obj, "name"))
+	}
+	return nil
+}
+
+// stageWatchFromRV checks the half of a watch that makes a cache possible: a
+// client saying what it already has, and being told only what changed since.
+//
+// List, then watch from that list's own resourceVersion. Nothing repeated,
+// nothing missed, and no window in between — this pair is every informer in
+// Kubernetes, and the list carried a version of its own from stage 5 onwards
+// for exactly this moment.
+func stageWatchFromRV(ctx context.Context, _ *kube.Env, bin string) error {
+	dir, err := os.MkdirTemp("", "byok8s-apiserver-*")
+	if err != nil {
+		return fmt.Errorf("make a directory for the store: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	const path = "/api/v1/namespaces/default/configmaps"
+	configmap := func(name string) map[string]any {
+		return map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   map[string]any{"name": name},
+			"data":       map[string]any{"colour": "blue"},
+		}
+	}
+
+	var oldVersion string
+	err = func() error {
+		srv, cleanup, err := serve(ctx, bin, "-data", dir)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+
+		for _, name := range []string{"alpha", "beta"} {
+			if _, err := srv.create(ctx, path, configmap(name)); err != nil {
+				return err
+			}
+		}
+		// The list a client builds its cache from, and the version that list
+		// describes. Everything after this point is what a watch resuming
+		// from it has to be told.
+		_, list, err := srv.names(ctx, path)
+		if err != nil {
+			return err
+		}
+		version := metaField(list, "resourceVersion")
+		oldVersion = version
+
+		if _, err := srv.create(ctx, path, configmap("gamma")); err != nil {
+			return err
+		}
+		if res, body, err := srv.send(ctx, http.MethodPut, path+"/alpha", configmap("alpha")); err != nil {
+			return err
+		} else if res.StatusCode != http.StatusOK {
+			return fmt.Errorf("PUT %s/alpha answered %d rather than 200\nthe body was:\n%s", path, res.StatusCode, tail(string(body)))
+		}
+		if res, body, err := srv.send(ctx, http.MethodDelete, path+"/beta", nil); err != nil {
+			return err
+		} else if res.StatusCode != http.StatusOK {
+			return fmt.Errorf("DELETE %s/beta answered %d rather than 200\nthe body was:\n%s", path, res.StatusCode, tail(string(body)))
+		}
+
+		// Three changes happened after that list. A watch resuming from it
+		// gets those three, in order, and nothing else: alpha and beta were
+		// in the list, so re-sending them as ADDED would have the client
+		// treat objects it is already caching as new.
+		w, err := srv.watch(ctx, path+"?watch=true&resourceVersion="+url.QueryEscape(version))
+		if err != nil {
+			return fmt.Errorf("%w\n\nthe resourceVersion on a watch is the one the list answered with: it is what the client has, and the watch is everything after it", err)
+		}
+		defer w.stop()
+		for _, want := range []struct{ kind, name string }{
+			{"ADDED", "gamma"}, {"MODIFIED", "alpha"}, {"DELETED", "beta"},
+		} {
+			kind, obj, err := w.next(ctx, want.kind+" "+want.name)
+			if err != nil {
+				return fmt.Errorf("%w\n\nthree changes were made after the list this watch resumed from: gamma created, alpha updated, beta deleted", err)
+			}
+			if kind != want.kind || metaField(obj, "name") != want.name {
+				return fmt.Errorf("a watch resumed from the list's resourceVersion sent %s %s where %s %s was expected: a resuming watch replays the changes since that version, in the order they were made, and sends no synthetic ADDED for what the client already had",
+					kind, metaField(obj, "name"), want.kind, want.name)
+			}
+		}
+
+		// Caught up, and then live: the replay runs into the stream with no
+		// gap between them.
+		if _, err := srv.create(ctx, path, configmap("delta")); err != nil {
+			return err
+		}
+		if err := w.want(ctx, "ADDED", "delta"); err != nil {
+			return fmt.Errorf("%w\n\nafter the missed changes have been replayed the same connection carries the live ones: a client that had to reconnect for those would have a window it sees nothing through", err)
+		}
+
+		// resourceVersion=0 is not version zero. It means "whatever you have
+		// already, and do not make me wait for it", so the current state
+		// comes back as ADDED just as it does with no version at all.
+		zero, err := srv.watch(ctx, path+"?watch=true&resourceVersion=0")
+		if err != nil {
+			return err
+		}
+		defer zero.stop()
+		// The state is alpha, delta and gamma — beta was deleted — so those
+		// three arrive as ADDED and nothing else does. A server that read the
+		// 0 as a version to resume after would replay the history instead,
+		// and the client would be told about beta, which no longer exists.
+		for _, want := range []string{"alpha", "delta", "gamma"} {
+			kind, obj, err := zero.next(ctx, "ADDED "+want)
+			if err != nil {
+				return fmt.Errorf("%w\n\nresourceVersion=0 on a watch is the one value that is not a version: it says the client has nothing and will take the state as it is, which is how an informer does its cheap first pass", err)
+			}
+			if kind != "ADDED" || metaField(obj, "name") != want {
+				return fmt.Errorf("a watch with resourceVersion=0 sent %s %s where ADDED %s was expected: 0 means \"I have nothing, send me what there is\" — not \"resume after version zero\", which would replay every change ever made including the delete of an object that is gone",
+					kind, metaField(obj, "name"), want)
+			}
+		}
+
+		// A version this server has never reached. It may have come from
+		// another apiserver a moment ago, so the answer is "ask again", not
+		// "you are mistaken" — the same 504 a read gets in stage 9.
+		res, body, err := srv.send(ctx, http.MethodGet, path+"?watch=true&resourceVersion=999999", nil)
+		if err != nil {
+			return err
+		}
+		if err := wantStatus("a watch from resourceVersion=999999", res, body, http.StatusGatewayTimeout, "Timeout"); err != nil {
+			return err
+		}
+		return nil
+	}()
+	if err != nil {
+		return err
+	}
+
+	// A restart. The objects were written down; the changes were not, so
+	// nothing before this process started can be replayed.
+	srv, cleanup, err := serve(ctx, bin, "-data", dir)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// The version a client held from before the restart is now too old. This
+	// is the error every informer in Kubernetes is written to handle — the
+	// real server gives it once etcd has compacted the revision away, and a
+	// client that gets it throws its cache away, lists, and watches from
+	// there. Answering it with the current state instead is the dangerous
+	// failure: the client would believe it had missed nothing.
+	res, body, err := srv.send(ctx, http.MethodGet, path+"?watch=true&resourceVersion="+url.QueryEscape(oldVersion), nil)
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("a watch resumed from a version from before the restart", res, body, http.StatusGone, "Expired"); err != nil {
+		return fmt.Errorf("%w\n\nthe store came back from disk but the history of changes did not, so this version can no longer be caught up from: 410 Gone with reason Expired is how a client is told to list again, and it is the one answer that cannot be faked by sending the current state",
+			err)
+	}
+
+	// The server itself is fine, and a watch that asks for nothing in
+	// particular still works after the restart.
+	w, err := srv.watch(ctx, path+"?watch=true")
+	if err != nil {
+		return err
+	}
+	defer w.stop()
+	if _, _, err := w.next(ctx, "the state the watch starts from"); err != nil {
+		return fmt.Errorf("%w\n\na watch with no resourceVersion still starts from the current state after a restart: only resuming from a version older than this process is refused", err)
+	}
+	return nil
+}
+
+// stageBookmarks checks the event that carries no object: a periodic "you have
+// seen everything up to here" for a watch where nothing is happening.
+//
+// Without it, a client watching a quiet resource holds a resourceVersion that
+// ages while the cluster moves on around it. When it eventually reconnects,
+// that version has fallen off the end of the history and the answer is 410 and
+// a full relist — of everything, by every idle watcher, at once. A bookmark is
+// a few bytes that stop that.
+//
+// The interval is this course's own: a server here sends one within five
+// seconds of the store moving. The real one is roughly a minute, jittered.
+func stageBookmarks(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	const path = "/api/v1/namespaces/default/configmaps"
+	configmap := func(name string) map[string]any {
+		return map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   map[string]any{"name": name},
+		}
+	}
+	if _, err := srv.create(ctx, path, configmap("alpha")); err != nil {
+		return err
+	}
+
+	w, err := srv.watch(ctx, path+"?watch=true&allowWatchBookmarks=true")
+	if err != nil {
+		return err
+	}
+	defer w.stop()
+	kind, obj, err := w.next(ctx, "the state the watch starts from")
+	if err != nil {
+		return err
+	}
+	if kind != "ADDED" {
+		return fmt.Errorf("the first event was %s rather than ADDED: allowing bookmarks does not change how a watch starts", kind)
+	}
+	seen := metaField(obj, "resourceVersion")
+
+	// Writes this watch will never be told about: a different namespace, so
+	// the store's version climbs and this client hears nothing.
+	for _, name := range []string{"one", "two", "three"} {
+		if _, err := srv.create(ctx, "/api/v1/namespaces/kube-public/configmaps", configmap(name)); err != nil {
+			return err
+		}
+	}
+
+	kind, obj, err = w.next(ctx, "a BOOKMARK")
+	if err != nil {
+		return fmt.Errorf("%w\n\nthree objects were created elsewhere in the cluster while this watch was idle, and a client that allowed bookmarks is told how far the store has got: a server here sends one within five seconds of the store moving past what this watch has been sent",
+			err)
+	}
+	if kind != "BOOKMARK" {
+		return fmt.Errorf("the next event on an idle watch was %s %s, and it should be a BOOKMARK: the writes were in another namespace, so this watch must not be sent them — a watch that leaks objects from outside its scope is the failure stage 14 graded",
+			kind, metaField(obj, "name"))
+	}
+	if name := metaField(obj, "name"); name != "" {
+		return fmt.Errorf("the BOOKMARK carried an object named %q, and a bookmark has no object: it is a resourceVersion and nothing else — the promise that everything up to that number has been sent, not a change to anything",
+			name)
+	}
+	version := metaField(obj, "resourceVersion")
+	if version == "" {
+		return fmt.Errorf("the BOOKMARK has no metadata.resourceVersion, which is the only thing it carries and the only reason it exists: a client stores it and resumes from it after a reconnect")
+	}
+	// Compared as numbers: "10" is less than "9" as text, and a version is a
+	// counter whatever the wire says.
+	ahead, err1 := strconv.ParseInt(version, 10, 64)
+	behind, err2 := strconv.ParseInt(seen, 10, 64)
+	if err1 != nil || err2 != nil {
+		return fmt.Errorf("a resourceVersion of %q or %q is not a number: it is a string on the wire and opaque to clients, but this server's own are the store's counter", version, seen)
+	}
+	if ahead <= behind {
+		return fmt.Errorf("the BOOKMARK carries resourceVersion %q where the last event carried %q: a bookmark says how far the store has got, so it is ahead of everything this watch has been sent",
+			version, seen)
+	}
+	if obj["kind"] != "ConfigMap" {
+		return fmt.Errorf("the BOOKMARK's object has kind %v, and it is the kind being watched — ConfigMap here: a client decodes it like any other event", obj["kind"])
+	}
+
+	// Still a watch. The bookmarks run alongside the events rather than
+	// instead of them.
+	if _, err := srv.create(ctx, path, configmap("beta")); err != nil {
+		return err
+	}
+	for {
+		kind, obj, err = w.next(ctx, "ADDED beta")
+		if err != nil {
+			return err
+		}
+		if kind == "BOOKMARK" {
+			continue
+		}
+		if kind != "ADDED" || metaField(obj, "name") != "beta" {
+			return fmt.Errorf("after a bookmark the watch sent %s %s rather than ADDED beta: bookmarks are sent between events, not instead of them", kind, metaField(obj, "name"))
+		}
+		break
+	}
+
+	// A client that did not ask for bookmarks must never be sent one. Its
+	// library does not know the type, and an event it cannot decode is worse
+	// than no event at all — which is why this is opt-in rather than on.
+	plain, err := srv.watch(ctx, path+"?watch=true")
+	if err != nil {
+		return err
+	}
+	defer plain.stop()
+	for _, want := range []string{"alpha", "beta"} {
+		if err := plain.want(ctx, "ADDED", want); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{"four", "five"} {
+		if _, err := srv.create(ctx, "/api/v1/namespaces/kube-public/configmaps", configmap(name)); err != nil {
+			return err
+		}
+	}
+	// Long enough that a server sending bookmarks to everybody would have
+	// sent this watch one by now. The next thing it hears is the next write
+	// in its own namespace.
+	time.Sleep(6 * time.Second)
+	if _, err := srv.create(ctx, path, configmap("gamma")); err != nil {
+		return err
+	}
+	kind, obj, err = plain.next(ctx, "ADDED gamma")
+	if err != nil {
+		return err
+	}
+	if kind == "BOOKMARK" {
+		return fmt.Errorf("a watch that did not send allowWatchBookmarks=true was sent a BOOKMARK: bookmarks are opt-in, and a client whose decoder does not know the type sees an event it cannot read")
+	}
+	if kind != "ADDED" || metaField(obj, "name") != "gamma" {
+		return fmt.Errorf("the next event on the plain watch was %s %s rather than ADDED gamma", kind, metaField(obj, "name"))
+	}
+	return nil
+}
+
+// watchStream is one open watch, decoded event by event in the background so
+// a stage can say "the next thing that happens should be this, within a few
+// seconds" rather than blocking for ever on a server that sends nothing.
+type watchStream struct {
+	events chan map[string]any
+	fail   chan error
+	cancel context.CancelFunc
+	body   io.Closer
+	path   string
+}
+
+// watch opens a watch and insists it starts: the status and the headers come
+// back before the first event, because the client is waiting to learn the
+// watch is open rather than queued behind something.
+func (s *server) watch(ctx context.Context, path string) (*watchStream, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url+path, nil)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	// No client timeout: a watch that answered and then went quiet is correct,
+	// and the context is what closes this one. The opening of it is bounded
+	// separately, below, because a program that never flushes its header
+	// leaves this call blocked for ever rather than failing.
+	type opened struct {
+		res *http.Response
+		err error
+	}
+	answer := make(chan opened, 1)
+	go func() {
+		res, err := (&http.Client{}).Do(req)
+		answer <- opened{res, err}
+	}()
+	var res *http.Response
+	select {
+	case got := <-answer:
+		res, err = got.res, got.err
+	case <-time.After(30 * time.Second):
+		cancel()
+		return nil, fmt.Errorf("GET %s did not answer within 30s: a watch sends its status and headers as soon as it is open, before any event — Go holds the header back until the response is flushed, so a watch that writes nothing until the first change leaves every client waiting on a response that has not started\nthe program said:\n%s",
+			path, tail(s.p.Stdout()))
+	}
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("GET %s: %w\nthe program said:\n%s", path, err, tail(s.p.Stdout()))
+	}
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<16))
+		res.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("GET %s answered %d rather than 200: a watch answers its status straight away, and only then starts sending events\nthe body was:\n%s",
+			path, res.StatusCode, tail(string(body)))
+	}
+	if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		res.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("GET %s answered Content-Type %q, and a watch is a stream of JSON events", path, ct)
+	}
+
+	w := &watchStream{events: make(chan map[string]any, 64), fail: make(chan error, 1), cancel: cancel, body: res.Body, path: path}
+	go func() {
+		defer close(w.events)
+		dec := json.NewDecoder(res.Body)
+		for {
+			var event map[string]any
+			if err := dec.Decode(&event); err != nil {
+				w.fail <- err
+				return
+			}
+			w.events <- event
+		}
+	}()
+	return w, nil
+}
+
+// next waits for one event and reports its type and object. The wait is
+// generous because what is being graded is that the event arrives at all, and
+// short enough that a watch which never sends is a failure rather than a hang.
+func (w *watchStream) next(ctx context.Context, what string) (string, map[string]any, error) {
+	select {
+	case event, open := <-w.events:
+		if !open {
+			return "", nil, fmt.Errorf("the watch on %s ended while waiting for %s: %v\n\nan open watch stays open — a server that answers the request and closes it has turned a watch into an expensive get",
+				w.path, what, <-w.fail)
+		}
+		kind, _ := event["type"].(string)
+		obj, _ := event["object"].(map[string]any)
+		if kind == "" || obj == nil {
+			return "", nil, fmt.Errorf("the watch on %s sent %v, and an event is {\"type\": ..., \"object\": ...}: the type is ADDED, MODIFIED, DELETED or BOOKMARK, and the object is the whole object as it now is",
+				w.path, event)
+		}
+		return kind, obj, nil
+	case <-time.After(20 * time.Second):
+		return "", nil, fmt.Errorf("nothing arrived on the watch on %s within 20s, waiting for %s: an event has to be written and flushed as it happens — one left in a buffer until the buffer fills is an event the client has not been told about",
+			w.path, what)
+	case <-ctx.Done():
+		return "", nil, ctx.Err()
+	}
+}
+
+// want reads the next event and insists it is the one expected.
+func (w *watchStream) want(ctx context.Context, kind, name string) error {
+	what := fmt.Sprintf("%s %s", kind, name)
+	gotKind, obj, err := w.next(ctx, what)
+	if err != nil {
+		return err
+	}
+	if gotKind != kind || metaField(obj, "name") != name {
+		return fmt.Errorf("the watch on %s sent %s %s where %s was expected: the events are the writes, in the order the store applied them",
+			w.path, gotKind, metaField(obj, "name"), what)
+	}
+	return nil
+}
+
+// stop closes the watch, which is how a client leaves: the request is
+// cancelled and the server notices.
+func (w *watchStream) stop() {
+	w.cancel()
+	w.body.Close()
 }
 
 // names reads a collection and returns what is in it, in the order the server

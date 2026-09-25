@@ -53,16 +53,7 @@ type store struct {
 	dir      string // where the store is kept; empty keeps it in memory only
 	watchers map[int]chan watchEvent
 	nextID   int
-	history  []watchEvent // recent changes, for a watch that resumes
-	floor    int64        // the oldest version a watch can still resume from
 }
-
-// historyLimit is how far back a resuming watch can reach. It is the whole of
-// what this server remembers, and the real one's answer is the same shape:
-// etcd keeps a few minutes of revisions and compacts the rest, which is why a
-// client that goes away for too long is told to start again rather than served
-// a gap.
-const historyLimit = 1000
 
 func newStore(dir string) *store {
 	return &store{objects: map[string]object{}, dir: dir, watchers: map[int]chan watchEvent{}}
@@ -79,49 +70,23 @@ type watchEvent struct {
 	Version   int64
 }
 
-// watcher is one open watch: the live channel, and whatever the client has to
-// be told before it starts.
-type watcher struct {
-	id      int
-	events  chan watchEvent
-	version int64        // where the store stood when the watch opened
-	initial []object     // the state to send as ADDED — empty for a resuming watch
-	replay  []watchEvent // the changes the client missed, oldest first
-}
-
-// watchFrom opens a watch and works out what it starts from, under one lock.
+// watchFrom opens a watch and takes the snapshot it starts from under the same
+// lock.
 //
 // Both halves together or neither: a snapshot taken before the watcher is
 // registered misses whatever is written in between, and one taken after it
 // shows an object that is also about to arrive as an event. Holding the lock
 // across the pair is what makes "everything now, then everything after" true.
-//
-// since is the resourceVersion the client already has, or -1 for a client that
-// has nothing and wants the current state first.
-func (s *store) watchFrom(resource, namespace string, since int64) (*watcher, error) {
+func (s *store) watchFrom(resource, namespace string) (int, chan watchEvent, []object, int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if since >= 0 && since < s.floor {
-		// The client is asking to resume from a point this server can no
-		// longer describe. Serving it from the current state would leave it
-		// believing it had missed nothing, so it is told to start again.
-		return nil, errExpired
-	}
 	s.nextID++
+	id := s.nextID
 	// Buffered, because a write must not wait on a client's socket. A watcher
 	// that fills it is disconnected rather than allowed to hold up the server.
-	w := &watcher{id: s.nextID, events: make(chan watchEvent, 64), version: s.version}
-	s.watchers[w.id] = w.events
-	if since < 0 {
-		w.initial = s.locked(resource, namespace)
-		return w, nil
-	}
-	for _, event := range s.history {
-		if event.Version > since {
-			w.replay = append(w.replay, event)
-		}
-	}
-	return w, nil
+	events := make(chan watchEvent, 64)
+	s.watchers[id] = events
+	return id, events, s.locked(resource, namespace), s.version
 }
 
 // unwatch closes a watch, which is what every handler does on its way out.
@@ -138,14 +103,6 @@ func (s *store) unwatch(id int) {
 // lock, by the write that made the change, so watchers see writes in the order
 // the store applied them.
 func (s *store) publish(event watchEvent) {
-	s.history = append(s.history, event)
-	if len(s.history) > historyLimit {
-		drop := len(s.history) - historyLimit
-		// What is dropped is what can no longer be replayed, so the floor
-		// rises to the last change forgotten.
-		s.floor = s.history[drop-1].Version
-		s.history = append([]watchEvent(nil), s.history[drop:]...)
-	}
 	for id, events := range s.watchers {
 		select {
 		case events <- event:
@@ -214,11 +171,6 @@ func (s *store) load() error {
 		s.objects = snap.Objects
 	}
 	s.version = snap.Version
-	// Nothing that happened before this process started can be replayed: the
-	// objects were written down, the changes were not. A watch resuming from
-	// anything older than this is told so rather than handed a gap, which is
-	// the same answer the real server gives after a compaction.
-	s.floor = s.version
 	return nil
 }
 
@@ -461,7 +413,6 @@ var (
 	errAlreadyExists = errors.New("already exists")
 	errNotFound      = errors.New("not found")
 	errConflict      = errors.New("the object has been modified")
-	errExpired       = errors.New("too old resource version")
 )
 
 // newUID is the identity the server gives an object, and the reason a name
@@ -780,7 +731,7 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 		// it is the same URL with a flag on it — same resource, same
 		// namespace, same selectors, a different shape of answer.
 		if watching(r) {
-			streamWatch(w, r, objects, resource, kind, selected)
+			streamWatch(w, r, objects, resource, selected)
 			return
 		}
 
@@ -867,31 +818,10 @@ func watching(r *http.Request) bool {
 // controller, the scheduler, the kubelet and kube-proxy are all a cache filled
 // from one of these and kept in step by it — nothing polls, and that is the
 // only reason a cluster of any size works at all.
-func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resource, kind string, selected func(object) bool) {
+func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resource string, selected func(object) bool) {
 	namespace := r.PathValue("namespace")
-	// The version the client says it already has. Absent and 0 both mean "I
-	// have nothing" — 0 is not version zero, it is "whatever you have
-	// already, and do not make me wait for it".
-	since := int64(-1)
-	if raw := r.URL.Query().Get("resourceVersion"); raw != "" && raw != "0" {
-		// freshEnough has already refused anything that is not a number, or
-		// that is ahead of this server.
-		since, _ = strconv.ParseInt(raw, 10, 64)
-	}
-	watch, err := objects.watchFrom(resource, namespace, since)
-	if errors.Is(err, errExpired) {
-		// The error every informer is written to handle: its cache is too old
-		// to be caught up, so it throws the cache away, lists again, and
-		// watches from that list's version.
-		writeStatus(w, http.StatusGone, "Expired",
-			fmt.Sprintf("too old resource version: %d", since))
-		return
-	}
-	if err != nil {
-		writeStatus(w, http.StatusInternalServerError, "InternalError", "the watch could not be opened: "+err.Error())
-		return
-	}
-	defer objects.unwatch(watch.id)
+	id, events, initial, _ := objects.watchFrom(resource, namespace)
+	defer objects.unwatch(id)
 
 	// 200 and the headers go out before anything has happened, because the
 	// client is waiting to learn the watch is open. Nothing here sets a
@@ -908,8 +838,8 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 	// a response that never starts — a watch that has nothing to say yet is
 	// still an open watch.
 	flusher.Flush()
-	send := func(eventType string, obj object) bool {
-		raw, err := json.Marshal(map[string]any{"type": eventType, "object": obj})
+	send := func(kind string, obj object) bool {
+		raw, err := json.Marshal(map[string]any{"type": kind, "object": obj})
 		if err != nil {
 			return false
 		}
@@ -926,72 +856,19 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 
 	// The state as it was when the watch opened, as ADDED events. A watch with
 	// no resourceVersion says "I have nothing", so everything there is, is new
-	// to it.
-	for _, obj := range watch.initial {
+	// to it — the next stage is where a client gets to say otherwise.
+	for _, obj := range initial {
 		if selected(obj) && !send("ADDED", obj) {
 			return
 		}
 	}
-	// A client that did say what it has gets the changes since instead: no
-	// synthetic ADDED for objects it already knows about, and no gap between
-	// the list it built its cache from and the stream that keeps it current.
-	// This pair — list, then watch from the list's own resourceVersion — is
-	// how every informer in Kubernetes stays in step, and it is why the list
-	// carries a version of its own at all.
-	for _, event := range watch.replay {
-		if event.Resource != resource || (namespace != "" && event.Namespace != namespace) {
-			continue
-		}
-		if selected(event.Object) && !send(event.Type, event.Object) {
-			return
-		}
-	}
-	// Everything the client has been told about, as a version. A bookmark is
-	// how that number is kept current when nothing this watch cares about is
-	// happening, so it has to count the events actually sent.
-	latest := watch.version
-	for _, event := range watch.replay {
-		if event.Version > latest {
-			latest = event.Version
-		}
-	}
-
-	// Bookmarks are sent only to a client that asked for them. One that did
-	// not is a client whose library does not know the type, and an event it
-	// cannot decode is worse than no event at all.
-	var bookmarks <-chan time.Time
-	if allowed, err := strconv.ParseBool(r.URL.Query().Get("allowWatchBookmarks")); err == nil && allowed {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		bookmarks = ticker.C
-	}
-
 	for {
 		select {
-		case <-bookmarks:
-			// The store has moved, and none of it was for this client. Without
-			// this, a watch on a quiet resource holds a version that ages
-			// until it falls off the end of the history — and the reconnect
-			// it eventually makes is answered with 410 and a full relist.
-			//
-			// The object carries a resourceVersion and nothing else: there is
-			// no object here, only a promise that the client has seen
-			// everything up to this number.
-			if current := objects.currentVersion(); current > latest {
-				latest = current
-				if !send("BOOKMARK", object{
-					"apiVersion": "v1",
-					"kind":       strings.TrimSuffix(kind, "List"),
-					"metadata":   map[string]any{"resourceVersion": strconv.FormatInt(current, 10)},
-				}) {
-					return
-				}
-			}
 		case <-r.Context().Done():
 			// The client hung up. Nothing to clean but the watcher, and the
 			// deferred unwatch has that.
 			return
-		case event, open := <-watch.events:
+		case event, open := <-events:
 			if !open {
 				// Dropped for being too slow. The stream ends, and the client
 				// lists again and starts over.
@@ -1006,7 +883,6 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 			if !selected(event.Object) {
 				continue
 			}
-			latest = event.Version
 			if !send(event.Type, event.Object) {
 				return
 			}

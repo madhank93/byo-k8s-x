@@ -84,7 +84,6 @@ type watchEvent struct {
 type watcher struct {
 	id      int
 	events  chan watchEvent
-	version int64        // where the store stood when the watch opened
 	initial []object     // the state to send as ADDED — empty for a resuming watch
 	replay  []watchEvent // the changes the client missed, oldest first
 }
@@ -110,7 +109,7 @@ func (s *store) watchFrom(resource, namespace string, since int64) (*watcher, er
 	s.nextID++
 	// Buffered, because a write must not wait on a client's socket. A watcher
 	// that fills it is disconnected rather than allowed to hold up the server.
-	w := &watcher{id: s.nextID, events: make(chan watchEvent, 64), version: s.version}
+	w := &watcher{id: s.nextID, events: make(chan watchEvent, 64)}
 	s.watchers[w.id] = w.events
 	if since < 0 {
 		w.initial = s.locked(resource, namespace)
@@ -780,7 +779,7 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 		// it is the same URL with a flag on it — same resource, same
 		// namespace, same selectors, a different shape of answer.
 		if watching(r) {
-			streamWatch(w, r, objects, resource, kind, selected)
+			streamWatch(w, r, objects, resource, selected)
 			return
 		}
 
@@ -867,7 +866,7 @@ func watching(r *http.Request) bool {
 // controller, the scheduler, the kubelet and kube-proxy are all a cache filled
 // from one of these and kept in step by it — nothing polls, and that is the
 // only reason a cluster of any size works at all.
-func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resource, kind string, selected func(object) bool) {
+func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resource string, selected func(object) bool) {
 	namespace := r.PathValue("namespace")
 	// The version the client says it already has. Absent and 0 both mean "I
 	// have nothing" — 0 is not version zero, it is "whatever you have
@@ -908,8 +907,8 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 	// a response that never starts — a watch that has nothing to say yet is
 	// still an open watch.
 	flusher.Flush()
-	send := func(eventType string, obj object) bool {
-		raw, err := json.Marshal(map[string]any{"type": eventType, "object": obj})
+	send := func(kind string, obj object) bool {
+		raw, err := json.Marshal(map[string]any{"type": kind, "object": obj})
 		if err != nil {
 			return false
 		}
@@ -946,47 +945,8 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 			return
 		}
 	}
-	// Everything the client has been told about, as a version. A bookmark is
-	// how that number is kept current when nothing this watch cares about is
-	// happening, so it has to count the events actually sent.
-	latest := watch.version
-	for _, event := range watch.replay {
-		if event.Version > latest {
-			latest = event.Version
-		}
-	}
-
-	// Bookmarks are sent only to a client that asked for them. One that did
-	// not is a client whose library does not know the type, and an event it
-	// cannot decode is worse than no event at all.
-	var bookmarks <-chan time.Time
-	if allowed, err := strconv.ParseBool(r.URL.Query().Get("allowWatchBookmarks")); err == nil && allowed {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		bookmarks = ticker.C
-	}
-
 	for {
 		select {
-		case <-bookmarks:
-			// The store has moved, and none of it was for this client. Without
-			// this, a watch on a quiet resource holds a version that ages
-			// until it falls off the end of the history — and the reconnect
-			// it eventually makes is answered with 410 and a full relist.
-			//
-			// The object carries a resourceVersion and nothing else: there is
-			// no object here, only a promise that the client has seen
-			// everything up to this number.
-			if current := objects.currentVersion(); current > latest {
-				latest = current
-				if !send("BOOKMARK", object{
-					"apiVersion": "v1",
-					"kind":       strings.TrimSuffix(kind, "List"),
-					"metadata":   map[string]any{"resourceVersion": strconv.FormatInt(current, 10)},
-				}) {
-					return
-				}
-			}
 		case <-r.Context().Done():
 			// The client hung up. Nothing to clean but the watcher, and the
 			// deferred unwatch has that.
@@ -1006,7 +966,6 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 			if !selected(event.Object) {
 				continue
 			}
-			latest = event.Version
 			if !send(event.Type, event.Object) {
 				return
 			}

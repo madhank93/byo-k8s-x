@@ -44,3 +44,12 @@ stages:
   - slug: pagination
     name: A collection too big for one answer
     difficulty: medium
+  - slug: watch
+    name: The request that never ends
+    difficulty: hard
+  - slug: watch-from-rv
+    name: Catching up without starting over
+    difficulty: hard
+  - slug: bookmarks
+    name: Nothing happened, and here is proof
+    difficulty: medium
