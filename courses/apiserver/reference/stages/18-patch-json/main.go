@@ -1425,18 +1425,6 @@ func decodePatch(w http.ResponseWriter, r *http.Request) (func(object) (object, 
 			}
 			return result, nil
 		}, true
-	case "application/strategic-merge-patch+json":
-		return func(obj object) (object, error) {
-			merged, err := strategicMerge(map[string]any(obj), patch, "")
-			if err != nil {
-				return nil, err
-			}
-			result, ok := merged.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("%w: a strategic merge patch of an object has to be an object", errInvalidPatch)
-			}
-			return result, nil
-		}, true
 	case "application/merge-patch+json":
 		return func(obj object) (object, error) {
 			merged, ok := mergePatch(map[string]any(obj), patch).(map[string]any)
@@ -1447,7 +1435,7 @@ func decodePatch(w http.ResponseWriter, r *http.Request) (func(object) (object, 
 		}, true
 	}
 	writeStatus(w, http.StatusUnsupportedMediaType, "UnsupportedMediaType",
-		fmt.Sprintf("the body of the request was in an unknown format %q - accepted media types include: application/json-patch+json, application/merge-patch+json, application/strategic-merge-patch+json", mediaType))
+		fmt.Sprintf("the body of the request was in an unknown format %q - accepted media types include: application/json-patch+json, application/merge-patch+json", mediaType))
 	return nil, false
 }
 
@@ -1474,118 +1462,6 @@ func mergePatch(target, patch any) any {
 		}
 	}
 	return merged
-}
-
-// mergeKeys says how each list a strategic merge patch can reach is merged:
-// by the field named, or as a set of plain values where that is "". A list not
-// named here is replaced whole, as a merge patch would.
-//
-// The real server reads this from struct tags on the Go type of every resource
-// (patchStrategy and patchMergeKey), which is why a strategic patch works only
-// on built-in types and never on a custom resource.
-var mergeKeys = map[string]string{
-	"metadata.finalizers":      "",
-	"metadata.ownerReferences": "uid",
-}
-
-// strategicMerge applies a strategic merge patch to target and returns the
-// result. It is a merge patch in everything but lists named in mergeKeys, and
-// in the directives — keys starting with $ — which say what to take out of a
-// list that merges, and are never stored.
-func strategicMerge(target, patch any, path string) (any, error) {
-	fields, ok := patch.(map[string]any)
-	if !ok {
-		return patch, nil
-	}
-	merged, ok := target.(map[string]any)
-	if !ok {
-		merged = map[string]any{}
-	}
-	for key, value := range fields {
-		at := strings.TrimPrefix(path+"."+key, ".")
-		switch {
-		case strings.HasPrefix(key, "$deleteFromPrimitiveList/"):
-			field := strings.TrimPrefix(key, "$deleteFromPrimitiveList/")
-			remove, _ := value.([]any)
-			if list, ok := merged[field].([]any); ok {
-				merged[field] = slices.DeleteFunc(list, func(v any) bool {
-					return slices.ContainsFunc(remove, func(r any) bool { return reflect.DeepEqual(v, r) })
-				})
-			}
-		case strings.HasPrefix(key, "$"):
-			// ponytail: $setElementOrder, $retainKeys and $patch on a map are
-			// accepted and ignored; order is by arrival. Honour them if a
-			// client ever depends on them.
-		case value == nil:
-			delete(merged, key)
-		default:
-			list, isList := value.([]any)
-			mergeKey, declared := mergeKeys[at]
-			var err error
-			switch {
-			case isList && declared && mergeKey == "":
-				merged[key] = mergeSet(merged[key], list)
-			case isList && declared:
-				merged[key], err = mergeByKey(merged[key], list, mergeKey, at)
-			default:
-				merged[key], err = strategicMerge(merged[key], value, at)
-			}
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	return merged, nil
-}
-
-// mergeSet adds each value the patch lists that is not in the list already,
-// after the ones that are.
-func mergeSet(target any, patch []any) []any {
-	list, _ := target.([]any)
-	for _, value := range patch {
-		if !slices.ContainsFunc(list, func(v any) bool { return reflect.DeepEqual(v, value) }) {
-			list = append(list, value)
-		}
-	}
-	return list
-}
-
-// mergeByKey merges each element of the patch into the element of the list
-// with the same key, appends it if there is none, and removes the matching
-// element instead if it carries $patch: delete.
-func mergeByKey(target any, patch []any, key, path string) ([]any, error) {
-	list, _ := target.([]any)
-	for _, element := range patch {
-		fields, _ := element.(map[string]any)
-		id, ok := fields[key]
-		if !ok {
-			return nil, fmt.Errorf("%w: every element of %s needs its %s, which is how it is matched", errInvalidPatch, path, key)
-		}
-		i := slices.IndexFunc(list, func(v any) bool {
-			m, _ := v.(map[string]any)
-			return m != nil && reflect.DeepEqual(m[key], id)
-		})
-		if fields["$patch"] == "delete" {
-			if i >= 0 {
-				list = slices.Delete(list, i, i+1)
-			}
-			continue
-		}
-		var existing any
-		if i >= 0 {
-			existing = list[i]
-		}
-		merged, err := strategicMerge(existing, fields, path)
-		if err != nil {
-			return nil, err
-		}
-		if i >= 0 {
-			list[i] = merged
-		} else {
-			list = append(list, merged)
-		}
-	}
-	return list, nil
 }
 
 // patchOp is one step of an RFC 6902 JSON patch. Value is the operand of add,

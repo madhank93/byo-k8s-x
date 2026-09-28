@@ -53,3 +53,12 @@ stages:
   - slug: bookmarks
     name: Nothing happened, and here is proof
     difficulty: medium
+  - slug: patch-merge
+    name: Saying only what changed
+    difficulty: medium
+  - slug: patch-json
+    name: One element of a list
+    difficulty: hard
+  - slug: patch-strategic
+    name: Lists that belong to more than one writer
+    difficulty: hard

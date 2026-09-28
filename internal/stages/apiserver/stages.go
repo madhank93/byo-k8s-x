@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -57,6 +58,9 @@ func init() {
 	register(Stage{Slug: "watch", Run: stageWatch})
 	register(Stage{Slug: "watch-from-rv", Run: stageWatchFromRV})
 	register(Stage{Slug: "bookmarks", Run: stageBookmarks})
+	register(Stage{Slug: "patch-merge", Run: stagePatchMerge})
+	register(Stage{Slug: "patch-json", Run: stagePatchJSON})
+	register(Stage{Slug: "patch-strategic", Run: stagePatchStrategic})
 }
 
 // stageServe checks the program serves HTTP where it was told to, says it is
@@ -1979,6 +1983,523 @@ func stageBookmarks(ctx context.Context, _ *kube.Env, bin string) error {
 	return nil
 }
 
+// stagePatchMerge checks a PATCH that says only what changed, in the
+// simplest of the three dialects: a JSON merge patch, RFC 7386.
+//
+// The two things graded hardest are the ones a hand-rolled merge gets wrong.
+// null is how a key is removed, not a value to store; and a patch is applied
+// to what is stored at the moment of the write, under the same lock, so two
+// clients patching different keys of one object both keep what they wrote.
+// That second property is the reason PATCH exists at all — a PUT built from a
+// read loses a race, and a patch has nothing stale in it to lose with.
+func stagePatchMerge(ctx context.Context, _ *kube.Env, bin string) error {
+	// On disk, so every write holds the store for as long as a real one waits
+	// on etcd: that is the gap a read taken outside the write falls into.
+	dir, err := os.MkdirTemp("", "byok8s-apiserver-*")
+	if err != nil {
+		return fmt.Errorf("make a directory for the store: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	srv, cleanup, err := serve(ctx, bin, "-data", dir)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	const (
+		path  = "/api/v1/namespaces/default/configmaps"
+		merge = "application/merge-patch+json"
+	)
+	created, err := srv.create(ctx, path, map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":       "settings",
+			"labels":     map[string]any{"app": "web"},
+			"finalizers": []any{"example.com/one", "example.com/two"},
+		},
+		"data": map[string]any{"colour": "blue", "size": "large"},
+	})
+	if err != nil {
+		return err
+	}
+
+	// patchOK sends one merge patch that has to succeed, and returns the
+	// object as the reply and a fresh read both describe it.
+	patchOK := func(what string, body any) (map[string]any, error) {
+		res, raw, err := srv.patch(ctx, path+"/settings", merge, body)
+		if err != nil {
+			return nil, err
+		}
+		if res.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("PATCH %s/settings (%s) answered %d rather than 200\nthe body was:\n%s", path, what, res.StatusCode, tail(string(raw)))
+		}
+		if _, err := decode(raw); err != nil {
+			return nil, fmt.Errorf("the reply to PATCH %s/settings (%s) is not JSON (%w)\nthe body was:\n%s", path, what, err, tail(string(raw)))
+		}
+		return srv.getJSON(ctx, path+"/settings")
+	}
+	dataOf := func(obj map[string]any) map[string]any {
+		data, _ := obj["data"].(map[string]any)
+		return data
+	}
+
+	got, err := patchOK("one key of data", map[string]any{"data": map[string]any{"colour": "green"}})
+	if err != nil {
+		return err
+	}
+	if data := dataOf(got); data["colour"] != "green" || data["size"] != "large" {
+		return fmt.Errorf("after a merge patch of data.colour alone the object's data is %v: the keys a patch does not mention are kept, which is the difference between a patch and a PUT", got["data"])
+	}
+	if labels, _ := got["metadata"].(map[string]any)["labels"].(map[string]any); labels["app"] != "web" {
+		return fmt.Errorf("after a merge patch that only touched data, metadata.labels is %v: a merge recurses into objects, and a patch that did not mention metadata leaves all of it alone", labels)
+	}
+	if metaField(got, "resourceVersion") == metaField(created, "resourceVersion") {
+		return fmt.Errorf("the object still has resourceVersion %q after a patch: a patch is a write like any other, and moves the store forward", metaField(got, "resourceVersion"))
+	}
+	if metaField(got, "uid") != metaField(created, "uid") {
+		return fmt.Errorf("the patch changed metadata.uid from %q to %q: the object was edited, not replaced by a new one", metaField(created, "uid"), metaField(got, "uid"))
+	}
+
+	// null is not a value in a merge patch, it is a delete. Storing it leaves
+	// a key every reader has to know to skip.
+	got, err = patchOK(`data.size set to null`, map[string]any{"data": map[string]any{"size": nil}})
+	if err != nil {
+		return err
+	}
+	if size, there := dataOf(got)["size"]; there {
+		return fmt.Errorf("after a merge patch setting data.size to null the object still has data.size = %v: in a merge patch null removes the key, and it is the only way this dialect has of removing anything", size)
+	}
+
+	// A list is a value, not something merged into. This is the rule that
+	// makes a merge patch unfit for lists other people also write to — and it
+	// is why the strategic dialect exists.
+	got, err = patchOK("metadata.finalizers", map[string]any{"metadata": map[string]any{"finalizers": []any{"example.com/three"}}})
+	if err != nil {
+		return err
+	}
+	finalizers, _ := got["metadata"].(map[string]any)["finalizers"].([]any)
+	if len(finalizers) != 1 || finalizers[0] != "example.com/three" {
+		return fmt.Errorf("after a merge patch of metadata.finalizers to [example.com/three] the list is %v: a merge patch replaces a list whole — it has no way to say which element is which, so it does not try", finalizers)
+	}
+
+	// A resourceVersion in a patch is a precondition, exactly as it is in a
+	// PUT: the client is saying it built this change on that version.
+	res, raw, err := srv.patch(ctx, path+"/settings", merge, map[string]any{
+		"metadata": map[string]any{"resourceVersion": metaField(created, "resourceVersion")},
+		"data":     map[string]any{"colour": "red"},
+	})
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("PATCH "+path+"/settings carrying the resourceVersion from before three writes", res, raw, http.StatusConflict, "Conflict"); err != nil {
+		return fmt.Errorf("%w\n\na patch with no resourceVersion is applied to whatever is there; one that names a version is a client asking for exactly that version to be the one it changes", err)
+	}
+	if got, err = srv.getJSON(ctx, path+"/settings"); err != nil {
+		return err
+	}
+	if dataOf(got)["colour"] != "green" {
+		return fmt.Errorf("the refused patch changed the object anyway: data.colour is now %v", dataOf(got)["colour"])
+	}
+
+	// Many clients at once, each adding its own key. A server that reads the
+	// object, merges outside the lock and writes back loses some of them, or
+	// answers 409 to a client that sent no precondition at all.
+	const writers = 50
+	failures := make(chan error, writers)
+	for i := range writers {
+		go func() {
+			key := "writer-" + strconv.Itoa(i)
+			res, raw, err := srv.patch(ctx, path+"/settings", merge, map[string]any{"data": map[string]any{key: "here"}})
+			switch {
+			case err != nil:
+				failures <- err
+			case res.StatusCode != http.StatusOK:
+				failures <- fmt.Errorf("one of %d concurrent patches, each to its own key, answered %d: a patch with no resourceVersion has no precondition to fail, so the server has to apply it to whatever is there when it gets the lock rather than to what it read before\nthe body was:\n%s", writers, res.StatusCode, tail(string(raw)))
+			default:
+				failures <- nil
+			}
+		}()
+	}
+	for range writers {
+		if err := <-failures; err != nil {
+			return err
+		}
+	}
+	if got, err = srv.getJSON(ctx, path+"/settings"); err != nil {
+		return err
+	}
+	for i := range writers {
+		if key := "writer-" + strconv.Itoa(i); dataOf(got)[key] != "here" {
+			return fmt.Errorf("%d concurrent patches each added one key and all answered 200, but data.%s is missing afterwards: a merge computed from a read taken before the lock is a lost update — the patch has to be applied to the stored object inside the write", writers, key)
+		}
+	}
+
+	// A patch is only as meaningful as its dialect, and the body alone does
+	// not say which one it is in. application/json is not a patch type.
+	res, raw, err = srv.patch(ctx, path+"/settings", "application/json", map[string]any{"data": map[string]any{"colour": "red"}})
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("PATCH "+path+"/settings with Content-Type application/json", res, raw, http.StatusUnsupportedMediaType, "UnsupportedMediaType"); err != nil {
+		return fmt.Errorf("%w\n\nthe Content-Type is what says how to read a patch — the same body means different things as a merge patch and as a strategic one — so a type the server does not handle is refused rather than guessed at", err)
+	}
+
+	res, raw, err = srv.patch(ctx, path+"/absent", merge, map[string]any{"data": map[string]any{"colour": "red"}})
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("PATCH "+path+"/absent", res, raw, http.StatusNotFound, "NotFound"); err != nil {
+		return fmt.Errorf("%w\n\na patch describes a change to something, and there is nothing here to change", err)
+	}
+
+	// kubectl patch and kubectl apply both look for the verb before they send
+	// anything.
+	list, err := srv.getJSON(ctx, "/api/v1")
+	if err != nil {
+		return err
+	}
+	resources, _ := list["resources"].([]any)
+	for _, r := range resources {
+		if m, ok := r.(map[string]any); ok && m["name"] == "configmaps" {
+			if verbs, _ := m["verbs"].([]any); !contains(verbs, "patch") {
+				return fmt.Errorf("the configmaps entry in GET /api/v1 does not offer the verb \"patch\" (it offers %v): kubectl reads discovery before it sends a PATCH, and refuses one the server does not list", m["verbs"])
+			}
+		}
+	}
+	return nil
+}
+
+// stagePatchJSON checks the second patch dialect: a JSON patch, RFC 6902, a
+// list of operations addressed by JSON pointer.
+//
+// It is the only dialect that can name one element of a list, remove a key
+// without a null, or refuse to run unless a value is what the client expects.
+// The two properties graded hardest are the pointer escaping — a / in a key is
+// ~1, and every label with a domain prefix has one — and that a patch applies
+// whole or not at all: an operation that fails undoes the ones before it.
+func stagePatchJSON(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	const (
+		path = "/api/v1/namespaces/default/configmaps"
+		jp   = "application/json-patch+json"
+	)
+	if _, err := srv.create(ctx, path, map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":       "settings",
+			"labels":     map[string]any{"app.kubernetes.io/name": "web"},
+			"finalizers": []any{"example.com/one", "example.com/two", "example.com/three"},
+		},
+		"data": map[string]any{"a": "1", "b": "2"},
+	}); err != nil {
+		return err
+	}
+
+	type op = map[string]any
+	// patchOK sends one JSON patch that has to succeed, and returns the
+	// object as a fresh read describes it.
+	patchOK := func(what string, ops ...op) (map[string]any, error) {
+		res, raw, err := srv.patch(ctx, path+"/settings", jp, ops)
+		if err != nil {
+			return nil, err
+		}
+		if res.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("PATCH %s/settings with a JSON patch that %s answered %d rather than 200\nthe patch was: %v\nthe body was:\n%s",
+				path, what, res.StatusCode, ops, tail(string(raw)))
+		}
+		return srv.getJSON(ctx, path+"/settings")
+	}
+	dataOf := func(obj map[string]any) map[string]any {
+		data, _ := obj["data"].(map[string]any)
+		return data
+	}
+	metaOf := func(obj map[string]any) map[string]any {
+		meta, _ := obj["metadata"].(map[string]any)
+		return meta
+	}
+
+	got, err := patchOK("tests, replaces, adds and removes keys of data",
+		op{"op": "test", "path": "/data/a", "value": "1"},
+		op{"op": "replace", "path": "/data/a", "value": "10"},
+		op{"op": "add", "path": "/data/c", "value": "3"},
+		op{"op": "remove", "path": "/data/b"},
+	)
+	if err != nil {
+		return err
+	}
+	if data := dataOf(got); len(data) != 2 || data["a"] != "10" || data["c"] != "3" {
+		return fmt.Errorf("after test /data/a, replace /data/a with 10, add /data/c and remove /data/b the data is %v, and it should be exactly {a:10 c:3}: the operations run in order, each on the result of the one before", got["data"])
+	}
+
+	// A list is addressed by index, and - is the end of it. This is what a
+	// merge patch cannot do.
+	got, err = patchOK("works on a list by index",
+		op{"op": "remove", "path": "/metadata/finalizers/1"},
+		op{"op": "add", "path": "/metadata/finalizers/-", "value": "example.com/four"},
+		op{"op": "add", "path": "/metadata/finalizers/0", "value": "example.com/zero"},
+	)
+	if err != nil {
+		return err
+	}
+	want := []any{"example.com/zero", "example.com/one", "example.com/three", "example.com/four"}
+	if finalizers, _ := metaOf(got)["finalizers"].([]any); !reflect.DeepEqual(finalizers, want) {
+		return fmt.Errorf("after remove /metadata/finalizers/1, add at /- and add at /0 the finalizers are %v, not %v: remove takes the element at that index out, add at an index inserts before it, and - is one past the end", finalizers, want)
+	}
+
+	// The key has a / in it, and in a pointer that is written ~1. Read
+	// literally, the pointer would walk into a key app.kubernetes.io and then
+	// look for name inside it.
+	got, err = patchOK("replaces a label whose key contains a /",
+		op{"op": "replace", "path": "/metadata/labels/app.kubernetes.io~1name", "value": "api"})
+	if err != nil {
+		return fmt.Errorf("%w\n\nin a JSON pointer / separates the tokens, so a / inside a key is escaped as ~1 (and a ~ as ~0), and has to be unescaped after the split rather than before", err)
+	}
+	labels, _ := metaOf(got)["labels"].(map[string]any)
+	if len(labels) != 1 || labels["app.kubernetes.io/name"] != "api" {
+		return fmt.Errorf("after replace /metadata/labels/app.kubernetes.io~1name the labels are %v: ~1 is a / inside the key, so the label app.kubernetes.io/name should now be api and nothing else should be there", labels)
+	}
+
+	got, err = patchOK("copies and moves keys",
+		op{"op": "copy", "from": "/data/a", "path": "/data/a-copy"},
+		op{"op": "move", "from": "/data/c", "path": "/data/d"},
+	)
+	if err != nil {
+		return err
+	}
+	if data := dataOf(got); len(data) != 3 || data["a"] != "10" || data["a-copy"] != "10" || data["d"] != "3" {
+		return fmt.Errorf("after copy /data/a to /data/a-copy and move /data/c to /data/d the data is %v, and it should be exactly {a:10 a-copy:10 d:3}: copy leaves the source where it was, move takes it away", got["data"])
+	}
+
+	// test is how a JSON patch carries a precondition, on any field at all:
+	// "only if the resourceVersion is still this" is the common one.
+	got, err = patchOK("tests the resourceVersion it was built from",
+		op{"op": "test", "path": "/metadata/resourceVersion", "value": metaField(got, "resourceVersion")},
+		op{"op": "replace", "path": "/data/a", "value": "11"},
+	)
+	if err != nil {
+		return err
+	}
+	before := got
+
+	// All or nothing. The replace succeeds on its own; the test after it
+	// fails, and the replace has to go with it.
+	res, raw, err := srv.patch(ctx, path+"/settings", jp, []op{
+		{"op": "replace", "path": "/data/a", "value": "99"},
+		{"op": "test", "path": "/data/d", "value": "not what is there"},
+	})
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("PATCH "+path+"/settings with a JSON patch whose test fails", res, raw, http.StatusUnprocessableEntity, "Invalid"); err != nil {
+		return fmt.Errorf("%w\n\na patch that cannot be applied is a 422 — the request was understood, and the object it would produce is the problem", err)
+	}
+	if got, err = srv.getJSON(ctx, path+"/settings"); err != nil {
+		return err
+	}
+	if dataOf(got)["a"] != "11" || metaField(got, "resourceVersion") != metaField(before, "resourceVersion") {
+		return fmt.Errorf("a JSON patch whose second operation failed left data.a as %v and resourceVersion %s (they were 11 and %s): the operations before the failure have to be undone with it — a patch applies whole or not at all",
+			dataOf(got)["a"], metaField(got, "resourceVersion"), metaField(before, "resourceVersion"))
+	}
+
+	res, raw, err = srv.patch(ctx, path+"/settings", jp, []op{{"op": "remove", "path": "/data/absent"}})
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("PATCH "+path+"/settings removing /data/absent", res, raw, http.StatusUnprocessableEntity, "Invalid"); err != nil {
+		return fmt.Errorf("%w\n\nremove, replace and test all need the target to exist; only add creates", err)
+	}
+
+	// An object where a list of operations should be is a request the server
+	// cannot read at all, which is a 400 rather than a 422.
+	res, raw, err = srv.patch(ctx, path+"/settings", jp, map[string]any{"data": map[string]any{"a": "12"}})
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("PATCH "+path+"/settings with a JSON patch that is an object rather than a list", res, raw, http.StatusBadRequest, "BadRequest"); err != nil {
+		return fmt.Errorf("%w\n\nthat body is a merge patch sent under the wrong Content-Type, and applying it as one would be guessing", err)
+	}
+	return nil
+}
+
+// stagePatchStrategic checks the dialect kubectl patch sends by default: the
+// strategic merge patch, a merge patch that knows which lists are sets and
+// which are keyed by a field.
+//
+// The point of it is shared lists. Several controllers each own one finalizer
+// on an object, several owners each have one ownerReference, and a merge patch
+// can only replace the whole list — so every writer erases the others. A
+// strategic patch merges into those lists instead, and says what to take out
+// with directives, which are instructions to the server and never stored.
+func stagePatchStrategic(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	const (
+		path = "/api/v1/namespaces/default/configmaps"
+		smp  = "application/strategic-merge-patch+json"
+	)
+	if _, err := srv.create(ctx, path, map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":       "settings",
+			"finalizers": []any{"example.com/a", "example.com/b"},
+			"ownerReferences": []any{
+				map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "name": "parent-one", "uid": "uid-one"},
+			},
+		},
+		"data": map[string]any{"colour": "blue", "size": "large"},
+	}); err != nil {
+		return err
+	}
+
+	patchOK := func(what string, body any) (map[string]any, error) {
+		res, raw, err := srv.patch(ctx, path+"/settings", smp, body)
+		if err != nil {
+			return nil, err
+		}
+		if res.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("PATCH %s/settings with a strategic merge patch that %s answered %d rather than 200\nthe patch was: %v\nthe body was:\n%s",
+				path, what, res.StatusCode, body, tail(string(raw)))
+		}
+		return srv.getJSON(ctx, path+"/settings")
+	}
+	metaOf := func(obj map[string]any) map[string]any {
+		meta, _ := obj["metadata"].(map[string]any)
+		return meta
+	}
+	owners := func(obj map[string]any) map[string]map[string]any {
+		out := map[string]map[string]any{}
+		refs, _ := metaOf(obj)["ownerReferences"].([]any)
+		for _, ref := range refs {
+			if m, ok := ref.(map[string]any); ok {
+				uid, _ := m["uid"].(string)
+				out[uid] = m
+			}
+		}
+		return out
+	}
+
+	// Where nothing is declared, it is a merge patch: objects merge, null
+	// deletes.
+	got, err := patchOK("changes data", map[string]any{"data": map[string]any{"colour": "green", "size": nil}})
+	if err != nil {
+		return err
+	}
+	if data, _ := got["data"].(map[string]any); len(data) != 1 || data["colour"] != "green" {
+		return fmt.Errorf("after a strategic patch of data {colour: green, size: null} the data is %v: for a map a strategic patch is a merge patch — keys merge, null removes", got["data"])
+	}
+
+	// finalizers is a set: what the patch lists is added, once, and what it
+	// does not list stays. $setElementOrder is what kubectl sends alongside to
+	// say what order it wants; whatever a server does with it, it is not a
+	// field of the object.
+	got, err = patchOK("adds to metadata.finalizers", map[string]any{"metadata": map[string]any{
+		"finalizers":                  []any{"example.com/c", "example.com/a"},
+		"$setElementOrder/finalizers": []any{"example.com/a", "example.com/b", "example.com/c"},
+	}})
+	if err != nil {
+		return err
+	}
+	want := []any{"example.com/a", "example.com/b", "example.com/c"}
+	if finalizers, _ := metaOf(got)["finalizers"].([]any); !reflect.DeepEqual(finalizers, want) {
+		return fmt.Errorf("after a strategic patch listing finalizers [example.com/c example.com/a] onto [example.com/a example.com/b] the list is %v, not %v: metadata.finalizers is merged as a set — new values are added once, and the ones the patch did not mention are some other controller's and stay. That is the whole difference from a merge patch, which would have replaced the list", finalizers, want)
+	}
+
+	got, err = patchOK("deletes a finalizer", map[string]any{"metadata": map[string]any{
+		"$deleteFromPrimitiveList/finalizers": []any{"example.com/a"},
+	}})
+	if err != nil {
+		return err
+	}
+	want = []any{"example.com/b", "example.com/c"}
+	if finalizers, _ := metaOf(got)["finalizers"].([]any); !reflect.DeepEqual(finalizers, want) {
+		return fmt.Errorf("after $deleteFromPrimitiveList/finalizers: [example.com/a] the finalizers are %v, not %v: in a list that merges, leaving a value out keeps it, so removing one needs a directive of its own", finalizers, want)
+	}
+
+	// ownerReferences is keyed by uid: an element whose uid is new is added,
+	// one whose uid is there is merged into that element.
+	got, err = patchOK("adds an ownerReference", map[string]any{"metadata": map[string]any{
+		"ownerReferences": []any{map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "name": "parent-two", "uid": "uid-two"}},
+	}})
+	if err != nil {
+		return err
+	}
+	if refs := owners(got); len(refs) != 2 || refs["uid-one"] == nil || refs["uid-two"] == nil {
+		return fmt.Errorf("after a strategic patch adding an ownerReference with uid uid-two the owners are %v: metadata.ownerReferences is merged by uid, so a new uid is added beside the ones already there", metaOf(got)["ownerReferences"])
+	}
+	got, err = patchOK("changes one ownerReference by uid", map[string]any{"metadata": map[string]any{
+		"ownerReferences": []any{map[string]any{"uid": "uid-one", "controller": true}},
+	}})
+	if err != nil {
+		return err
+	}
+	refs := owners(got)
+	if len(refs) != 2 || refs["uid-one"]["controller"] != true || refs["uid-one"]["name"] != "parent-one" || refs["uid-two"]["controller"] != nil {
+		return fmt.Errorf("after a strategic patch of ownerReferences [{uid: uid-one, controller: true}] the owners are %v: the element whose uid matches is merged into — it gains controller and keeps its name — and the others are left alone", metaOf(got)["ownerReferences"])
+	}
+	got, err = patchOK("deletes one ownerReference by uid", map[string]any{"metadata": map[string]any{
+		"ownerReferences": []any{map[string]any{"uid": "uid-two", "$patch": "delete"}},
+	}})
+	if err != nil {
+		return err
+	}
+	if refs := owners(got); len(refs) != 1 || refs["uid-one"] == nil {
+		return fmt.Errorf("after a strategic patch of ownerReferences [{uid: uid-two, $patch: delete}] the owners are %v: $patch: delete removes the element with that uid, and only that one", metaOf(got)["ownerReferences"])
+	}
+
+	// Directives are instructions, not data. Storing one leaves a field in
+	// the object no client knows how to read, and that the next patch would
+	// try to obey.
+	var directive func(node any, at string) string
+	directive = func(node any, at string) string {
+		switch n := node.(type) {
+		case map[string]any:
+			for key, value := range n {
+				if strings.HasPrefix(key, "$") {
+					return at + "." + key
+				}
+				if found := directive(value, at+"."+key); found != "" {
+					return found
+				}
+			}
+		case []any:
+			for i, value := range n {
+				if found := directive(value, at+"["+strconv.Itoa(i)+"]"); found != "" {
+					return found
+				}
+			}
+		}
+		return ""
+	}
+	if found := directive(got, ""); found != "" {
+		return fmt.Errorf("the stored object has a field %s: keys starting with $ in a strategic patch are directives to the server — $patch, $deleteFromPrimitiveList, $setElementOrder — and are never stored", found)
+	}
+
+	// An element of a keyed list has to carry its key, or there is no telling
+	// which element it means.
+	res, raw, err := srv.patch(ctx, path+"/settings", smp, map[string]any{"metadata": map[string]any{
+		"ownerReferences": []any{map[string]any{"name": "no-uid"}},
+	}})
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("PATCH "+path+"/settings with an ownerReference that has no uid", res, raw, http.StatusUnprocessableEntity, "Invalid"); err != nil {
+		return fmt.Errorf("%w\n\nownerReferences are merged by uid, and an element without one names no element: adding it would be guessing, and so would merging it into one", err)
+	}
+	return nil
+}
+
 // watchStream is one open watch, decoded event by event in the background so
 // a stage can say "the next thing that happens should be this, within a few
 // seconds" rather than blocking for ever on a server that sends nothing.
@@ -2185,9 +2706,28 @@ func metaField(obj map[string]any, field string) string {
 	return s
 }
 
+// patch sends one PATCH in the dialect contentType names. The body is the same
+// JSON whichever it is; the header is what says how the server reads it.
+func (s *server) patch(ctx context.Context, path, contentType string, body any) (*http.Response, []byte, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode the patch: %w", err)
+	}
+	res, got, err := requestAs(ctx, http.MethodPatch, s.url+path, contentType, raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("PATCH %s: %w\nthe program said:\n%s", path, err, tail(s.p.Stdout()))
+	}
+	return res, got, nil
+}
+
 // request makes one HTTP request and reads the whole answer, which is small
 // enough here that streaming it would only hide the body from an error message.
 func request(ctx context.Context, method, url string, body []byte) (*http.Response, []byte, error) {
+	return requestAs(ctx, method, url, "application/json", body)
+}
+
+// requestAs is request with the body's Content-Type named.
+func requestAs(ctx context.Context, method, url, contentType string, body []byte) (*http.Response, []byte, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -2197,7 +2737,7 @@ func request(ctx context.Context, method, url string, body []byte) (*http.Respon
 		return nil, nil, err
 	}
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentType)
 	}
 	req.Header.Set("Accept", "application/json")
 	res, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)

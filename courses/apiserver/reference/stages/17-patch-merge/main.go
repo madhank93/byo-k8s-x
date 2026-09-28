@@ -13,7 +13,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/fs"
 	"maps"
 	"mime"
@@ -21,8 +20,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"reflect"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -483,11 +480,11 @@ var (
 	errInvalidPatch  = errors.New("the patch cannot be applied")
 )
 
-// clone is a deep copy of an object, or of any part of one, for a change that
-// has to be worked out without touching what the store holds.
-func clone[T any](v T) T {
-	raw, _ := json.Marshal(v)
-	var out T
+// clone is a deep copy of an object, for a change that has to be worked out
+// without touching what the store holds.
+func clone(obj object) object {
+	raw, _ := json.Marshal(obj)
+	var out object
 	_ = json.Unmarshal(raw, &out)
 	return out
 }
@@ -1398,45 +1395,12 @@ func writeModifyError(w http.ResponseWriter, err error, name string) {
 // this server does not know is refused rather than guessed at.
 func decodePatch(w http.ResponseWriter, r *http.Request) (func(object) (object, error), bool) {
 	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	raw, err := io.ReadAll(r.Body)
 	var patch any
-	if err == nil {
-		err = json.Unmarshal(raw, &patch)
-	}
-	if err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 		writeStatus(w, http.StatusBadRequest, "BadRequest", "the patch is not valid JSON: "+err.Error())
 		return nil, false
 	}
 	switch mediaType {
-	case "application/json-patch+json":
-		var ops []patchOp
-		if err := json.Unmarshal(raw, &ops); err != nil {
-			writeStatus(w, http.StatusBadRequest, "BadRequest", "a JSON patch is a list of operations: "+err.Error())
-			return nil, false
-		}
-		return func(obj object) (object, error) {
-			patched, err := jsonPatch(map[string]any(obj), ops)
-			if err != nil {
-				return nil, err
-			}
-			result, ok := patched.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("%w: the patched document is not an object", errInvalidPatch)
-			}
-			return result, nil
-		}, true
-	case "application/strategic-merge-patch+json":
-		return func(obj object) (object, error) {
-			merged, err := strategicMerge(map[string]any(obj), patch, "")
-			if err != nil {
-				return nil, err
-			}
-			result, ok := merged.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("%w: a strategic merge patch of an object has to be an object", errInvalidPatch)
-			}
-			return result, nil
-		}, true
 	case "application/merge-patch+json":
 		return func(obj object) (object, error) {
 			merged, ok := mergePatch(map[string]any(obj), patch).(map[string]any)
@@ -1447,7 +1411,7 @@ func decodePatch(w http.ResponseWriter, r *http.Request) (func(object) (object, 
 		}, true
 	}
 	writeStatus(w, http.StatusUnsupportedMediaType, "UnsupportedMediaType",
-		fmt.Sprintf("the body of the request was in an unknown format %q - accepted media types include: application/json-patch+json, application/merge-patch+json, application/strategic-merge-patch+json", mediaType))
+		fmt.Sprintf("the body of the request was in an unknown format %q - accepted media types include: application/merge-patch+json", mediaType))
 	return nil, false
 }
 
@@ -1474,318 +1438,6 @@ func mergePatch(target, patch any) any {
 		}
 	}
 	return merged
-}
-
-// mergeKeys says how each list a strategic merge patch can reach is merged:
-// by the field named, or as a set of plain values where that is "". A list not
-// named here is replaced whole, as a merge patch would.
-//
-// The real server reads this from struct tags on the Go type of every resource
-// (patchStrategy and patchMergeKey), which is why a strategic patch works only
-// on built-in types and never on a custom resource.
-var mergeKeys = map[string]string{
-	"metadata.finalizers":      "",
-	"metadata.ownerReferences": "uid",
-}
-
-// strategicMerge applies a strategic merge patch to target and returns the
-// result. It is a merge patch in everything but lists named in mergeKeys, and
-// in the directives — keys starting with $ — which say what to take out of a
-// list that merges, and are never stored.
-func strategicMerge(target, patch any, path string) (any, error) {
-	fields, ok := patch.(map[string]any)
-	if !ok {
-		return patch, nil
-	}
-	merged, ok := target.(map[string]any)
-	if !ok {
-		merged = map[string]any{}
-	}
-	for key, value := range fields {
-		at := strings.TrimPrefix(path+"."+key, ".")
-		switch {
-		case strings.HasPrefix(key, "$deleteFromPrimitiveList/"):
-			field := strings.TrimPrefix(key, "$deleteFromPrimitiveList/")
-			remove, _ := value.([]any)
-			if list, ok := merged[field].([]any); ok {
-				merged[field] = slices.DeleteFunc(list, func(v any) bool {
-					return slices.ContainsFunc(remove, func(r any) bool { return reflect.DeepEqual(v, r) })
-				})
-			}
-		case strings.HasPrefix(key, "$"):
-			// ponytail: $setElementOrder, $retainKeys and $patch on a map are
-			// accepted and ignored; order is by arrival. Honour them if a
-			// client ever depends on them.
-		case value == nil:
-			delete(merged, key)
-		default:
-			list, isList := value.([]any)
-			mergeKey, declared := mergeKeys[at]
-			var err error
-			switch {
-			case isList && declared && mergeKey == "":
-				merged[key] = mergeSet(merged[key], list)
-			case isList && declared:
-				merged[key], err = mergeByKey(merged[key], list, mergeKey, at)
-			default:
-				merged[key], err = strategicMerge(merged[key], value, at)
-			}
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	return merged, nil
-}
-
-// mergeSet adds each value the patch lists that is not in the list already,
-// after the ones that are.
-func mergeSet(target any, patch []any) []any {
-	list, _ := target.([]any)
-	for _, value := range patch {
-		if !slices.ContainsFunc(list, func(v any) bool { return reflect.DeepEqual(v, value) }) {
-			list = append(list, value)
-		}
-	}
-	return list
-}
-
-// mergeByKey merges each element of the patch into the element of the list
-// with the same key, appends it if there is none, and removes the matching
-// element instead if it carries $patch: delete.
-func mergeByKey(target any, patch []any, key, path string) ([]any, error) {
-	list, _ := target.([]any)
-	for _, element := range patch {
-		fields, _ := element.(map[string]any)
-		id, ok := fields[key]
-		if !ok {
-			return nil, fmt.Errorf("%w: every element of %s needs its %s, which is how it is matched", errInvalidPatch, path, key)
-		}
-		i := slices.IndexFunc(list, func(v any) bool {
-			m, _ := v.(map[string]any)
-			return m != nil && reflect.DeepEqual(m[key], id)
-		})
-		if fields["$patch"] == "delete" {
-			if i >= 0 {
-				list = slices.Delete(list, i, i+1)
-			}
-			continue
-		}
-		var existing any
-		if i >= 0 {
-			existing = list[i]
-		}
-		merged, err := strategicMerge(existing, fields, path)
-		if err != nil {
-			return nil, err
-		}
-		if i >= 0 {
-			list[i] = merged
-		} else {
-			list = append(list, merged)
-		}
-	}
-	return list, nil
-}
-
-// patchOp is one step of an RFC 6902 JSON patch. Value is the operand of add,
-// replace and test; From is the source of move and copy.
-type patchOp struct {
-	Op    string `json:"op"`
-	Path  string `json:"path"`
-	From  string `json:"from"`
-	Value any    `json:"value"`
-}
-
-// jsonPatch applies every operation in order and returns the result, or the
-// first failure. It works on doc in place, so the caller hands it a copy: a
-// patch applies whole or not at all, and a failure halfway leaves that copy
-// half-changed.
-func jsonPatch(doc any, ops []patchOp) (any, error) {
-	for i, op := range ops {
-		var err error
-		doc, err = applyOp(doc, op)
-		if err != nil {
-			return nil, fmt.Errorf("%w: operation %d (%s %s): %v", errInvalidPatch, i, op.Op, op.Path, err)
-		}
-	}
-	return doc, nil
-}
-
-// applyOp is one operation. Replace, move and copy are defined by the RFC in
-// terms of the other three, and are written that way here.
-func applyOp(doc any, op patchOp) (any, error) {
-	switch op.Op {
-	case "add":
-		return pointerAdd(doc, op.Path, op.Value)
-	case "remove":
-		doc, _, err := pointerRemove(doc, op.Path)
-		return doc, err
-	case "replace":
-		doc, _, err := pointerRemove(doc, op.Path)
-		if err != nil {
-			return nil, err
-		}
-		return pointerAdd(doc, op.Path, op.Value)
-	case "move":
-		doc, value, err := pointerRemove(doc, op.From)
-		if err != nil {
-			return nil, err
-		}
-		return pointerAdd(doc, op.Path, value)
-	case "copy":
-		value, err := pointerGet(doc, op.From)
-		if err != nil {
-			return nil, err
-		}
-		return pointerAdd(doc, op.Path, clone(value))
-	case "test":
-		value, err := pointerGet(doc, op.Path)
-		if err != nil {
-			return nil, err
-		}
-		if !reflect.DeepEqual(value, op.Value) {
-			return nil, fmt.Errorf("the value is %v, not %v", value, op.Value)
-		}
-		return doc, nil
-	}
-	return nil, fmt.Errorf("unknown op %q", op.Op)
-}
-
-// pointerAdd sets the value a JSON pointer names. In an object that adds or
-// overwrites the key; in a list it inserts before the index, and "-" appends.
-func pointerAdd(doc any, path string, value any) (any, error) {
-	return walkPointer(doc, path, func(parent any, key string) (any, error) {
-		switch node := parent.(type) {
-		case map[string]any:
-			node[key] = value
-			return node, nil
-		case []any:
-			if key == "-" {
-				return append(node, value), nil
-			}
-			i, err := listIndex(key, len(node))
-			if err != nil {
-				return nil, err
-			}
-			return slices.Insert(node, i, value), nil
-		}
-		return nil, fmt.Errorf("%s is inside something that is not an object or a list", path)
-	})
-}
-
-// pointerRemove takes out the value a JSON pointer names, which has to be there.
-func pointerRemove(doc any, path string) (any, any, error) {
-	var removed any
-	doc, err := walkPointer(doc, path, func(parent any, key string) (any, error) {
-		switch node := parent.(type) {
-		case map[string]any:
-			value, ok := node[key]
-			if !ok {
-				return nil, fmt.Errorf("%s does not exist", path)
-			}
-			removed = value
-			delete(node, key)
-			return node, nil
-		case []any:
-			i, err := listIndex(key, len(node)-1)
-			if err != nil {
-				return nil, err
-			}
-			removed = node[i]
-			return slices.Delete(node, i, i+1), nil
-		}
-		return nil, fmt.Errorf("%s is inside something that is not an object or a list", path)
-	})
-	return doc, removed, err
-}
-
-// pointerGet reads the value a JSON pointer names, which has to be there.
-func pointerGet(doc any, path string) (any, error) {
-	var found any
-	_, err := walkPointer(doc, path, func(parent any, key string) (any, error) {
-		switch node := parent.(type) {
-		case map[string]any:
-			value, ok := node[key]
-			if !ok {
-				return nil, fmt.Errorf("%s does not exist", path)
-			}
-			found = value
-		case []any:
-			i, err := listIndex(key, len(node)-1)
-			if err != nil {
-				return nil, err
-			}
-			found = node[i]
-		default:
-			return nil, fmt.Errorf("%s is inside something that is not an object or a list", path)
-		}
-		return parent, nil
-	})
-	return found, err
-}
-
-// walkPointer follows a JSON pointer down to the container its last token is
-// in, and hands that container and token to leaf. What leaf returns is put
-// back in the container's place, because appending to a list makes a new one.
-//
-// A pointer is a list of tokens, each one a key or a list index. / separates
-// them, so a / inside a key is written ~1 and a ~ is written ~0 — which is how
-// a label named app.kubernetes.io/name is reached at all.
-func walkPointer(doc any, path string, leaf func(parent any, key string) (any, error)) (any, error) {
-	if !strings.HasPrefix(path, "/") {
-		return nil, fmt.Errorf("the path %q is not a JSON pointer below the root", path)
-	}
-	tokens := strings.Split(path[1:], "/")
-	for i, token := range tokens {
-		tokens[i] = strings.NewReplacer("~1", "/", "~0", "~").Replace(token)
-	}
-	var walk func(node any, tokens []string) (any, error)
-	walk = func(node any, tokens []string) (any, error) {
-		if len(tokens) == 1 {
-			return leaf(node, tokens[0])
-		}
-		var child any
-		switch n := node.(type) {
-		case map[string]any:
-			value, ok := n[tokens[0]]
-			if !ok {
-				return nil, fmt.Errorf("%s does not exist", path)
-			}
-			child = value
-		case []any:
-			i, err := listIndex(tokens[0], len(n)-1)
-			if err != nil {
-				return nil, err
-			}
-			child = n[i]
-		default:
-			return nil, fmt.Errorf("%s is inside something that is not an object or a list", path)
-		}
-		child, err := walk(child, tokens[1:])
-		if err != nil {
-			return nil, err
-		}
-		switch n := node.(type) {
-		case map[string]any:
-			n[tokens[0]] = child
-		case []any:
-			i, _ := strconv.Atoi(tokens[0])
-			n[i] = child
-		}
-		return node, nil
-	}
-	return walk(doc, tokens)
-}
-
-// listIndex reads a list index out of a pointer token, which has to be a
-// number from 0 up to highest.
-func listIndex(token string, highest int) (int, error) {
-	i, err := strconv.Atoi(token)
-	if err != nil || i < 0 || i > highest {
-		return 0, fmt.Errorf("%q is not an index of this list", token)
-	}
-	return i, nil
 }
 
 // writeJSON sends one object. The content type is not decoration: a client
