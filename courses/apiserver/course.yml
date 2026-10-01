@@ -71,3 +71,12 @@ stages:
   - slug: subresource-status
     name: The half of the object that isn't yours
     difficulty: medium
+  - slug: subresource-scale
+    name: How many, and nothing else
+    difficulty: hard
+  - slug: openapi
+    name: The schema kubectl reads first
+    difficulty: medium
+  - slug: authn-token
+    name: Who is asking
+    difficulty: medium

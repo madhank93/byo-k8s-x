@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"sort"
@@ -66,6 +67,9 @@ func init() {
 	register(Stage{Slug: "apply-ssa", Run: stageApplySSA})
 	register(Stage{Slug: "apply-conflict", Run: stageApplyConflict})
 	register(Stage{Slug: "subresource-status", Run: stageSubresourceStatus})
+	register(Stage{Slug: "subresource-scale", Run: stageSubresourceScale})
+	register(Stage{Slug: "openapi", Run: stageOpenAPI})
+	register(Stage{Slug: "authn-token", Run: stageAuthnToken})
 }
 
 // stageServe checks the program serves HTTP where it was told to, says it is
@@ -1484,6 +1488,10 @@ func serve(ctx context.Context, bin string, args ...string) (*server, func(), er
 		res, _, err := request(ctx, http.MethodGet, srv.url+"/healthz", nil)
 		if err == nil && res.StatusCode == http.StatusOK {
 			return srv, cleanup, nil
+		}
+		if err == nil && res.StatusCode == http.StatusUnauthorized {
+			cleanup()
+			return nil, nil, fmt.Errorf("GET /healthz on %s answered 401: the health endpoints answer whoever asks, token or not — whatever restarts a server has no credentials, and one that cannot say it is alive is restarted for ever", addr)
 		}
 		if done, result := p.Exited(); done {
 			cleanup()
@@ -3546,6 +3554,1118 @@ func statusConflict(target string, res *http.Response, body []byte) error {
 		return fmt.Errorf("%w\n\nsplitting the object does not split its version: there is one resourceVersion for the whole namespace, and a write through either endpoint from an old read is refused rather than allowed to undo what happened since", err)
 	}
 	return nil
+}
+
+// stageSubresourceScale checks a second resource, the ReplicationController,
+// and the /scale subresource that reads and writes one number of it.
+//
+// Scale is a shape shared by every resource that has a replica count. The
+// HorizontalPodAutoscaler and kubectl scale work through it on Deployments,
+// StatefulSets and custom resources alike without knowing any of their
+// schemas, and RBAC can grant resizing without granting the rest of the spec.
+func stageSubresourceScale(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := scaleDiscovery(ctx, srv); err != nil {
+		return err
+	}
+
+	const (
+		ns    = "scale-demo"
+		rcs   = "/api/v1/namespaces/" + ns + "/replicationcontrollers"
+		rc    = rcs + "/web"
+		scale = rc + "/scale"
+	)
+	if _, err := srv.create(ctx, "/api/v1/namespaces", map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata":   map[string]any{"name": ns},
+	}); err != nil {
+		return err
+	}
+
+	// No replicas, no selector, and a status the server did not observe: all
+	// three are the server's to fill in.
+	created, err := srv.create(ctx, rcs, map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ReplicationController",
+		"metadata":   map[string]any{"name": "web", "labels": map[string]any{"app": "web"}},
+		"spec":       map[string]any{"template": scaleTemplate()},
+		"status":     map[string]any{"replicas": 7},
+	})
+	if err != nil {
+		return fmt.Errorf("%w\n\nreplicationcontrollers is a second resource beside configmaps, served at the same shape of URL: what a configmap can do, it can do", err)
+	}
+	if created["kind"] != "ReplicationController" {
+		return fmt.Errorf("POST %s answered kind %v rather than ReplicationController: each resource stores and answers its own kind", rcs, created["kind"])
+	}
+	if n, ok := scaleReplicas(created, "spec"); !ok || n != 1 {
+		return fmt.Errorf("the created controller has spec.replicas %v, and the body named none: an absent replica count defaults to 1, so a controller nobody sized still runs something", scaleHalf(created, "spec")["replicas"])
+	}
+	if selector := scaleHalf(created, "spec")["selector"]; !reflect.DeepEqual(selector, scaleTemplate()["metadata"].(map[string]any)["labels"]) {
+		return fmt.Errorf("the created controller has spec.selector %v, and the body named none: an absent selector is copied from spec.template.metadata.labels, so the controller selects exactly the pods it makes", selector)
+	}
+	if n, ok := scaleReplicas(created, "status"); !ok || n != 0 {
+		return fmt.Errorf("the created controller has status %v, where the body said replicas 7: status is what a controller observed, and nothing has been observed yet — the server sets it to {\"replicas\": 0} whatever a create sends", created["status"])
+	}
+
+	// The basics, briefly: everything else a configmap does has been graded on
+	// configmaps, and this is the same code over another resource.
+	got, err := srv.getJSON(ctx, rc)
+	if err != nil {
+		return err
+	}
+	if metaField(got, "uid") != metaField(created, "uid") {
+		return fmt.Errorf("GET %s answered uid %q, and the controller was created with %q", rc, metaField(got, "uid"), metaField(created, "uid"))
+	}
+	for _, path := range []string{rcs, "/api/v1/replicationcontrollers"} {
+		names, list, err := srv.names(ctx, path)
+		if err != nil {
+			return err
+		}
+		if list["kind"] != "ReplicationControllerList" || len(names) != 1 || names[0] != "web" {
+			return fmt.Errorf("GET %s answered kind %v with items %v, where it should be a ReplicationControllerList holding web: a list is named after the kind it holds", path, list["kind"], names)
+		}
+	}
+
+	// The main endpoint keeps the stored status, as a namespace's did.
+	res, body, err := srv.send(ctx, http.MethodPut, rc, map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ReplicationController",
+		"metadata":   map[string]any{"name": "web", "resourceVersion": metaField(created, "resourceVersion"), "labels": map[string]any{"app": "web", "tier": "front"}},
+		"spec":       map[string]any{"replicas": 2, "selector": scaleHalf(created, "spec")["selector"], "template": scaleTemplate()},
+		"status":     map[string]any{"replicas": 9},
+	})
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PUT %s answered %d rather than 200\nthe body was:\n%s", rc, res.StatusCode, tail(string(body)))
+	}
+	updated, err := decode(body)
+	if err != nil {
+		return fmt.Errorf("the reply to PUT %s is not JSON (%w)\nthe body was:\n%s", rc, err, tail(string(body)))
+	}
+	if n, _ := scaleReplicas(updated, "status"); n != 0 {
+		return fmt.Errorf("after a PUT %s whose body carried status.replicas 9, the controller has status %v: the main endpoint keeps the stored status, as it does for a namespace", rc, updated["status"])
+	}
+	res, body, err = srv.patch(ctx, rc, "application/merge-patch+json", map[string]any{"status": map[string]any{"replicas": 9}})
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PATCH %s answered %d rather than 200\nthe body was:\n%s", rc, res.StatusCode, tail(string(body)))
+	}
+	kept, err := decode(body)
+	if err != nil {
+		return fmt.Errorf("the reply to PATCH %s is not JSON (%w)\nthe body was:\n%s", rc, err, tail(string(body)))
+	}
+	if n, _ := scaleReplicas(kept, "status"); n != 0 {
+		return fmt.Errorf("after a merge patch of %s setting status.replicas 9, the controller has status %v: a patch through the main endpoint keeps the stored status too — it is the same endpoint, in fewer words", rc, kept["status"])
+	}
+
+	// A status written through /status, so the Scale has a count of its own to
+	// report rather than a zero that could be a constant.
+	res, body, err = srv.send(ctx, http.MethodPut, rc+"/status", map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ReplicationController",
+		"metadata":   map[string]any{"name": "web"},
+		"status":     map[string]any{"replicas": 2},
+	})
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PUT %s/status answered %d rather than 200: a controller writes what it observed through the status subresource, as for a namespace\nthe body was:\n%s", rc, res.StatusCode, tail(string(body)))
+	}
+	before, err := srv.getJSON(ctx, rc)
+	if err != nil {
+		return err
+	}
+	if n, _ := scaleReplicas(before, "status"); n != 2 {
+		return fmt.Errorf("after PUT %s/status with replicas 2 the controller has status %v", rc, before["status"])
+	}
+
+	s, err := srv.getJSON(ctx, scale)
+	if err != nil {
+		return fmt.Errorf("%w\n\nthe scale subresource is how anything that resizes workloads reads one: the HPA and kubectl scale know the Scale shape, and nothing about a ReplicationController", err)
+	}
+	if err := scaleWant(s, "GET "+scale, before, 2, 2); err != nil {
+		return err
+	}
+	// Read many times: a selector built by ranging over a map comes out in
+	// whatever order the map gives, which one read can happen to get right.
+	for i := 0; i < 20; i++ {
+		if i > 0 {
+			if s, err = srv.getJSON(ctx, scale); err != nil {
+				return err
+			}
+		}
+		if sel, _ := scaleHalf(s, "status")["selector"].(string); sel != "app=web,env=prod,tier=front" {
+			return fmt.Errorf("GET %s answered status.selector %q on read %d, where the controller selects %v: a Scale carries the selector as one label-selector string, k=v pairs sorted by key and joined with commas, so the HPA can list the pods it is scaling with ?labelSelector= — and sorted, so the same selector is always the same string", scale, sel, i+1, scaleHalf(before, "spec")["selector"])
+		}
+	}
+
+	// Opened from the controller's current version, so the next event is the
+	// scale write and nothing earlier.
+	w, err := srv.watch(ctx, rcs+"?watch=true&resourceVersion="+url.QueryEscape(metaField(before, "resourceVersion")))
+	if err != nil {
+		return err
+	}
+	defer w.stop()
+
+	// The Scale carries a status and a selector of its own; only the count is
+	// taken.
+	res, body, err = srv.send(ctx, http.MethodPut, scale, map[string]any{
+		"apiVersion": "autoscaling/v1",
+		"kind":       "Scale",
+		"metadata":   map[string]any{"name": "web", "namespace": ns, "resourceVersion": metaField(before, "resourceVersion")},
+		"spec":       map[string]any{"replicas": 3},
+		"status":     map[string]any{"replicas": 8, "selector": "app=other"},
+	})
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PUT %s answered %d rather than 200: writing a Scale is how a controller is resized, and the reply is the new Scale\nthe body was:\n%s", scale, res.StatusCode, tail(string(body)))
+	}
+	reply, err := decode(body)
+	if err != nil {
+		return fmt.Errorf("the reply to PUT %s is not JSON (%w)\nthe body was:\n%s", scale, err, tail(string(body)))
+	}
+	after, err := srv.getJSON(ctx, rc)
+	if err != nil {
+		return err
+	}
+	if err := scaleWant(reply, "the reply to PUT "+scale, after, 3, 2); err != nil {
+		return fmt.Errorf("%w\n\nthe reply is the Scale of the controller as it now is, resourceVersion included, so the client can send its next write from it", err)
+	}
+	if metaField(after, "resourceVersion") == metaField(before, "resourceVersion") {
+		return fmt.Errorf("the controller is still at resourceVersion %q after PUT %s changed its replica count: a write through a subresource is a write to the object", metaField(before, "resourceVersion"), scale)
+	}
+	if n, _ := scaleReplicas(after, "spec"); n != 3 {
+		return fmt.Errorf("after PUT %s with spec.replicas 3 the controller has spec.replicas %v: the Scale is a view of the controller, and writing it writes the controller", scale, scaleHalf(after, "spec")["replicas"])
+	}
+	if err := scaleUntouched(before, after, "PUT "+scale); err != nil {
+		return err
+	}
+	kind, obj, err := w.next(ctx, "MODIFIED web for the scale write")
+	if err != nil {
+		return fmt.Errorf("%w\n\na scale write goes through the same store as any other write, and the controller that makes the pods learns its new count from this event", err)
+	}
+	if n, _ := scaleReplicas(obj, "spec"); kind != "MODIFIED" || metaField(obj, "name") != "web" || n != 3 {
+		return fmt.Errorf("the watch on %s sent %s %s with spec.replicas %v, where MODIFIED web with spec.replicas 3 was expected: the event holds the controller, not the Scale", rcs, kind, metaField(obj, "name"), scaleHalf(obj, "spec")["replicas"])
+	}
+
+	// The refusals. None of them may move the controller.
+	current := metaField(after, "resourceVersion")
+	refusals := []struct {
+		what   string
+		body   map[string]any
+		code   int
+		reason string
+		why    string
+	}{
+		{"carrying the resourceVersion from before the last scale", scaleBody("web", metaField(before, "resourceVersion"), 4), http.StatusConflict, "Conflict",
+			"a resourceVersion in a Scale is a precondition on the controller, as in any write: two autoscalers acting on the same old read must not both win"},
+		{"carrying metadata.name \"other\"", scaleBody("other", "", 4), http.StatusBadRequest, "BadRequest",
+			"the name in the body has to agree with the URL: a Scale for one controller sent to another is a client bug, not a resize"},
+		{"with spec.replicas -1", scaleBody("web", "", -1), http.StatusUnprocessableEntity, "Invalid",
+			"a replica count below zero means nothing, and storing it hands the controller a number it cannot act on"},
+		{"with no spec.replicas", scaleBody("web", "", nil), http.StatusUnprocessableEntity, "Invalid",
+			"the count is the only thing a Scale writes; a Scale without one is not a request to scale to zero"},
+		{"with spec.replicas 2.5", scaleBody("web", "", 2.5), http.StatusUnprocessableEntity, "Invalid",
+			"a replica count is a whole number of pods; 2.5 is refused, not rounded"},
+		{"with spec.replicas \"three\"", scaleBody("web", "", "three"), http.StatusUnprocessableEntity, "Invalid",
+			"a replica count is an integer, and a body that says otherwise is refused field by field as 422 rather than stored"},
+	}
+	for _, r := range refusals {
+		res, body, err := srv.send(ctx, http.MethodPut, scale, r.body)
+		if err != nil {
+			return err
+		}
+		if err := wantStatus("PUT "+scale+" "+r.what, res, body, r.code, r.reason); err != nil {
+			return fmt.Errorf("%w\n\n%s", err, r.why)
+		}
+	}
+	got, err = srv.getJSON(ctx, rc)
+	if err != nil {
+		return err
+	}
+	if rv := metaField(got, "resourceVersion"); rv != current {
+		return fmt.Errorf("after five refused PUTs to %s the controller is at resourceVersion %q rather than %q: a write that was refused has to have left the store alone", scale, rv, current)
+	}
+
+	for _, r := range []struct {
+		method string
+		body   any
+	}{{http.MethodGet, nil}, {http.MethodPut, scaleBody("absent", "", 1)}} {
+		res, body, err := srv.send(ctx, r.method, rcs+"/absent/scale", r.body)
+		if err != nil {
+			return err
+		}
+		if err := wantStatus(r.method+" "+rcs+"/absent/scale, where absent has never been created", res, body, http.StatusNotFound, "NotFound"); err != nil {
+			return fmt.Errorf("%w\n\na Scale is a view of a controller, and there is no controller here to view or resize", err)
+		}
+	}
+
+	// What kubectl scale sends: a merge patch of the Scale, applied to the
+	// current Scale and written like a PUT.
+	res, body, err = srv.patch(ctx, scale, "application/merge-patch+json", map[string]any{"spec": map[string]any{"replicas": 5}})
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PATCH %s with the merge patch {\"spec\":{\"replicas\":5}} answered %d rather than 200: this is exactly what kubectl scale --replicas=5 sends\nthe body was:\n%s", scale, res.StatusCode, tail(string(body)))
+	}
+	if reply, err = decode(body); err != nil {
+		return fmt.Errorf("the reply to PATCH %s is not JSON (%w)\nthe body was:\n%s", scale, err, tail(string(body)))
+	}
+	patched, err := srv.getJSON(ctx, rc)
+	if err != nil {
+		return err
+	}
+	if err := scaleWant(reply, "the reply to PATCH "+scale, patched, 5, 2); err != nil {
+		return fmt.Errorf("%w\n\na patch of the Scale is applied to the Scale as it is now, and the result written to the controller like a PUT", err)
+	}
+	if err := scaleUntouched(before, patched, "PATCH "+scale); err != nil {
+		return err
+	}
+	if err := w.want(ctx, "MODIFIED", "web"); err != nil {
+		return err
+	}
+
+	// Asking for the count the controller already has changes nothing, so it
+	// writes nothing: an autoscaler re-asserting its answer every few seconds
+	// must not wake every watcher each time.
+	res, body, err = srv.send(ctx, http.MethodPut, scale, scaleBody("web", "", 5))
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PUT %s with the replica count the controller already has answered %d rather than 200\nthe body was:\n%s", scale, res.StatusCode, tail(string(body)))
+	}
+	if reply, err = decode(body); err != nil {
+		return fmt.Errorf("the reply to PUT %s is not JSON (%w)\nthe body was:\n%s", scale, err, tail(string(body)))
+	}
+	if rv := metaField(reply, "resourceVersion"); rv != metaField(patched, "resourceVersion") {
+		return fmt.Errorf("PUT %s with spec.replicas 5, which the controller already had, moved its resourceVersion from %q to %q: a write that changes nothing is not a write, and is not an event", scale, metaField(patched, "resourceVersion"), rv)
+	}
+
+	// The controller is in the namespace, and goes with it.
+	res, body, err = srv.send(ctx, http.MethodDelete, "/api/v1/namespaces/"+ns, nil)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("DELETE /api/v1/namespaces/%s answered %d\nthe body was:\n%s", ns, res.StatusCode, tail(string(body)))
+	}
+	if err := w.want(ctx, "DELETED", "web"); err != nil {
+		return fmt.Errorf("%w\n\ndeleting a namespace deletes every resource in it, not only configmaps, and each one is an event to whoever is watching", err)
+	}
+	res, body, err = srv.send(ctx, http.MethodGet, rc, nil)
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("GET "+rc+" after its namespace was deleted", res, body, http.StatusNotFound, "NotFound"); err != nil {
+		return fmt.Errorf("%w\n\nwhat is in a namespace goes with it, whatever resource it is: a namespace delete that knows only about configmaps leaves the second resource behind", err)
+	}
+	return nil
+}
+
+// scaleDiscovery insists /api/v1 lists the controller and both its
+// subresources. kubectl scale finds the Scale endpoint through discovery, and
+// refuses a resource that lists none.
+func scaleDiscovery(ctx context.Context, srv *server) error {
+	list, err := srv.getJSON(ctx, "/api/v1")
+	if err != nil {
+		return err
+	}
+	entries := map[string]map[string]any{}
+	resources, _ := list["resources"].([]any)
+	for _, r := range resources {
+		if m, ok := r.(map[string]any); ok {
+			name, _ := m["name"].(string)
+			entries[name] = m
+		}
+	}
+	for _, want := range []struct {
+		name, kind, group, version string
+		verbs                      []string
+	}{
+		{"replicationcontrollers", "ReplicationController", "", "", []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
+		{"replicationcontrollers/scale", "Scale", "autoscaling", "v1", []string{"get", "patch", "update"}},
+		{"replicationcontrollers/status", "ReplicationController", "", "", []string{"get", "update"}},
+	} {
+		e := entries[want.name]
+		if e == nil {
+			return fmt.Errorf("GET /api/v1 lists no resource named %s: a client is told a resource and each of its subresources exist through discovery, and nothing else", want.name)
+		}
+		if namespaced, _ := e["namespaced"].(bool); !namespaced {
+			return fmt.Errorf("the %s entry says namespaced: false, and a replication controller lives in a namespace — a subresource is scoped like the resource it belongs to", want.name)
+		}
+		if e["kind"] != want.kind {
+			return fmt.Errorf("the %s entry has kind %v rather than %s: kind is what goes in and comes out of the endpoint", want.name, e["kind"], want.kind)
+		}
+		if want.group != "" && (e["group"] != want.group || e["version"] != want.version) {
+			return fmt.Errorf("the %s entry has group %v and version %v, where the Scale is autoscaling/v1: a subresource can answer a kind from another group, and the entry says which so a client decodes it right", want.name, e["group"], e["version"])
+		}
+		verbs, _ := e["verbs"].([]any)
+		for _, v := range want.verbs {
+			if !contains(verbs, v) {
+				return fmt.Errorf("the %s entry does not offer the verb %q (it offers %v)", want.name, v, e["verbs"])
+			}
+		}
+	}
+	if short, _ := entries["replicationcontrollers"]["shortNames"].([]any); !contains(short, "rc") {
+		return fmt.Errorf("the replicationcontrollers entry has shortNames %v, without rc: kubectl get rc works because discovery says rc means this resource", entries["replicationcontrollers"]["shortNames"])
+	}
+	return nil
+}
+
+// scaleTemplate is the pod template every write in the stage carries. Its
+// labels have three keys so that an unsorted selector string shows up.
+func scaleTemplate() map[string]any {
+	return map[string]any{
+		"metadata": map[string]any{"labels": map[string]any{"tier": "front", "app": "web", "env": "prod"}},
+		"spec":     map[string]any{"containers": []any{map[string]any{"name": "web", "image": "nginx"}}},
+	}
+}
+
+// scaleBody is a Scale as a client sends it. A nil replicas leaves the field
+// out; resourceVersion "" sends no precondition.
+func scaleBody(name, resourceVersion string, replicas any) map[string]any {
+	meta := map[string]any{"name": name}
+	if resourceVersion != "" {
+		meta["resourceVersion"] = resourceVersion
+	}
+	spec := map[string]any{}
+	if replicas != nil {
+		spec["replicas"] = replicas
+	}
+	return map[string]any{"apiVersion": "autoscaling/v1", "kind": "Scale", "metadata": meta, "spec": spec}
+}
+
+func scaleHalf(obj map[string]any, half string) map[string]any {
+	m, _ := obj[half].(map[string]any)
+	return m
+}
+
+// scaleReplicas reads spec.replicas or status.replicas, a JSON number.
+func scaleReplicas(obj map[string]any, half string) (float64, bool) {
+	n, ok := scaleHalf(obj, half)["replicas"].(float64)
+	return n, ok
+}
+
+// scaleWant checks a Scale against the controller it is a view of.
+func scaleWant(s map[string]any, what string, rc map[string]any, spec, status float64) error {
+	if s["kind"] != "Scale" || s["apiVersion"] != "autoscaling/v1" {
+		return fmt.Errorf("%s has kind %v and apiVersion %v, where it is a Scale in autoscaling/v1: one shape for every scalable resource is the point of the subresource", what, s["kind"], s["apiVersion"])
+	}
+	for _, field := range []string{"name", "namespace", "uid", "resourceVersion", "creationTimestamp"} {
+		if got, want := metaField(s, field), metaField(rc, field); got != want {
+			return fmt.Errorf("%s has metadata.%s %q, and the controller has %q: a Scale's metadata is the controller's own, so a client can send its resourceVersion back as a precondition", what, field, got, want)
+		}
+	}
+	if n, ok := scaleReplicas(s, "spec"); !ok || n != spec {
+		return fmt.Errorf("%s has spec %v, where spec.replicas should be %v: the Scale's spec.replicas is the controller's spec.replicas", what, s["spec"], spec)
+	}
+	if n, ok := scaleReplicas(s, "status"); !ok || n != status {
+		return fmt.Errorf("%s has status %v, where status.replicas should be %v: the Scale's status.replicas is the controller's status.replicas, what it observed rather than what was asked for", what, s["status"], status)
+	}
+	return nil
+}
+
+// scaleUntouched insists a scale write changed the replica count and nothing
+// else a user owns or a controller observed.
+func scaleUntouched(before, after map[string]any, what string) error {
+	for _, part := range []struct {
+		name          string
+		before, after any
+	}{
+		{"metadata.labels", scaleHalf(before, "metadata")["labels"], scaleHalf(after, "metadata")["labels"]},
+		{"spec.template", scaleHalf(before, "spec")["template"], scaleHalf(after, "spec")["template"]},
+		{"spec.selector", scaleHalf(before, "spec")["selector"], scaleHalf(after, "spec")["selector"]},
+		{"status", before["status"], after["status"]},
+	} {
+		if !reflect.DeepEqual(part.before, part.after) {
+			return fmt.Errorf("after %s the controller's %s changed from %v to %v: a Scale writes the replica count and nothing else, which is what lets RBAC grant resizing without granting the template", what, part.name, part.before, part.after)
+		}
+	}
+	return nil
+}
+
+// stageOpenAPI checks the OpenAPI v3 document: the schema of every type the
+// server serves, which is what kubectl explain prints, what client-side
+// validation checks a manifest against, and where a client learns how each
+// list in an object merges.
+//
+// It is read before almost anything else, so it is cached hard. The index
+// names one URL per group-version with a hash of the document in it; a URL
+// that changes whenever the content does can be cached for ever, and a client
+// re-reads only the group-versions whose hash moved.
+func stageOpenAPI(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	first, err := openapiIndex(ctx, srv)
+	if err != nil {
+		return err
+	}
+
+	res, raw, err := openapiGet(ctx, srv.url+first, "")
+	if err != nil {
+		return fmt.Errorf("GET %s: %w\nthe program said:\n%s", first, err, tail(srv.p.Stdout()))
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s answered %d: this is the URL GET /openapi/v3 named for api/v1, and a client follows it exactly as given, query and all\nthe body was:\n%s",
+			first, res.StatusCode, tail(string(raw)))
+	}
+	if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		return fmt.Errorf("GET %s answered with Content-Type %q, and the document is JSON", first, ct)
+	}
+	doc, err := decode(raw)
+	if err != nil {
+		return fmt.Errorf("GET %s did not answer JSON (%w)\nthe body was:\n%s", first, err, tail(string(raw)))
+	}
+	if version, _ := doc["openapi"].(string); !strings.HasPrefix(version, "3.") {
+		return fmt.Errorf("the document at %s has openapi %v, and this is the v3 endpoint: the field is the OpenAPI version the document is written in, and a client picks its parser by it", first, doc["openapi"])
+	}
+	if info, _ := doc["info"].(map[string]any); info["title"] == nil || info["version"] == nil {
+		return fmt.Errorf("the document at %s has info %v, and an OpenAPI document's info carries a title and a version", first, doc["info"])
+	}
+
+	// The hash in the URL is a promise that what it names never changes.
+	if cc := res.Header.Get("Cache-Control"); !strings.Contains(cc, "immutable") {
+		return fmt.Errorf("GET %s answered Cache-Control %q, and a URL carrying the current hash serves content that cannot change under it: say immutable, and a client keeps its copy until the index names a different hash", first, cc)
+	}
+	etag := res.Header.Get("ETag")
+	if len(etag) < 3 || !strings.HasPrefix(etag, `"`) || !strings.HasSuffix(etag, `"`) {
+		return fmt.Errorf("GET %s answered ETag %q, and the document needs one, quoted as HTTP writes entity tags: it is what a client sends back to ask whether its copy is still good", first, etag)
+	}
+
+	// Without the hash, the same document: the hash is for caching, not for
+	// finding it.
+	const plain = "/openapi/v3/api/v1"
+	res, again, err := openapiGet(ctx, srv.url+plain, "")
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", plain, err)
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s answered %d: the document is served with or without ?hash=, and the hash only says which version the client expects\nthe body was:\n%s",
+			plain, res.StatusCode, tail(string(again)))
+	}
+	if got := res.Header.Get("ETag"); got != etag {
+		return fmt.Errorf("GET %s answered ETag %s and GET %s answered %s: it is the same document, and its tag is a function of its bytes", plain, got, first, etag)
+	}
+	if !bytes.Equal(raw, again) {
+		return fmt.Errorf("GET %s and GET %s answered different bytes: it is one document, and a hash taken of it has to describe whichever copy a client got", first, plain)
+	}
+
+	res, body, err := openapiGet(ctx, srv.url+plain, etag)
+	if err != nil {
+		return fmt.Errorf("GET %s with If-None-Match: %w", plain, err)
+	}
+	if res.StatusCode != http.StatusNotModified {
+		return fmt.Errorf("GET %s with If-None-Match: %s answered %d, and that is the ETag this server just gave for it: a match is 304 Not Modified, so a client that already has the document is not sent it again", plain, etag, res.StatusCode)
+	}
+	if len(body) != 0 {
+		return fmt.Errorf("the 304 for GET %s carried a %d-byte body, and a 304 has none: the point of it is that the client already holds the bytes", plain, len(body))
+	}
+
+	// A hash that is not the document's: what a client still holding an old
+	// index would ask for.
+	const stale = "/openapi/v3/api/v1?hash=0000"
+	if res, _, err = openapiGet(ctx, srv.url+stale, ""); err != nil {
+		return fmt.Errorf("GET %s: %w", stale, err)
+	}
+	if strings.Contains(res.Header.Get("Cache-Control"), "immutable") {
+		return fmt.Errorf("GET %s answered Cache-Control %q, and that hash is not the document's: immutable promises the content behind a URL never changes, so it belongs only on the URL carrying the current hash", stale, res.Header.Get("Cache-Control"))
+	}
+
+	if err := openapiSchemas(doc); err != nil {
+		return err
+	}
+
+	paths, _ := doc["paths"].(map[string]any)
+	const item = "/api/v1/namespaces/{namespace}/configmaps/{name}"
+	ops, _ := paths[item].(map[string]any)
+	if ops == nil {
+		return fmt.Errorf("the document's paths have no entry %s: paths list every URL the group-version serves, with the namespace and name as {placeholders}", item)
+	}
+	for _, verb := range []string{"get", "put", "patch", "delete"} {
+		if ops[verb] == nil {
+			return fmt.Errorf("the paths entry %s has no %s operation: one configmap can be read, replaced, patched and deleted at that URL, and the document says so with one operation per method", item, verb)
+		}
+	}
+
+	const unknown = "/openapi/v3/apis/nope/v1"
+	res, body, err = openapiGet(ctx, srv.url+unknown, "")
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", unknown, err)
+	}
+	if res.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("GET %s answered %d: no group nope is served here, so it has no document, and a client that guessed the URL needs to hear 404 rather than read some other group's schema as this one's\nthe body was:\n%s",
+			unknown, res.StatusCode, tail(string(body)))
+	}
+	if status, err := decode(body); err != nil || status["kind"] != "Status" {
+		return fmt.Errorf("the 404 for GET %s is not a Status object: every failure this server reports is one\nthe body was:\n%s", unknown, tail(string(body)))
+	}
+
+	second, err := openapiIndex(ctx, srv)
+	if err != nil {
+		return err
+	}
+	if second != first {
+		return fmt.Errorf("GET /openapi/v3 named %s and then %s with nothing changed in between: the hash is of the document's bytes, so a document that is not built the same way every time — map order, a timestamp — moves the hash and empties every client's cache for nothing", first, second)
+	}
+	return nil
+}
+
+// openapiIndex reads GET /openapi/v3 and returns the URL it names for api/v1.
+func openapiIndex(ctx context.Context, srv *server) (string, error) {
+	index, err := srv.getJSON(ctx, "/openapi/v3")
+	if err != nil {
+		return "", fmt.Errorf("%w\n\nthe index is where a client starts: one entry per group-version, each naming the URL of that group-version's document", err)
+	}
+	paths, _ := index["paths"].(map[string]any)
+	entry, _ := paths["api/v1"].(map[string]any)
+	link, _ := entry["serverRelativeURL"].(string)
+	if !strings.HasPrefix(link, "/") {
+		return "", fmt.Errorf("GET /openapi/v3 answered paths %v, with no serverRelativeURL for api/v1: the key is the group-version's path without a leading slash, and its serverRelativeURL is where the document is, with ?hash= on the end", index["paths"])
+	}
+	return link, nil
+}
+
+// openapiGet is a GET that can carry If-None-Match, which request cannot.
+func openapiGet(ctx context.Context, url, ifNoneMatch string) (*http.Response, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if ifNoneMatch != "" {
+		req.Header.Set("If-None-Match", ifNoneMatch)
+	}
+	res, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 8<<20))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the response body: %w", err)
+	}
+	return res, body, nil
+}
+
+const openapiObjectMeta = "io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"
+
+// openapiSchemas checks the schemas kubectl needs for what this server serves.
+func openapiSchemas(doc map[string]any) error {
+	components, _ := doc["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+	get := func(name string) (map[string]any, error) {
+		s, _ := schemas[name].(map[string]any)
+		if s == nil {
+			return nil, fmt.Errorf("components.schemas has no %s: schemas are named by the Go package and type the real server generates them from, and a client looks them up by that name", name)
+		}
+		return s, nil
+	}
+
+	configMap, err := get("io.k8s.api.core.v1.ConfigMap")
+	if err != nil {
+		return err
+	}
+	if err := openapiKind(configMap, "ConfigMap"); err != nil {
+		return err
+	}
+	props, _ := configMap["properties"].(map[string]any)
+	rawMeta, _ := props["metadata"].(map[string]any)
+	if ref := openapiRef(rawMeta); ref != "#/components/schemas/"+openapiObjectMeta {
+		return fmt.Errorf("ConfigMap's metadata property refers to %q, and every object's metadata is the one shared ObjectMeta schema, by $ref to #/components/schemas/%s", ref, openapiObjectMeta)
+	}
+	for _, check := range []struct{ field, typ, format string }{
+		{"apiVersion", "string", ""},
+		{"kind", "string", ""},
+		{"data", "map", ""},
+		{"binaryData", "map", "byte"},
+	} {
+		if err := openapiType(schemas, configMap, "ConfigMap", check.typ, check.format, check.field); err != nil {
+			return err
+		}
+	}
+
+	namespace, err := get("io.k8s.api.core.v1.Namespace")
+	if err != nil {
+		return err
+	}
+	if err := openapiKind(namespace, "Namespace"); err != nil {
+		return err
+	}
+	if openapiProp(schemas, namespace, "spec") == nil {
+		return fmt.Errorf("Namespace has no spec property: kubectl explain namespace.spec reads it, and a field the schema does not list is one client-side validation refuses")
+	}
+	if err := openapiType(schemas, namespace, "Namespace", "string", "", "status", "phase"); err != nil {
+		return err
+	}
+
+	rc, err := get("io.k8s.api.core.v1.ReplicationController")
+	if err != nil {
+		return err
+	}
+	if err := openapiKind(rc, "ReplicationController"); err != nil {
+		return err
+	}
+	for _, check := range []struct {
+		typ, format string
+		path        []string
+	}{
+		{"integer", "int32", []string{"spec", "replicas"}},
+		{"map", "", []string{"spec", "selector"}},
+		{"object", "", []string{"spec", "template"}},
+		{"integer", "", []string{"status", "replicas"}},
+	} {
+		if err := openapiType(schemas, rc, "ReplicationController", check.typ, check.format, check.path...); err != nil {
+			return err
+		}
+	}
+
+	meta, err := get(openapiObjectMeta)
+	if err != nil {
+		return err
+	}
+	for _, field := range []string{"name", "namespace", "uid", "resourceVersion", "creationTimestamp"} {
+		if err := openapiType(schemas, meta, "ObjectMeta", "string", "", field); err != nil {
+			return err
+		}
+	}
+	for _, field := range []string{"labels", "annotations"} {
+		if err := openapiType(schemas, meta, "ObjectMeta", "map", "", field); err != nil {
+			return err
+		}
+	}
+	for _, field := range []string{"finalizers", "ownerReferences", "managedFields"} {
+		if err := openapiType(schemas, meta, "ObjectMeta", "array", "", field); err != nil {
+			return err
+		}
+	}
+	finalizers := openapiProp(schemas, meta, "finalizers")
+	if items, _ := finalizers["items"].(map[string]any); items["type"] != "string" {
+		return fmt.Errorf("ObjectMeta.finalizers has items %v, and a finalizer is a string", finalizers["items"])
+	}
+
+	// These two are the strategies stage 19 merges by. kubectl computes the
+	// strategic patch it sends from them, so a schema that disagrees with the
+	// server has kubectl building patches the server then reads another way.
+	if finalizers["x-kubernetes-patch-strategy"] != "merge" {
+		return fmt.Errorf("ObjectMeta.finalizers has x-kubernetes-patch-strategy %v, and this server merges finalizers as a set (stage 19): the schema has to say \"merge\", because it is where kubectl learns that, and it builds its patches from what it learns", finalizers["x-kubernetes-patch-strategy"])
+	}
+	owners := openapiProp(schemas, meta, "ownerReferences")
+	if owners["x-kubernetes-patch-strategy"] != "merge" || owners["x-kubernetes-patch-merge-key"] != "uid" {
+		return fmt.Errorf("ObjectMeta.ownerReferences has x-kubernetes-patch-strategy %v and x-kubernetes-patch-merge-key %v, and this server merges ownerReferences by uid (stage 19): the schema has to say strategy \"merge\" with merge key \"uid\", or kubectl's patches replace the list it should be merging into",
+			owners["x-kubernetes-patch-strategy"], owners["x-kubernetes-patch-merge-key"])
+	}
+	return nil
+}
+
+// openapiKind checks a top-level schema is an object and names the kind it
+// is, which is how kubectl explain maps "configmap" to a schema.
+func openapiKind(schema map[string]any, kind string) error {
+	if schema["type"] != "object" {
+		return fmt.Errorf("the %s schema has type %v, and a kind's schema is type object", kind, schema["type"])
+	}
+	gvks, _ := schema["x-kubernetes-group-version-kind"].([]any)
+	for _, g := range gvks {
+		if m, _ := g.(map[string]any); m["group"] == "" && m["version"] == "v1" && m["kind"] == kind {
+			return nil
+		}
+	}
+	return fmt.Errorf("the %s schema has x-kubernetes-group-version-kind %v, and it needs [{group: \"\", version: v1, kind: %s}]: a schema is just a name until this ties it to the kind a client is holding — it is how kubectl explain %s finds it",
+		kind, schema["x-kubernetes-group-version-kind"], kind, strings.ToLower(kind))
+}
+
+// openapiType checks the property at path has the type, and the format when
+// one is named. "map" is an object whose additionalProperties are strings,
+// with the format on the inner schema.
+func openapiType(schemas, root map[string]any, kind, typ, format string, path ...string) error {
+	where := kind + "." + strings.Join(path, ".")
+	node := openapiProp(schemas, root, path...)
+	if node == nil {
+		return fmt.Errorf("%s is not in the schema: kubectl explain prints nothing for a field the schema leaves out, and client-side validation refuses a manifest that sets it", where)
+	}
+	if typ == "map" {
+		inner, _ := node["additionalProperties"].(map[string]any)
+		if node["type"] != "object" || inner["type"] != "string" {
+			return fmt.Errorf("%s has type %v and additionalProperties %v, and it is a map of strings: type object, additionalProperties {type: string} — the keys are the user's, so they cannot be listed as properties", where, node["type"], node["additionalProperties"])
+		}
+		if format != "" && inner["format"] != format {
+			return fmt.Errorf("%s has additionalProperties %v, and its values carry format %q: the format is how a client knows to base64-encode them", where, node["additionalProperties"], format)
+		}
+		return nil
+	}
+	if node["type"] != typ {
+		return fmt.Errorf("%s has type %v, and it is %s: client-side validation refuses a manifest whose field has the wrong type, by this schema, before it is ever sent", where, node["type"], typ)
+	}
+	if format != "" && node["format"] != format {
+		return fmt.Errorf("%s has format %v, and it is %s %s: the format says how wide a number is, and a client generated from this schema picks its type by it", where, node["format"], typ, format)
+	}
+	return nil
+}
+
+// openapiProp walks properties along path, resolving a $ref at each step.
+func openapiProp(schemas, schema map[string]any, path ...string) map[string]any {
+	node := schema
+	for _, name := range path {
+		props, _ := node["properties"].(map[string]any)
+		node = openapiResolve(schemas, props[name])
+		if node == nil {
+			return nil
+		}
+	}
+	return node
+}
+
+// openapiRef is the $ref a property points at, written directly or, as the
+// real server writes it beside a default, as the single entry of an allOf.
+func openapiRef(node map[string]any) string {
+	if ref, ok := node["$ref"].(string); ok {
+		return ref
+	}
+	if all, _ := node["allOf"].([]any); len(all) == 1 {
+		if m, _ := all[0].(map[string]any); m != nil {
+			ref, _ := m["$ref"].(string)
+			return ref
+		}
+	}
+	return ""
+}
+
+// openapiResolve follows one $ref to #/components/schemas/X.
+func openapiResolve(schemas map[string]any, node any) map[string]any {
+	m, _ := node.(map[string]any)
+	if name, ok := strings.CutPrefix(openapiRef(m), "#/components/schemas/"); ok {
+		target, _ := schemas[name].(map[string]any)
+		return target
+	}
+	return m
+}
+
+// The token file this stage hands the program. alice's groups are the quoted
+// fourth column, bob has none, and the blank line is there to be skipped.
+const authnTokens = `alice-token-0001,alice,1001,"developers,oncall"
+
+bob-token-0002,bob,1002
+`
+
+const authnWhoamiPath = "/apis/authentication.k8s.io/v1/selfsubjectreviews"
+
+// stageAuthnToken checks the server can tell who is asking, and refuses to
+// answer anybody it cannot name.
+//
+// Authentication only produces a name and a list of groups. What that name is
+// allowed to do is the next question, and a separate one; this stage is about
+// the answer being right, and about a request with no good answer never
+// reaching a handler at all.
+func stageAuthnToken(ctx context.Context, _ *kube.Env, bin string) error {
+	if err := authnAnonymous(ctx, bin); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "byok8s-apiserver-*")
+	if err != nil {
+		return fmt.Errorf("make a directory for the token file: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	file := filepath.Join(dir, "tokens.csv")
+	if err := os.WriteFile(file, []byte(authnTokens), 0o600); err != nil {
+		return fmt.Errorf("write the token file: %w", err)
+	}
+
+	srv, cleanup, err := serve(ctx, bin, "-token-auth-file", file)
+	if err != nil {
+		return fmt.Errorf("%w\n\nthis stage passes -token-auth-file <path>, a CSV of token,user,uid[,\"groups\"]: the harness waits on GET /healthz with no token, and the three health endpoints answer whoever asks — a kubelet probing the server has no credentials to send", err)
+	}
+	defer cleanup()
+
+	for _, path := range []string{"/healthz", "/livez", "/readyz"} {
+		res, body, err := authnSend(ctx, srv, http.MethodGet, path, "", nil)
+		if err != nil {
+			return err
+		}
+		if res.StatusCode != http.StatusOK {
+			return fmt.Errorf("GET %s with no token answered %d: health is answered without authentication, because what probes it — kubelet, a load balancer — is not a user and has nothing to present\nthe body was:\n%s",
+				path, res.StatusCode, tail(string(body)))
+		}
+	}
+
+	const alice, bob = "Bearer alice-token-0001", "Bearer bob-token-0002"
+	const path = "/api/v1/namespaces/default/configmaps"
+	res, body, err := authnSend(ctx, srv, http.MethodGet, path, alice, nil)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s with alice's token answered %d rather than 200: a token in the file is a user, and once the server knows who is asking the request goes on exactly as it did before there was a file\nthe body was:\n%s",
+			path, res.StatusCode, tail(string(body)))
+	}
+
+	user, err := authnWhoami(ctx, srv, alice)
+	if err != nil {
+		return err
+	}
+	if user["username"] != "alice" || user["uid"] != "1001" {
+		return fmt.Errorf("alice's token reviewed as username %v, uid %v, and the file says alice and 1001: the second and third columns are the user, as written", user["username"], user["uid"])
+	}
+	groups, _ := user["groups"].([]any)
+	for _, want := range []string{"developers", "oncall", "system:authenticated"} {
+		if !contains(groups, want) {
+			return fmt.Errorf("alice's groups are %v, missing %q: the fourth column is one quoted field holding a comma-separated list — split the line with encoding/csv, not strings.Split, or the quotes and the comma inside them break it — and every user who got this far is also in system:authenticated",
+				user["groups"], want)
+		}
+	}
+
+	user, err = authnWhoami(ctx, srv, bob)
+	if err != nil {
+		return err
+	}
+	groups, _ = user["groups"].([]any)
+	if user["username"] != "bob" || !contains(groups, "system:authenticated") {
+		return fmt.Errorf("bob's token reviewed as username %v with groups %v: a line with three columns is a user with no groups of their own, who is still in system:authenticated", user["username"], user["groups"])
+	}
+
+	// Every way of not being somebody. A token that is the start of a real
+	// one is here because a comparison that stops early accepts it.
+	for _, auth := range []string{"", "Bearer nobody-knows-this", "Bearer alice-token", "Basic YWxpY2U6c2VjcmV0", "Token alice-token-0001"} {
+		what := fmt.Sprintf("GET %s with Authorization %q", path, auth)
+		if auth == "" {
+			what = "GET " + path + " with no Authorization header"
+		}
+		res, body, err := authnSend(ctx, srv, http.MethodGet, path, auth, nil)
+		if err != nil {
+			return err
+		}
+		if err := wantStatus(what, res, body, http.StatusUnauthorized, "Unauthorized"); err != nil {
+			return fmt.Errorf("%w\n\n401 means the server could not tell who is asking, and it is answered before the request reaches anything else: a missing header, an unknown token and a scheme this server does not speak are all the same failure", err)
+		}
+	}
+
+	// Refused means refused: a write without a token must not have happened
+	// with a 401 reported afterwards.
+	intruder := map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "intruder"}}
+	if res, body, err = authnSend(ctx, srv, http.MethodPost, path, "", intruder); err != nil {
+		return err
+	}
+	if err := wantStatus("POST "+path+" with no token", res, body, http.StatusUnauthorized, "Unauthorized"); err != nil {
+		return err
+	}
+	if res, body, err = authnSend(ctx, srv, http.MethodGet, path+"/intruder", alice, nil); err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("GET %s/intruder answered %d after a POST of it without a token was refused: authentication runs before the handler, so a refused write stores nothing\nthe body was:\n%s",
+			path, res.StatusCode, tail(string(body)))
+	}
+
+	if err := authnWatch(ctx, srv, path+"?watch=true", "Bearer nobody-knows-this"); err != nil {
+		return err
+	}
+	// Checked last: a program that does not take the flag at all also exits
+	// non-zero here, and the serve above names that failure better.
+	return authnBadFile(ctx, bin)
+}
+
+// authnAnonymous checks a program started without the flag: nothing is
+// refused, and whoever asks is told they are nobody in particular.
+func authnAnonymous(ctx context.Context, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if _, _, err := srv.names(ctx, "/api/v1/namespaces/default/configmaps"); err != nil {
+		return fmt.Errorf("%w\n\nthis program was started without -token-auth-file: with no authenticator configured every earlier stage still has to pass, unchanged", err)
+	}
+
+	groups, err := srv.getJSON(ctx, "/apis")
+	if err != nil {
+		return err
+	}
+	var group map[string]any
+	list, _ := groups["groups"].([]any)
+	for _, g := range list {
+		if m, ok := g.(map[string]any); ok && m["name"] == "authentication.k8s.io" {
+			group = m
+		}
+	}
+	if group == nil {
+		return fmt.Errorf("GET /apis lists no group named authentication.k8s.io: kubectl auth whoami looks for it there before it builds a request, and a group that is not listed is one a client concludes the server does not have")
+	}
+	preferred, _ := group["preferredVersion"].(map[string]any)
+	if preferred["groupVersion"] != "authentication.k8s.io/v1" {
+		return fmt.Errorf("the authentication.k8s.io group prefers %v, and the version it offers is authentication.k8s.io/v1", group["preferredVersion"])
+	}
+
+	resources, err := srv.getJSON(ctx, "/apis/authentication.k8s.io/v1")
+	if err != nil {
+		return err
+	}
+	var reviews map[string]any
+	items, _ := resources["resources"].([]any)
+	for _, r := range items {
+		if m, ok := r.(map[string]any); ok && m["name"] == "selfsubjectreviews" {
+			reviews = m
+		}
+	}
+	if resources["kind"] != "APIResourceList" || reviews == nil {
+		return fmt.Errorf("GET /apis/authentication.k8s.io/v1 answered kind %v without a selfsubjectreviews resource: it is an APIResourceList, like /api/v1, listing what the version offers", resources["kind"])
+	}
+	verbs, _ := reviews["verbs"].([]any)
+	if reviews["kind"] != "SelfSubjectReview" || reviews["namespaced"] != false || !contains(verbs, "create") {
+		return fmt.Errorf("the selfsubjectreviews entry is %v, and it is kind SelfSubjectReview, not namespaced, with the one verb create: a review is asked for and answered, never stored", reviews)
+	}
+
+	user, err := authnWhoami(ctx, srv, "")
+	if err != nil {
+		return err
+	}
+	groupsOf, _ := user["groups"].([]any)
+	if user["username"] != "system:anonymous" || !contains(groupsOf, "system:unauthenticated") {
+		return fmt.Errorf("with no authenticator configured the review says username %v, groups %v, and it is system:anonymous in system:unauthenticated: not knowing who is asking is itself an identity, and a policy can be written against it",
+			user["username"], user["groups"])
+	}
+	return nil
+}
+
+// authnBadFile checks a token file the program cannot read stops it before
+// it serves.
+func authnBadFile(ctx context.Context, bin string) error {
+	dir, err := os.MkdirTemp("", "byok8s-apiserver-*")
+	if err != nil {
+		return fmt.Errorf("make a directory for the token file: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	file := filepath.Join(dir, "tokens.csv")
+	if err := os.WriteFile(file, []byte("alice-token-0001,alice,1001\ncarol-token-0003,carol\n"), 0o600); err != nil {
+		return fmt.Errorf("write the token file: %w", err)
+	}
+
+	addr, err := freeAddr()
+	if err != nil {
+		return err
+	}
+	p, err := runner.Start(ctx, bin, nil, "-addr", addr, "-token-auth-file", file)
+	if err != nil {
+		return err
+	}
+	defer p.Stop(5 * time.Second)
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if done, result := p.Exited(); done {
+			if result.ExitCode == 0 {
+				return fmt.Errorf("given a token file with a two-column line the program exited 0: a file it cannot read is a failure, and the exit code is how whatever started it finds out")
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("given a token file whose second line has two columns (carol-token-0003,carol), the program was still running after 15s: a server that skips the lines it cannot parse starts up missing users nobody is told about, so it refuses to start instead\nthe program said:\n%s",
+		tail(p.Stdout()))
+}
+
+// authnWhoami asks the server who the caller is, as kubectl auth whoami does,
+// and returns the userInfo it answers with.
+func authnWhoami(ctx context.Context, srv *server, auth string) (map[string]any, error) {
+	review := map[string]any{"apiVersion": "authentication.k8s.io/v1", "kind": "SelfSubjectReview"}
+	res, body, err := authnSend(ctx, srv, http.MethodPost, authnWhoamiPath, auth, review)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("POST %s answered %d rather than 201: a review is a create, answered with the object filled in\nthe body was:\n%s",
+			authnWhoamiPath, res.StatusCode, tail(string(body)))
+	}
+	obj, err := decode(body)
+	if err != nil {
+		return nil, fmt.Errorf("the reply to POST %s is not JSON (%w)\nthe body was:\n%s", authnWhoamiPath, err, tail(string(body)))
+	}
+	if obj["kind"] != "SelfSubjectReview" || obj["apiVersion"] != "authentication.k8s.io/v1" {
+		return nil, fmt.Errorf("the reply to POST %s has kind %v, apiVersion %v, and it is the SelfSubjectReview that was sent, from authentication.k8s.io/v1", authnWhoamiPath, obj["kind"], obj["apiVersion"])
+	}
+	status, _ := obj["status"].(map[string]any)
+	user, ok := status["userInfo"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("the SelfSubjectReview has no status.userInfo: that is the answer, the username, uid and groups the server decided this request came from\nthe body was:\n%s", tail(string(body)))
+	}
+	return user, nil
+}
+
+// authnWatch opens a watch with a token the server does not know, and
+// insists it is refused before the stream starts.
+func authnWatch(ctx context.Context, srv *server, path, auth string) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.url+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", auth)
+	res, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return fmt.Errorf("GET %s with an unknown token: %w\n\na watch with a bad token is refused like any other request, straight away", path, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusOK {
+		return fmt.Errorf("GET %s with an unknown token answered 200 and started streaming: a watch is authenticated once, when it opens, so the refusal is a 401 in place of the stream rather than an error somewhere inside it", path)
+	}
+	body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<16))
+	return wantStatus("GET "+path+" with an unknown token", res, body, http.StatusUnauthorized, "Unauthorized")
+}
+
+// authnSend is server.send with an Authorization header, which is left off
+// when auth is empty.
+func authnSend(ctx context.Context, srv *server, method, path, auth string, body any) (*http.Response, []byte, error) {
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, nil, fmt.Errorf("encode the request body: %w", err)
+		}
+		reader = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, srv.url+path, reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Accept", "application/json")
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	res, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s %s: %w\nthe program said:\n%s", method, path, err, tail(srv.p.Stdout()))
+	}
+	defer res.Body.Close()
+	got, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the response body: %w", err)
+	}
+	return res, got, nil
 }
 
 // watchStream is one open watch, decoded event by event in the background so

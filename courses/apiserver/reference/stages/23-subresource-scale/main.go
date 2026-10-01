@@ -8,9 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha512"
 	"encoding/base64"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -546,16 +544,7 @@ func newUID() string {
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:8080", "the address to serve the API on")
 	data := flag.String("data", "", "a directory to keep the objects in; empty keeps them in memory only")
-	tokenFile := flag.String("token-auth-file", "", "a CSV of token,user,uid[,groups] to authenticate bearer tokens against; empty turns authentication off")
 	flag.Parse()
-
-	var tokens map[string]userInfo
-	if *tokenFile != "" {
-		var err error
-		if tokens, err = loadTokens(*tokenFile); err != nil {
-			return err
-		}
-	}
 
 	objects := newStore(*data)
 	if err := objects.load(); err != nil {
@@ -587,46 +576,14 @@ func run() error {
 		})
 	})
 	// The group-less core API is /api; everything else lives under /apis, in a
-	// named group, each listed with the versions it serves.
+	// named group. There are none yet, and the empty list still has to be
+	// there: a client that gets a 404 here decides the server is broken, not
+	// that it has no groups.
 	mux.HandleFunc("GET /apis", func(w http.ResponseWriter, _ *http.Request) {
-		version := map[string]any{"groupVersion": "authentication.k8s.io/v1", "version": "v1"}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"kind":       "APIGroupList",
 			"apiVersion": "v1",
-			"groups": []any{map[string]any{
-				"name":             "authentication.k8s.io",
-				"versions":         []any{version},
-				"preferredVersion": version,
-			}},
-		})
-	})
-	mux.HandleFunc("GET /apis/authentication.k8s.io/v1", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"kind":         "APIResourceList",
-			"apiVersion":   "v1",
-			"groupVersion": "authentication.k8s.io/v1",
-			"resources": []any{map[string]any{
-				"name":         "selfsubjectreviews",
-				"singularName": "selfsubjectreview",
-				"namespaced":   false,
-				"kind":         "SelfSubjectReview",
-				"verbs":        []string{"create"},
-			}},
-		})
-	})
-	// Who the server decided the caller is: what kubectl auth whoami asks,
-	// and the first thing to check when a request is refused.
-	mux.HandleFunc("POST /apis/authentication.k8s.io/v1/selfsubjectreviews", func(w http.ResponseWriter, r *http.Request) {
-		user := r.Context().Value(userKey{}).(userInfo)
-		info := map[string]any{"username": user.name, "groups": user.groups}
-		if user.uid != "" {
-			info["uid"] = user.uid
-		}
-		writeJSON(w, http.StatusCreated, map[string]any{
-			"apiVersion": "authentication.k8s.io/v1",
-			"kind":       "SelfSubjectReview",
-			"metadata":   map[string]any{"creationTimestamp": nil},
-			"status":     map[string]any{"userInfo": info},
+			"groups":     []any{},
 		})
 	})
 	mux.HandleFunc("GET /api/v1", func(w http.ResponseWriter, _ *http.Request) {
@@ -764,15 +721,13 @@ func run() error {
 		writeJSON(w, http.StatusOK, removed)
 	})
 
-	serveOpenAPI(mux)
-
 	// Anything this server does not serve is a 404 carrying a Status, not an
 	// empty body: a client reads the reason out of it.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeStatus(w, http.StatusNotFound, "NotFound", "the server could not find the requested resource: "+r.URL.Path)
 	})
 
-	srv := &http.Server{Addr: *addr, Handler: authenticate(tokens, mux)}
+	srv := &http.Server{Addr: *addr, Handler: mux}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	go func() {
@@ -2550,204 +2505,4 @@ func trackUpdate(old, obj object, manager string) object {
 func mustLeaf(obj object, path []string) any {
 	v, _ := leafValue(obj, path)
 	return v
-}
-
-// serveOpenAPI publishes the schema of every resource this server has, in the
-// OpenAPI v3 shape kubectl reads for explain and for validation.
-//
-// The document is built once, so it is the same bytes for the life of the
-// process. Its hash goes in the URL the index hands out, and a URL that names
-// its own content can be cached for ever: a client re-fetches only when the
-// index points somewhere new.
-func serveOpenAPI(mux *http.ServeMux) {
-	doc, _ := json.Marshal(openAPIDocument())
-	sum := sha512.Sum512(doc)
-	hash := strings.ToUpper(hex.EncodeToString(sum[:]))
-	etag := `"` + hash + `"`
-
-	mux.HandleFunc("GET /openapi/v3", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"paths": map[string]any{
-				"api/v1": map[string]any{"serverRelativeURL": "/openapi/v3/api/v1?hash=" + hash},
-			},
-		})
-	})
-	mux.HandleFunc("GET /openapi/v3/api/v1", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("ETag", etag)
-		if r.URL.Query().Get("hash") == hash {
-			w.Header().Set("Cache-Control", "public, immutable")
-		} else {
-			w.Header().Set("Cache-Control", "no-cache, private")
-		}
-		if r.Header.Get("If-None-Match") == etag {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(doc)
-	})
-}
-
-// openAPIDocument is the schema of the core group as this server serves it.
-// The x-kubernetes-patch-* extensions are the same table strategicMerge
-// works from: a client reads them to know how a list will be merged.
-func openAPIDocument() map[string]any {
-	str := map[string]any{"type": "string"}
-	strMap := map[string]any{"type": "object", "additionalProperties": str}
-	integer := map[string]any{"type": "integer", "format": "int32"}
-	object := func(props map[string]any) map[string]any {
-		return map[string]any{"type": "object", "properties": props}
-	}
-	ref := func(name string) map[string]any {
-		return map[string]any{"$ref": "#/components/schemas/" + name}
-	}
-	const meta = "io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"
-	kind := func(k string, props map[string]any) map[string]any {
-		props["apiVersion"], props["kind"], props["metadata"] = str, str, ref(meta)
-		schema := object(props)
-		schema["x-kubernetes-group-version-kind"] = []any{map[string]any{"group": "", "version": "v1", "kind": k}}
-		return schema
-	}
-
-	schemas := map[string]any{
-		meta: object(map[string]any{
-			"name": str, "namespace": str, "uid": str, "resourceVersion": str, "creationTimestamp": str,
-			"labels": strMap, "annotations": strMap,
-			"finalizers": map[string]any{
-				"type": "array", "items": str,
-				"x-kubernetes-patch-strategy": "merge",
-			},
-			"ownerReferences": map[string]any{
-				"type": "array", "items": object(map[string]any{
-					"apiVersion": str, "kind": str, "name": str, "uid": str,
-					"controller": map[string]any{"type": "boolean"},
-				}),
-				"x-kubernetes-patch-strategy":  "merge",
-				"x-kubernetes-patch-merge-key": "uid",
-			},
-			"managedFields": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
-		}),
-		"io.k8s.api.core.v1.ConfigMap": kind("ConfigMap", map[string]any{
-			"data": strMap,
-			"binaryData": map[string]any{
-				"type": "object", "additionalProperties": map[string]any{"type": "string", "format": "byte"},
-			},
-		}),
-		"io.k8s.api.core.v1.Namespace": kind("Namespace", map[string]any{
-			"spec":   object(map[string]any{"finalizers": map[string]any{"type": "array", "items": str}}),
-			"status": object(map[string]any{"phase": str}),
-		}),
-		"io.k8s.api.core.v1.ReplicationController": kind("ReplicationController", map[string]any{
-			"spec": object(map[string]any{
-				"replicas": integer,
-				"selector": strMap,
-				"template": map[string]any{"type": "object"},
-			}),
-			"status": object(map[string]any{"replicas": integer}),
-		}),
-	}
-
-	operations := func(verbs ...string) map[string]any {
-		out := map[string]any{}
-		for _, verb := range verbs {
-			out[verb] = map[string]any{"responses": map[string]any{"200": map[string]any{"description": "OK"}}}
-		}
-		return out
-	}
-	paths := map[string]any{
-		"/api/v1/namespaces":               operations("get", "post"),
-		"/api/v1/namespaces/{name}":        operations("get", "put", "delete"),
-		"/api/v1/namespaces/{name}/status": operations("get", "put"),
-		"/api/v1/configmaps":               operations("get"),
-		"/api/v1/replicationcontrollers":   operations("get"),
-	}
-	for _, resource := range []string{"configmaps", "replicationcontrollers"} {
-		paths["/api/v1/namespaces/{namespace}/"+resource] = operations("get", "post")
-		paths["/api/v1/namespaces/{namespace}/"+resource+"/{name}"] = operations("get", "put", "patch", "delete")
-	}
-	paths["/api/v1/namespaces/{namespace}/replicationcontrollers/{name}/status"] = operations("get", "put")
-	paths["/api/v1/namespaces/{namespace}/replicationcontrollers/{name}/scale"] = operations("get", "put", "patch")
-
-	return map[string]any{
-		"openapi":    "3.0.0",
-		"info":       map[string]any{"title": "Kubernetes", "version": "v1.0.0"},
-		"paths":      paths,
-		"components": map[string]any{"schemas": schemas},
-	}
-}
-
-// userInfo is who a request is from, as far as the server can tell.
-type userInfo struct {
-	name, uid string
-	groups    []string
-}
-
-type userKey struct{}
-
-// anonymous is every caller while authentication is off.
-var anonymous = userInfo{name: "system:anonymous", groups: []string{"system:unauthenticated"}}
-
-// loadTokens reads a static token file, one token,user,uid[,groups] per line.
-// A file that does not parse stops the server: running with fewer users than
-// the operator wrote down locks someone out without saying who.
-func loadTokens(path string) (map[string]userInfo, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("read the token file: %w", err)
-	}
-	defer f.Close()
-	reader := csv.NewReader(f)
-	reader.FieldsPerRecord = -1
-	records, err := reader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("parse the token file %s: %w", path, err)
-	}
-	tokens := map[string]userInfo{}
-	for i, record := range records {
-		if len(record) < 3 || len(record) > 4 || record[0] == "" || record[1] == "" {
-			return nil, fmt.Errorf("the token file %s, line %d: want token,user,uid[,groups], got %d fields", path, i+1, len(record))
-		}
-		user := userInfo{name: record[1], uid: record[2]}
-		if len(record) == 4 {
-			for _, group := range strings.Split(record[3], ",") {
-				if group = strings.TrimSpace(group); group != "" {
-					user.groups = append(user.groups, group)
-				}
-			}
-		}
-		// Every user who proved who they are is in this group, which is
-		// what a rule meaning "anyone signed in" is written against.
-		user.groups = append(user.groups, "system:authenticated")
-		tokens[record[0]] = user
-	}
-	return tokens, nil
-}
-
-// authenticate decides who each request is from before anything else sees it,
-// and refuses one that claims to be somebody it cannot prove it is. With no
-// tokens configured every request is anonymous and none is refused.
-//
-// The health endpoints answer anybody: whatever restarts this process has no
-// token, and a server that cannot say it is alive gets restarted for ever.
-func authenticate(tokens map[string]userInfo, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user := anonymous
-		switch r.URL.Path {
-		case "/healthz", "/livez", "/readyz":
-		default:
-			if tokens == nil {
-				break
-			}
-			token, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-			known, ok := tokens[token]
-			if !bearer || !ok {
-				// 401 says "I do not know who you are"; 403, later, says "I
-				// know, and no". A client retries the first with credentials.
-				writeStatus(w, http.StatusUnauthorized, "Unauthorized", "Unauthorized")
-				return
-			}
-			user = known
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
-	})
 }

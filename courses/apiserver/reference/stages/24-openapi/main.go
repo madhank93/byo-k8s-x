@@ -10,7 +10,6 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/base64"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -546,16 +545,7 @@ func newUID() string {
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:8080", "the address to serve the API on")
 	data := flag.String("data", "", "a directory to keep the objects in; empty keeps them in memory only")
-	tokenFile := flag.String("token-auth-file", "", "a CSV of token,user,uid[,groups] to authenticate bearer tokens against; empty turns authentication off")
 	flag.Parse()
-
-	var tokens map[string]userInfo
-	if *tokenFile != "" {
-		var err error
-		if tokens, err = loadTokens(*tokenFile); err != nil {
-			return err
-		}
-	}
 
 	objects := newStore(*data)
 	if err := objects.load(); err != nil {
@@ -587,46 +577,14 @@ func run() error {
 		})
 	})
 	// The group-less core API is /api; everything else lives under /apis, in a
-	// named group, each listed with the versions it serves.
+	// named group. There are none yet, and the empty list still has to be
+	// there: a client that gets a 404 here decides the server is broken, not
+	// that it has no groups.
 	mux.HandleFunc("GET /apis", func(w http.ResponseWriter, _ *http.Request) {
-		version := map[string]any{"groupVersion": "authentication.k8s.io/v1", "version": "v1"}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"kind":       "APIGroupList",
 			"apiVersion": "v1",
-			"groups": []any{map[string]any{
-				"name":             "authentication.k8s.io",
-				"versions":         []any{version},
-				"preferredVersion": version,
-			}},
-		})
-	})
-	mux.HandleFunc("GET /apis/authentication.k8s.io/v1", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"kind":         "APIResourceList",
-			"apiVersion":   "v1",
-			"groupVersion": "authentication.k8s.io/v1",
-			"resources": []any{map[string]any{
-				"name":         "selfsubjectreviews",
-				"singularName": "selfsubjectreview",
-				"namespaced":   false,
-				"kind":         "SelfSubjectReview",
-				"verbs":        []string{"create"},
-			}},
-		})
-	})
-	// Who the server decided the caller is: what kubectl auth whoami asks,
-	// and the first thing to check when a request is refused.
-	mux.HandleFunc("POST /apis/authentication.k8s.io/v1/selfsubjectreviews", func(w http.ResponseWriter, r *http.Request) {
-		user := r.Context().Value(userKey{}).(userInfo)
-		info := map[string]any{"username": user.name, "groups": user.groups}
-		if user.uid != "" {
-			info["uid"] = user.uid
-		}
-		writeJSON(w, http.StatusCreated, map[string]any{
-			"apiVersion": "authentication.k8s.io/v1",
-			"kind":       "SelfSubjectReview",
-			"metadata":   map[string]any{"creationTimestamp": nil},
-			"status":     map[string]any{"userInfo": info},
+			"groups":     []any{},
 		})
 	})
 	mux.HandleFunc("GET /api/v1", func(w http.ResponseWriter, _ *http.Request) {
@@ -772,7 +730,7 @@ func run() error {
 		writeStatus(w, http.StatusNotFound, "NotFound", "the server could not find the requested resource: "+r.URL.Path)
 	})
 
-	srv := &http.Server{Addr: *addr, Handler: authenticate(tokens, mux)}
+	srv := &http.Server{Addr: *addr, Handler: mux}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	go func() {
@@ -2674,80 +2632,4 @@ func openAPIDocument() map[string]any {
 		"paths":      paths,
 		"components": map[string]any{"schemas": schemas},
 	}
-}
-
-// userInfo is who a request is from, as far as the server can tell.
-type userInfo struct {
-	name, uid string
-	groups    []string
-}
-
-type userKey struct{}
-
-// anonymous is every caller while authentication is off.
-var anonymous = userInfo{name: "system:anonymous", groups: []string{"system:unauthenticated"}}
-
-// loadTokens reads a static token file, one token,user,uid[,groups] per line.
-// A file that does not parse stops the server: running with fewer users than
-// the operator wrote down locks someone out without saying who.
-func loadTokens(path string) (map[string]userInfo, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("read the token file: %w", err)
-	}
-	defer f.Close()
-	reader := csv.NewReader(f)
-	reader.FieldsPerRecord = -1
-	records, err := reader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("parse the token file %s: %w", path, err)
-	}
-	tokens := map[string]userInfo{}
-	for i, record := range records {
-		if len(record) < 3 || len(record) > 4 || record[0] == "" || record[1] == "" {
-			return nil, fmt.Errorf("the token file %s, line %d: want token,user,uid[,groups], got %d fields", path, i+1, len(record))
-		}
-		user := userInfo{name: record[1], uid: record[2]}
-		if len(record) == 4 {
-			for _, group := range strings.Split(record[3], ",") {
-				if group = strings.TrimSpace(group); group != "" {
-					user.groups = append(user.groups, group)
-				}
-			}
-		}
-		// Every user who proved who they are is in this group, which is
-		// what a rule meaning "anyone signed in" is written against.
-		user.groups = append(user.groups, "system:authenticated")
-		tokens[record[0]] = user
-	}
-	return tokens, nil
-}
-
-// authenticate decides who each request is from before anything else sees it,
-// and refuses one that claims to be somebody it cannot prove it is. With no
-// tokens configured every request is anonymous and none is refused.
-//
-// The health endpoints answer anybody: whatever restarts this process has no
-// token, and a server that cannot say it is alive gets restarted for ever.
-func authenticate(tokens map[string]userInfo, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user := anonymous
-		switch r.URL.Path {
-		case "/healthz", "/livez", "/readyz":
-		default:
-			if tokens == nil {
-				break
-			}
-			token, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-			known, ok := tokens[token]
-			if !bearer || !ok {
-				// 401 says "I do not know who you are"; 403, later, says "I
-				// know, and no". A client retries the first with credentials.
-				writeStatus(w, http.StatusUnauthorized, "Unauthorized", "Unauthorized")
-				return
-			}
-			user = known
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
-	})
 }
