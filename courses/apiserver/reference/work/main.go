@@ -10,6 +10,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha512"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
@@ -548,7 +550,39 @@ func run() error {
 	addr := flag.String("addr", "127.0.0.1:8080", "the address to serve the API on")
 	data := flag.String("data", "", "a directory to keep the objects in; empty keeps them in memory only")
 	tokenFile := flag.String("token-auth-file", "", "a CSV of token,user,uid[,groups] to authenticate bearer tokens against; empty turns authentication off")
+	certFile := flag.String("tls-cert-file", "", "the PEM certificate to serve HTTPS with; empty serves plain HTTP")
+	keyFile := flag.String("tls-private-key-file", "", "the PEM private key for -tls-cert-file")
+	clientCAFile := flag.String("client-ca-file", "", "a PEM bundle of CAs whose client certificates are users; empty accepts none")
 	flag.Parse()
+
+	if (*certFile == "") != (*keyFile == "") {
+		return errors.New("-tls-cert-file and -tls-private-key-file are given together or not at all")
+	}
+	var tlsConfig *tls.Config
+	if *certFile != "" {
+		pair, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil {
+			return fmt.Errorf("load the serving certificate: %w", err)
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{pair}}
+	}
+	if *clientCAFile != "" {
+		if tlsConfig == nil {
+			return errors.New("-client-ca-file needs -tls-cert-file: a client certificate is only ever presented over TLS")
+		}
+		pem, err := os.ReadFile(*clientCAFile)
+		if err != nil {
+			return fmt.Errorf("read the client CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return fmt.Errorf("the client CA file %s holds no PEM certificates", *clientCAFile)
+		}
+		// A client without a certificate is still let in, to present a token
+		// instead; one with a certificate this pool did not sign is not.
+		tlsConfig.ClientCAs = pool
+		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+	}
 
 	var tokens map[string]userInfo
 	if *tokenFile != "" {
@@ -760,7 +794,7 @@ func run() error {
 		writeStatus(w, http.StatusNotFound, "NotFound", "the server could not find the requested resource: "+r.URL.Path)
 	})
 
-	srv := &http.Server{Addr: *addr, Handler: authenticate(tokens, mux)}
+	srv := &http.Server{Addr: *addr, Handler: authenticate(tokens, *clientCAFile != "", mux), TLSConfig: tlsConfig}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	go func() {
@@ -771,7 +805,12 @@ func run() error {
 	}()
 
 	fmt.Println("serving on", *addr)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	serve := srv.ListenAndServe
+	if tlsConfig != nil {
+		// The certificate is already in TLSConfig, so no file names here.
+		serve = func() error { return srv.ListenAndServeTLS("", "") }
+	}
+	if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("serve on %s: %w", *addr, err)
 	}
 	return nil
@@ -2828,18 +2867,24 @@ func loadTokens(path string) (map[string]userInfo, error) {
 }
 
 // authenticate decides who each request is from before anything else sees it,
-// and refuses one that claims to be somebody it cannot prove it is. With no
-// tokens configured every request is anonymous and none is refused.
+// and refuses one it cannot name once any authenticator is configured. With
+// none, every request is anonymous and none is refused.
 //
-// The health endpoints answer anybody: whatever restarts this process has no
-// token, and a server that cannot say it is alive gets restarted for ever.
-func authenticate(tokens map[string]userInfo, next http.Handler) http.Handler {
+// A verified client certificate is asked first, then a bearer token, and the
+// first that names somebody wins. The health endpoints answer anybody: whatever
+// restarts this process has no credentials, and a server that cannot say it is
+// alive gets restarted for ever.
+func authenticate(tokens map[string]userInfo, certs bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user := anonymous
 		switch r.URL.Path {
 		case "/healthz", "/livez", "/readyz":
 		default:
-			if tokens == nil {
+			if known, ok := certUser(r); ok {
+				user = known
+				break
+			}
+			if tokens == nil && !certs {
 				break
 			}
 			token, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -2854,4 +2899,19 @@ func authenticate(tokens map[string]userInfo, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
 	})
+}
+
+// certUser is the user a verified client certificate names: the common name
+// is the username and each organization a group. VerifiedChains is empty
+// unless the TLS handshake checked the certificate against the client CAs.
+func certUser(r *http.Request) (userInfo, bool) {
+	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 {
+		return userInfo{}, false
+	}
+	subject := r.TLS.VerifiedChains[0][0].Subject
+	if subject.CommonName == "" {
+		return userInfo{}, false
+	}
+	groups := append(slices.Clone(subject.Organization), "system:authenticated")
+	return userInfo{name: subject.CommonName, groups: groups}, true
 }

@@ -80,3 +80,6 @@ stages:
   - slug: authn-token
     name: Who is asking
     difficulty: medium
+  - slug: authn-cert
+    name: The certificate is the name
+    difficulty: hard
