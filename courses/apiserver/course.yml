@@ -62,3 +62,12 @@ stages:
   - slug: patch-strategic
     name: Lists that belong to more than one writer
     difficulty: hard
+  - slug: apply-ssa
+    name: One owner per field
+    difficulty: hard
+  - slug: apply-conflict
+    name: Two writers, one field
+    difficulty: hard
+  - slug: subresource-status
+    name: The half of the object that isn't yours
+    difficulty: medium

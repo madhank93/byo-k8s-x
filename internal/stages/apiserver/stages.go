@@ -19,6 +19,8 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +63,9 @@ func init() {
 	register(Stage{Slug: "patch-merge", Run: stagePatchMerge})
 	register(Stage{Slug: "patch-json", Run: stagePatchJSON})
 	register(Stage{Slug: "patch-strategic", Run: stagePatchStrategic})
+	register(Stage{Slug: "apply-ssa", Run: stageApplySSA})
+	register(Stage{Slug: "apply-conflict", Run: stageApplyConflict})
+	register(Stage{Slug: "subresource-status", Run: stageSubresourceStatus})
 }
 
 // stageServe checks the program serves HTTP where it was told to, says it is
@@ -1582,7 +1587,11 @@ func stageWatch(ctx context.Context, _ *kube.Env, bin string) error {
 		return err
 	}
 
-	res, body, err := srv.send(ctx, http.MethodPut, path+"/alpha", configmap("alpha", nil))
+	// A real change: a write that leaves the object as it was is not a write,
+	// and a server is right to send nothing for it.
+	changed := configmap("alpha", nil)
+	changed["data"] = map[string]any{"colour": "green"}
+	res, body, err := srv.send(ctx, http.MethodPut, path+"/alpha", changed)
 	if err != nil {
 		return err
 	}
@@ -1725,7 +1734,9 @@ func stageWatchFromRV(ctx context.Context, _ *kube.Env, bin string) error {
 		if _, err := srv.create(ctx, path, configmap("gamma")); err != nil {
 			return err
 		}
-		if res, body, err := srv.send(ctx, http.MethodPut, path+"/alpha", configmap("alpha")); err != nil {
+		changed := configmap("alpha")
+		changed["data"] = map[string]any{"colour": "green"}
+		if res, body, err := srv.send(ctx, http.MethodPut, path+"/alpha", changed); err != nil {
 			return err
 		} else if res.StatusCode != http.StatusOK {
 			return fmt.Errorf("PUT %s/alpha answered %d rather than 200\nthe body was:\n%s", path, res.StatusCode, tail(string(body)))
@@ -2496,6 +2507,1043 @@ func stagePatchStrategic(ctx context.Context, _ *kube.Env, bin string) error {
 	}
 	if err := wantStatus("PATCH "+path+"/settings with an ownerReference that has no uid", res, raw, http.StatusUnprocessableEntity, "Invalid"); err != nil {
 		return fmt.Errorf("%w\n\nownerReferences are merged by uid, and an element without one names no element: adding it would be guessing, and so would merging it into one", err)
+	}
+	return nil
+}
+
+// stageApplySSA checks server-side apply: a PATCH that carries the whole of
+// what one client wants the object to look like, and a server that remembers,
+// field by field, which client said what.
+//
+// The memory is the point. A merge patch can only add and change; to remove a
+// field a client has to know it is there and say null. An apply removes what
+// the client stopped mentioning — but only what that client set and nobody
+// else also set, which the server can tell only because managedFields records
+// every manager's fields. Graded hardest: the removal rule, and that applying
+// the same thing twice is not a write.
+func stageApplySSA(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	const (
+		path  = "/api/v1/namespaces/default/configmaps"
+		apply = "application/apply-patch+yaml"
+	)
+	applyAs := func(manager string, body any) (*http.Response, []byte, error) {
+		return srv.patch(ctx, path+"/settings?fieldManager="+manager, apply, body)
+	}
+	// applyOK sends one apply that has to answer 200 and returns the object
+	// as a fresh read describes it.
+	applyOK := func(manager, what string, body map[string]any) (map[string]any, error) {
+		res, raw, err := applyAs(manager, body)
+		if err != nil {
+			return nil, err
+		}
+		if res.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("an apply by %q that %s answered %d rather than 200: the object exists, so an apply changes it\nthe config was: %v\nthe body was:\n%s",
+				manager, what, res.StatusCode, body, tail(string(raw)))
+		}
+		return srv.getJSON(ctx, path+"/settings")
+	}
+	config := func(metadata, data map[string]any) map[string]any {
+		meta := map[string]any{"name": "settings"}
+		for k, v := range metadata {
+			meta[k] = v
+		}
+		obj := map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta}
+		if data != nil {
+			obj["data"] = data
+		}
+		return obj
+	}
+	dataOf := func(obj map[string]any) map[string]any {
+		data, _ := obj["data"].(map[string]any)
+		return data
+	}
+
+	// Every refusal comes before the object exists, so a server that refuses
+	// and creates anyway is caught by the 404 after them.
+	refusals := []struct {
+		what, query string
+		body        any
+		why         string
+	}{
+		{"with no fieldManager", "", config(nil, map[string]any{"colour": "blue"}),
+			"an apply is a manager declaring the fields it owns, and without a name there is nobody to record them against — and nothing to compare with next time to see what it dropped"},
+		{"with fieldManager empty", "?fieldManager=", config(nil, map[string]any{"colour": "blue"}),
+			"an empty name is no name: the next apply could not be matched to this one"},
+		{"whose body is a list", "?fieldManager=alpha", []any{config(nil, nil)},
+			"an apply is the object as this manager wants it, and an object is a JSON object"},
+		{"with no apiVersion", "?fieldManager=alpha", map[string]any{"kind": "ConfigMap", "metadata": map[string]any{"name": "settings"}},
+			"an apply is a whole configuration, and a configuration says what it is: apiVersion and kind are what the server checks it against"},
+		{"with no kind", "?fieldManager=alpha", map[string]any{"apiVersion": "v1", "metadata": map[string]any{"name": "settings"}},
+			"an apply is a whole configuration, and a configuration says what it is: apiVersion and kind are what the server checks it against"},
+		{"naming a different namespace in metadata.namespace", "?fieldManager=alpha", config(map[string]any{"namespace": "other"}, nil),
+			"the URL says default and the body says other; the object cannot live in both"},
+		{"naming a different object in metadata.name", "?fieldManager=alpha", config(map[string]any{"name": "other"}, nil),
+			"the URL says settings and the body says other; applying either one is guessing which the client meant"},
+	}
+	for _, r := range refusals {
+		res, raw, err := srv.patch(ctx, path+"/settings"+r.query, apply, r.body)
+		if err != nil {
+			return err
+		}
+		if err := wantStatus("an apply to "+path+"/settings "+r.what, res, raw, http.StatusBadRequest, "BadRequest"); err != nil {
+			return fmt.Errorf("%w\n\n%s", err, r.why)
+		}
+	}
+	if res, raw, err := srv.send(ctx, http.MethodGet, path+"/settings", nil); err != nil {
+		return err
+	} else if res.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("after seven applies that were all refused, GET %s/settings answered %d rather than 404: a refused request changes nothing, and that includes not creating the object\nthe body was:\n%s",
+			path, res.StatusCode, tail(string(raw)))
+	}
+
+	res, raw, err := srv.patch(ctx, "/api/v1/namespaces/nowhere/configmaps/settings?fieldManager=alpha", apply, config(nil, nil))
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("an apply to a configmap in namespace nowhere, which does not exist", res, raw, http.StatusNotFound, "NotFound"); err != nil {
+		return fmt.Errorf("%w\n\nan apply creates the object if it is missing, but not the namespace it lives in — stage 10's rule holds for every way of creating", err)
+	}
+
+	// An apply of something that is not there creates it: the client
+	// describes what it wants, not whether it exists yet.
+	first := config(
+		map[string]any{"labels": map[string]any{"app": "web"}, "finalizers": []any{"example.com/a", "example.com/b"}},
+		map[string]any{"colour": "blue", "size": "large"},
+	)
+	res, raw, err = applyAs("alpha", first)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusCreated {
+		return fmt.Errorf("the first apply to %s/settings, which does not exist yet, answered %d rather than 201: apply is create-or-update — the client sends what it wants, and the server works out which of the two that is\nthe body was:\n%s",
+			path, res.StatusCode, tail(string(raw)))
+	}
+	reply, err := decode(raw)
+	if err != nil {
+		return fmt.Errorf("the 201 for the first apply is not JSON (%w)\nthe body was:\n%s", err, tail(string(raw)))
+	}
+	for _, field := range []string{"uid", "resourceVersion", "creationTimestamp"} {
+		if metaField(reply, field) == "" {
+			return fmt.Errorf("the object the first apply created has no metadata.%s: a create by apply is a create, and the server fills in what it fills in on a POST", field)
+		}
+	}
+	got, err := srv.getJSON(ctx, path+"/settings")
+	if err != nil {
+		return err
+	}
+	if data := dataOf(got); data["colour"] != "blue" || data["size"] != "large" {
+		return fmt.Errorf("after an apply creating settings with data {colour: blue, size: large} the stored data is %v", got["data"])
+	}
+
+	alphaFirst := []string{"data.colour", "data.size", "metadata.finalizers", "metadata.labels.app"}
+	if err := ssaOwns(got, "alpha", alphaFirst); err != nil {
+		return fmt.Errorf("%w\n\nthe config was %v: every key it sets is a field alpha now owns, maps are walked into, and a list is one field — never apiVersion, kind or metadata.name, which say which object this is rather than what it holds", err, first)
+	}
+	if entries, _ := got["metadata"].(map[string]any)["managedFields"].([]any); len(entries) != 1 {
+		return fmt.Errorf("after one apply by one manager metadata.managedFields has %d entries, and it has one: an entry per manager and operation", len(entries))
+	}
+	entry := ssaEntry(got, "alpha")
+	for key, want := range map[string]any{"apiVersion": "v1", "fieldsType": "FieldsV1"} {
+		if entry[key] != want {
+			return fmt.Errorf("alpha's managedFields entry has %s %v rather than %v: kubectl and client-go read these entries, and they are the shape the real server writes\nthe entry was: %v", key, entry[key], want, entry)
+		}
+	}
+	if stamp, _ := entry["time"].(string); stamp == "" {
+		return fmt.Errorf("alpha's managedFields entry has no time: it is when this manager last changed what it owns, as RFC 3339\nthe entry was: %v", entry)
+	} else if _, err := time.Parse(time.RFC3339, stamp); err != nil {
+		return fmt.Errorf("alpha's managedFields time %q is not RFC 3339 (%v)", stamp, err)
+	}
+
+	// Applying the same config again is how every apply-based tool runs: on a
+	// loop, whether or not anything changed. If that were a write, every
+	// watcher in the cluster would be woken for nothing, every time.
+	// Past a second boundary, so an entry time refreshed on a no-op apply shows.
+	time.Sleep(1100 * time.Millisecond)
+	before, err := applyOK("alpha", "is identical to the last one", first)
+	if err != nil {
+		return err
+	}
+	if metaField(before, "resourceVersion") != metaField(got, "resourceVersion") {
+		return fmt.Errorf("re-applying exactly the config alpha already applied moved resourceVersion from %s to %s: a write whose result is what is already stored is not a write — tools apply on a loop, and each one would wake every watcher",
+			metaField(got, "resourceVersion"), metaField(before, "resourceVersion"))
+	}
+	if !reflect.DeepEqual(before["metadata"].(map[string]any)["managedFields"], got["metadata"].(map[string]any)["managedFields"]) {
+		return fmt.Errorf("re-applying an identical config changed managedFields from %v to %v: nothing changed, and that includes when alpha last changed something",
+			got["metadata"].(map[string]any)["managedFields"], before["metadata"].(map[string]any)["managedFields"])
+	}
+
+	w, err := srv.watch(ctx, path+"?watch=true&resourceVersion="+metaField(before, "resourceVersion"))
+	if err != nil {
+		return err
+	}
+	defer w.stop()
+	if _, err := applyOK("alpha", "is identical to the last one", first); err != nil {
+		return err
+	}
+	if err := ssaQuiet(w, 2*time.Second); err != nil {
+		return fmt.Errorf("%w\n\nthat event followed an apply identical to the one before it: no change, so no new version, and nothing for a watcher to be told", err)
+	}
+
+	// A second manager. It sets colour to the value already there, so the two
+	// share that field rather than fight over it, and adds a key of its own.
+	got, err = applyOK("beta", "adds data.shape and sets data.colour to the value it already has",
+		config(nil, map[string]any{"colour": "blue", "shape": "round"}))
+	if err != nil {
+		return err
+	}
+	if data := dataOf(got); len(data) != 3 || data["colour"] != "blue" || data["size"] != "large" || data["shape"] != "round" {
+		return fmt.Errorf("after beta applied data {colour: blue, shape: round} onto {colour: blue, size: large} the data is %v, and it should be all three keys: an apply is merged into the object — beta not mentioning size is not beta asking for it to go, because beta never owned it", got["data"])
+	}
+	if labels, _ := got["metadata"].(map[string]any)["labels"].(map[string]any); labels["app"] != "web" {
+		return fmt.Errorf("after beta's apply, which said nothing of labels, metadata.labels is %v: the merge leaves what a config does not mention alone", labels)
+	}
+	if err := ssaOwns(got, "beta", []string{"data.colour", "data.shape"}); err != nil {
+		return err
+	}
+	if err := ssaOwns(got, "alpha", alphaFirst); err != nil {
+		return fmt.Errorf("%w\n\nbeta applied, not alpha: one manager's apply replaces that manager's entry and nobody else's", err)
+	}
+	kind, obj, err := w.next(ctx, "MODIFIED settings, for beta's apply")
+	if err != nil {
+		return err
+	}
+	if kind != "MODIFIED" || metaField(obj, "resourceVersion") != metaField(got, "resourceVersion") {
+		return fmt.Errorf("the watch's next event was %s at resourceVersion %s, where MODIFIED at %s was expected for beta's apply: an apply that changes something is a write like any other, and the one before it changed nothing",
+			kind, metaField(obj, "resourceVersion"), metaField(got, "resourceVersion"))
+	}
+
+	// alpha stops mentioning size and colour, and changes its finalizers.
+	// size was alpha's alone, so it goes; colour is beta's too, so it stays.
+	got, err = applyOK("alpha", "drops data.size and data.colour and replaces metadata.finalizers",
+		config(map[string]any{"labels": map[string]any{"app": "web"}, "finalizers": []any{"example.com/c"}}, nil))
+	if err != nil {
+		return err
+	}
+	data := dataOf(got)
+	if _, there := data["size"]; there {
+		return fmt.Errorf("alpha applied a config without data.size, which only alpha had ever set, and data.size is still %v: an apply is the whole of what a manager wants, so a field it owned and no longer mentions is one it wants gone — that is how apply removes things without a null", data["size"])
+	}
+	if data["colour"] != "blue" {
+		return fmt.Errorf("alpha dropped data.colour from its config, and data.colour is now %v rather than blue: beta set it too, and beta still wants it — a field is removed only when no manager owns it any more", data["colour"])
+	}
+	if data["shape"] != "round" {
+		return fmt.Errorf("after alpha's apply data.shape is %v rather than round: alpha never owned it, so alpha leaving it out says nothing about it", data["shape"])
+	}
+	if finalizers, _ := got["metadata"].(map[string]any)["finalizers"].([]any); !reflect.DeepEqual(finalizers, []any{"example.com/c"}) {
+		return fmt.Errorf("after alpha applied finalizers [example.com/c] over [example.com/a example.com/b] the list is %v: in an apply, as in a merge patch, a list is one value and is replaced whole", finalizers)
+	}
+	if err := ssaOwns(got, "alpha", []string{"metadata.finalizers", "metadata.labels.app"}); err != nil {
+		return fmt.Errorf("%w\n\na manager's entry is exactly the fields of its latest config: what it dropped, it no longer owns", err)
+	}
+	if err := ssaOwns(got, "beta", []string{"data.colour", "data.shape"}); err != nil {
+		return err
+	}
+
+	// An apply can carry a resourceVersion, and then it is a precondition.
+	res, raw, err = applyAs("alpha", config(map[string]any{"resourceVersion": metaField(reply, "resourceVersion"), "labels": map[string]any{"app": "api"}}, nil))
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("an apply by alpha carrying the resourceVersion from when settings was created", res, raw, http.StatusConflict, "Conflict"); err != nil {
+		return fmt.Errorf("%w\n\nmost applies leave resourceVersion out and mean \"whatever is there\"; one that names a version is asking for exactly that version, as a PUT does", err)
+	}
+	current, err := srv.getJSON(ctx, path+"/settings")
+	if err != nil {
+		return err
+	}
+	if metaField(current, "resourceVersion") != metaField(got, "resourceVersion") {
+		return fmt.Errorf("the refused apply moved resourceVersion from %s to %s: a 409 changes nothing", metaField(got, "resourceVersion"), metaField(current, "resourceVersion"))
+	}
+
+	// A PUT from a client that has never heard of managedFields. It read the
+	// object into a type without the field, and writes back what it has.
+	put := current
+	meta := put["metadata"].(map[string]any)
+	delete(meta, "managedFields")
+	dataOf(put)["extra"] = "from a PUT"
+	res, raw, err = srv.send(ctx, http.MethodPut, path+"/settings", put)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PUT %s/settings with the current resourceVersion and no managedFields answered %d rather than 200\nthe body was:\n%s", path, res.StatusCode, tail(string(raw)))
+	}
+	if got, err = srv.getJSON(ctx, path+"/settings"); err != nil {
+		return err
+	}
+	for manager, want := range map[string][]string{"alpha": {"metadata.finalizers", "metadata.labels.app"}, "beta": {"data.colour", "data.shape"}} {
+		if err := ssaOwns(got, manager, want); err != nil {
+			return fmt.Errorf("%w\n\nthat followed a PUT whose body had no metadata.managedFields: most clients decode into types that do not have the field, so a write that leaves it out keeps what is stored — otherwise any old client erases every manager's record", err)
+		}
+	}
+
+	// beta applies a config that sets nothing. Everything beta owned alone
+	// goes, and an entry that owns nothing is not kept.
+	if got, err = applyOK("beta", "sets no fields at all", config(nil, nil)); err != nil {
+		return err
+	}
+	data = dataOf(got)
+	for _, key := range []string{"colour", "shape"} {
+		if _, there := data[key]; there {
+			return fmt.Errorf("beta applied a config with no data, and data.%s is still there: beta was its only owner — alpha dropped colour two applies ago — so leaving it out removes it", key)
+		}
+	}
+	if data["extra"] != "from a PUT" {
+		return fmt.Errorf("after beta's empty apply data.extra is %v: beta never set it, so beta's apply cannot remove it", data["extra"])
+	}
+	if entry := ssaEntry(got, "beta"); entry != nil {
+		return fmt.Errorf("beta's Apply entry is still in managedFields after beta applied a config that sets nothing: an entry that owns no fields says nothing, and is dropped\nthe entry was: %v", entry)
+	}
+	return nil
+}
+
+// ssaEntry is the manager's Apply entry in managedFields, or nil.
+func ssaEntry(obj map[string]any, manager string) map[string]any {
+	meta, _ := obj["metadata"].(map[string]any)
+	entries, _ := meta["managedFields"].([]any)
+	for _, e := range entries {
+		if m, ok := e.(map[string]any); ok && m["manager"] == manager && m["operation"] == "Apply" {
+			return m
+		}
+	}
+	return nil
+}
+
+// ssaOwns insists the manager's Apply entry owns exactly these leaf paths.
+// Compared as a set, because fieldsV1 is a tree and key order in it is not
+// meaningful.
+func ssaOwns(obj map[string]any, manager string, want []string) error {
+	meta, _ := obj["metadata"].(map[string]any)
+	if _, ok := meta["managedFields"].([]any); !ok {
+		return fmt.Errorf("the object has no metadata.managedFields list (it has %v): every apply records which fields its manager now owns, and the next apply by that manager is compared with it", meta["managedFields"])
+	}
+	entry := ssaEntry(obj, manager)
+	if entry == nil {
+		return fmt.Errorf("metadata.managedFields has no entry with manager %q and operation Apply\nmanagedFields was: %v", manager, meta["managedFields"])
+	}
+	got, err := ssaLeaves(entry["fieldsV1"], "")
+	if err != nil {
+		return fmt.Errorf("%w\nthe entry was: %v", err, entry)
+	}
+	slices.Sort(got)
+	want = slices.Sorted(slices.Values(want))
+	if !slices.Equal(got, want) {
+		return fmt.Errorf("%s's Apply entry owns %v, and it should own exactly %v\nfieldsV1 was: %v", manager, got, want, entry["fieldsV1"])
+	}
+	return nil
+}
+
+// ssaLeaves flattens a fieldsV1 tree into dotted leaf paths. A leaf is an
+// empty object: the field itself, whatever its value is.
+func ssaLeaves(node any, at string) ([]string, error) {
+	tree, ok := node.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("fieldsV1 at %q is %v, and every node of it is an object: a field that holds a map is an object of its keys, and any other field is {}", at, node)
+	}
+	var out []string
+	for key, child := range tree {
+		name, found := strings.CutPrefix(key, "f:")
+		if !found {
+			return nil, fmt.Errorf("fieldsV1 has a key %q under %q, and every field key is written f:<name>", key, at)
+		}
+		path := name
+		if at != "" {
+			path = at + "." + name
+		}
+		if sub, _ := child.(map[string]any); len(sub) == 0 {
+			out = append(out, path)
+			continue
+		}
+		more, err := ssaLeaves(child, path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, more...)
+	}
+	return out, nil
+}
+
+// ssaQuiet insists nothing arrives on the watch for a while. A BOOKMARK is
+// not a change, so it is let through.
+func ssaQuiet(w *watchStream, quiet time.Duration) error {
+	deadline := time.After(quiet)
+	for {
+		select {
+		case event, open := <-w.events:
+			if !open {
+				return fmt.Errorf("the watch on %s ended: %v", w.path, <-w.fail)
+			}
+			kind, _ := event["type"].(string)
+			if kind == "BOOKMARK" {
+				continue
+			}
+			obj, _ := event["object"].(map[string]any)
+			return fmt.Errorf("the watch on %s sent %s %s at resourceVersion %s", w.path, kind, metaField(obj, "name"), metaField(obj, "resourceVersion"))
+		case <-deadline:
+			return nil
+		}
+	}
+}
+
+// stageApplyConflict checks what server-side apply is for: two writers who
+// want different values in one field are told so, rather than taking turns
+// silently undoing each other.
+//
+// Ownership is recorded per field in metadata.managedFields. An apply that
+// would change a field someone else owns is refused with a 409 naming them;
+// one that agrees with them shares the field; force takes it. Plain writes —
+// PUT and the three patch dialects — never conflict, but they do take
+// ownership of what they changed, which is how an apply learns that somebody
+// edited its field by hand.
+func stageApplyConflict(ctx context.Context, _ *kube.Env, bin string) error {
+	// On disk, so the conflict check and the write are far enough apart for a
+	// check made outside the lock to be caught.
+	dir, err := os.MkdirTemp("", "byok8s-apiserver-*")
+	if err != nil {
+		return fmt.Errorf("make a directory for the store: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	srv, cleanup, err := serve(ctx, bin, "-data", dir)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	const path = "/api/v1/namespaces/default/configmaps"
+
+	applyOK := func(name, manager string, force bool, config map[string]any) (map[string]any, error) {
+		res, raw, err := conflictApply(ctx, srv, path, name, manager, force, config)
+		if err != nil {
+			return nil, err
+		}
+		if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
+			return nil, fmt.Errorf("an apply by %q (force=%v) to %s/%s answered %d rather than 200 or 201\nthe config was: %v\nthe body was:\n%s",
+				manager, force, path, name, res.StatusCode, config, tail(string(raw)))
+		}
+		return srv.getJSON(ctx, path+"/"+name)
+	}
+	// refused insists an apply is a conflict with manager over field, and that
+	// the object is exactly as it was.
+	refused := func(name, manager string, config map[string]any, other, field string) error {
+		before, err := srv.getJSON(ctx, path+"/"+name)
+		if err != nil {
+			return err
+		}
+		res, raw, err := conflictApply(ctx, srv, path, name, manager, false, config)
+		if err != nil {
+			return err
+		}
+		what := fmt.Sprintf("an apply by %q setting %s to a value %q owns and holds differently", manager, field, other)
+		if err := wantStatus(what, res, raw, http.StatusConflict, "Conflict"); err != nil {
+			return fmt.Errorf("%w\n\na field another manager owns is theirs: an apply that would change it is refused, so that two writers who disagree find out rather than overwriting each other on every reconcile\nmanagedFields before the apply: %s",
+				err, conflictDescribe(before))
+		}
+		if err := conflictWantNamed(what, raw, other, field); err != nil {
+			return err
+		}
+		after, err := srv.getJSON(ctx, path+"/"+name)
+		if err != nil {
+			return err
+		}
+		if metaField(after, "resourceVersion") != metaField(before, "resourceVersion") {
+			return fmt.Errorf("%s answered 409, but resourceVersion moved from %q to %q: a refused apply is refused whole — nothing of it is written, not the fields that did not conflict and not the managedFields",
+				what, metaField(before, "resourceVersion"), metaField(after, "resourceVersion"))
+		}
+		return nil
+	}
+
+	// alpha applies first and owns everything it set.
+	got, err := applyOK("settings", "alpha", false, conflictConfig("settings",
+		map[string]any{"colour": "blue", "size": "large"}, map[string]any{"team": "a"}))
+	if err != nil {
+		return err
+	}
+	if err := conflictWantOwns(got, "alpha", "Apply", ".data.colour", ".data.size", ".metadata.labels.team"); err != nil {
+		return err
+	}
+
+	// A manager changing a field only it owns is not a conflict with itself.
+	if _, err = applyOK("settings", "alpha", false, conflictConfig("settings",
+		map[string]any{"colour": "blue", "size": "large"}, map[string]any{"team": "b"})); err != nil {
+		return fmt.Errorf("%w\n\nalpha changed metadata.labels.team, which only alpha owns: a manager never conflicts with itself", err)
+	}
+
+	// beta wants a different colour.
+	if err := refused("settings", "beta", conflictConfig("settings", map[string]any{"colour": "red"}, nil), "alpha", ".data.colour"); err != nil {
+		return err
+	}
+	if got, err = srv.getJSON(ctx, path+"/settings"); err != nil {
+		return err
+	}
+	if fields, there := conflictOwned(got, "beta", "Apply"); there {
+		return fmt.Errorf("after beta's apply was refused, beta has a managedFields entry owning %v: a refused apply records nothing", fields)
+	}
+
+	// beta agrees with alpha's colour: that is not a conflict, and the field
+	// now has two owners.
+	if got, err = applyOK("settings", "beta", false, conflictConfig("settings", map[string]any{"colour": "blue"}, nil)); err != nil {
+		return fmt.Errorf("%w\n\nbeta asked for the value alpha already set — two managers that agree are not in conflict, and both of them own the field afterwards", err)
+	}
+	if err := conflictWantOwns(got, "beta", "Apply", ".data.colour"); err != nil {
+		return err
+	}
+	if err := conflictWantOwns(got, "alpha", "Apply", ".data.colour"); err != nil {
+		return fmt.Errorf("%w\n\nbeta applying the same value shares the field; it does not take it from alpha", err)
+	}
+
+	// alpha stops setting colour. beta still wants it, so it stays.
+	if got, err = applyOK("settings", "alpha", false, conflictConfig("settings",
+		map[string]any{"size": "large"}, map[string]any{"team": "a"})); err != nil {
+		return err
+	}
+	if data, _ := got["data"].(map[string]any); data["colour"] != "blue" {
+		return fmt.Errorf("alpha applied a config without data.colour, which beta also owns, and data.colour is now %v rather than blue: dropping a field from your config gives up your claim on it, and the field is only removed when nobody is left claiming it", data["colour"])
+	}
+	if fields, _ := conflictOwned(got, "alpha", "Apply"); fields[".data.colour"] {
+		return fmt.Errorf("alpha's config no longer sets data.colour, but alpha's managedFields entry still owns it: an apply entry is replaced by exactly the fields of the latest config")
+	}
+
+	// beta wants size smaller. Without force it is alpha's; with force it is
+	// beta's, and alpha loses it while keeping the rest of what it owns.
+	smaller := conflictConfig("settings", map[string]any{"colour": "blue", "size": "small"}, nil)
+	if err := refused("settings", "beta", smaller, "alpha", ".data.size"); err != nil {
+		return err
+	}
+	if got, err = applyOK("settings", "beta", true, smaller); err != nil {
+		return fmt.Errorf("%w\n\nforce=true is the applier saying it knows the field is someone else's and means to take it", err)
+	}
+	if data, _ := got["data"].(map[string]any); data["size"] != "small" {
+		return fmt.Errorf("after beta's forced apply of data.size: small, data.size is %v", data["size"])
+	}
+	if err := conflictWantOwns(got, "beta", "Apply", ".data.size"); err != nil {
+		return err
+	}
+	fields, there := conflictOwned(got, "alpha", "Apply")
+	if fields[".data.size"] {
+		return fmt.Errorf("after beta forced data.size, alpha's entry still owns it: force moves the field — a field owned by two managers who disagree about its value is the state conflicts exist to prevent\nmanagedFields: %s", conflictDescribe(got))
+	}
+	if !there || !fields[".metadata.labels.team"] {
+		return fmt.Errorf("after beta forced data.size, alpha no longer owns metadata.labels.team: force takes the fields that conflicted and nothing else\nmanagedFields: %s", conflictDescribe(got))
+	}
+
+	// A hand edit is a write like any other, and it owns what it changed. The
+	// applier finds out on its next apply rather than reverting it unseen.
+	if _, err := applyOK("edited", "alpha", false, conflictConfig("edited", map[string]any{"colour": "blue"}, nil)); err != nil {
+		return err
+	}
+	if got, err = conflictPut(ctx, srv, path, "edited", "?fieldManager=editor", "colour", "red"); err != nil {
+		return fmt.Errorf("%w\n\nalpha owns data.colour by apply, and this PUT changes it: a PUT is not an apply and never conflicts — it takes the field instead", err)
+	}
+	if err := conflictWantOwns(got, "editor", "Update", ".data.colour"); err != nil {
+		return fmt.Errorf("%w\n\na PUT or patch is recorded too, as operation Update under the manager named by ?fieldManager=, owning every field whose value it changed", err)
+	}
+	if fields, there := conflictOwned(got, "alpha", "Apply"); there {
+		return fmt.Errorf("editor's PUT changed data.colour, the only field alpha owned, yet alpha still has an entry owning %v: the field moved to editor, and an entry left owning nothing is dropped", conflictSorted(fields))
+	}
+	if err := refused("edited", "alpha", conflictConfig("edited", map[string]any{"colour": "blue"}, nil), "editor", ".data.colour"); err != nil {
+		return fmt.Errorf("%w\n\nthis is what ownership is for: without it, alpha's next apply would silently put back the value someone just changed by hand", err)
+	}
+	if got, err = applyOK("edited", "alpha", true, conflictConfig("edited", map[string]any{"colour": "blue"}, nil)); err != nil {
+		return err
+	}
+	if data, _ := got["data"].(map[string]any); data["colour"] != "blue" {
+		return fmt.Errorf("after alpha's forced apply of data.colour: blue, data.colour is %v", data["colour"])
+	}
+	if fields, there := conflictOwned(got, "editor", "Update"); there {
+		return fmt.Errorf("alpha forced data.colour, the only field editor owned, yet editor still has an entry owning %v: an entry left owning nothing is dropped", conflictSorted(fields))
+	}
+
+	// A write that names no manager still has one.
+	if got, err = conflictPut(ctx, srv, path, "edited", "", "shape", "round"); err != nil {
+		return err
+	}
+	if err := conflictWantOwns(got, "unknown", "Update", ".data.shape"); err != nil {
+		return fmt.Errorf("%w\n\na write without ?fieldManager= is recorded under the manager \"unknown\" — every field still has an owner", err)
+	}
+	if fields, _ := conflictOwned(got, "unknown", "Update"); fields[".data.colour"] {
+		return fmt.Errorf("a PUT that left data.colour as it was took ownership of it: a write owns what it changed, compared old against new, not every field it happened to send — a PUT sends all of them")
+	}
+	if err := conflictWantOwns(got, "alpha", "Apply", ".data.colour"); err != nil {
+		return fmt.Errorf("%w\n\nthe PUT's body had no managedFields, and a client that never heard of them cannot erase them", err)
+	}
+	res, raw, err := srv.patch(ctx, path+"/edited", "application/merge-patch+json", map[string]any{"data": map[string]any{"mood": "calm"}})
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PATCH %s/edited with a merge patch answered %d rather than 200\nthe body was:\n%s", path, res.StatusCode, tail(string(raw)))
+	}
+	if got, err = srv.getJSON(ctx, path+"/edited"); err != nil {
+		return err
+	}
+	if err := conflictWantOwns(got, "unknown", "Update", ".data.shape", ".data.mood"); err != nil {
+		return fmt.Errorf("%w\n\nthere is one entry per manager and operation: the patch's field joins the PUT's in the same \"unknown\" Update entry", err)
+	}
+	if n := conflictEntries(got, "unknown", "Update"); n != 1 {
+		return fmt.Errorf("managedFields has %d entries for manager \"unknown\" with operation Update, and there is one per manager and operation\nmanagedFields: %s", n, conflictDescribe(got))
+	}
+
+	// Many managers at once, each wanting its own value in a field nobody
+	// owns yet. The first to reach the store owns it, and every other one now
+	// disagrees with an owner. A check made before taking the lock lets several
+	// of them see the field free and all succeed.
+	// A large object makes the copy a pre-lock read takes slow enough for the
+	// other writers to land between that read and the lock.
+	ballast := map[string]any{}
+	for i := range 2000 {
+		ballast["base-"+strconv.Itoa(i)] = "x"
+	}
+	if _, err := applyOK("race", "seed", false, conflictConfig("race", ballast, nil)); err != nil {
+		return err
+	}
+	const writers = 20
+	type outcome struct {
+		manager string
+		res     *http.Response
+		raw     []byte
+		err     error
+	}
+	outcomes := make(chan outcome, writers)
+	for i := range writers {
+		go func() {
+			manager := "writer-" + strconv.Itoa(i)
+			res, raw, err := conflictApply(ctx, srv, path, "race", manager, false,
+				conflictConfig("race", map[string]any{"winner": manager}, nil))
+			outcomes <- outcome{manager, res, raw, err}
+		}()
+	}
+	var winners []string
+	for range writers {
+		o := <-outcomes
+		if o.err != nil {
+			return o.err
+		}
+		switch o.res.StatusCode {
+		case http.StatusOK:
+			winners = append(winners, o.manager)
+		case http.StatusConflict:
+			if err := wantStatus("an apply racing "+strconv.Itoa(writers-1)+" others for data.winner", o.res, o.raw, http.StatusConflict, "Conflict"); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("one of %d concurrent applies, each by its own manager setting data.winner to its own name, answered %d: the first to reach the store wins with 200, and each of the rest is a 409 Conflict with whoever got there first\nthe body was:\n%s",
+				writers, o.res.StatusCode, tail(string(o.raw)))
+		}
+	}
+	if len(winners) != 1 {
+		sort.Strings(winners)
+		return fmt.Errorf("%d concurrent applies set data.winner to %d different values, and %d of them succeeded (%s): only the first can find the field unowned — a conflict check made against a read taken before the lock lets several writers each believe they are first, and the last write silently wins",
+			writers, writers, len(winners), strings.Join(winners, ", "))
+	}
+	if got, err = srv.getJSON(ctx, path+"/race"); err != nil {
+		return err
+	}
+	if data, _ := got["data"].(map[string]any); data["winner"] != winners[0] {
+		return fmt.Errorf("only %s's apply succeeded, but data.winner is %v: the refused applies wrote something anyway", winners[0], data["winner"])
+	}
+	for _, entry := range conflictManaged(got) {
+		manager, _ := entry["manager"].(string)
+		if manager != winners[0] && conflictLeaves(entry["fieldsV1"], "")[".data.winner"] {
+			return fmt.Errorf("%s won data.winner, yet %s also owns it: a refused apply records no ownership\nmanagedFields: %s", winners[0], manager, conflictDescribe(got))
+		}
+	}
+	return nil
+}
+
+// conflictConfig is an apply config for a configmap: identity, data, and
+// labels when there are any.
+func conflictConfig(name string, data, labels map[string]any) map[string]any {
+	meta := map[string]any{"name": name}
+	if labels != nil {
+		meta["labels"] = labels
+	}
+	return map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta, "data": data}
+}
+
+// conflictApply sends one server-side apply as manager.
+func conflictApply(ctx context.Context, srv *server, path, name, manager string, force bool, config map[string]any) (*http.Response, []byte, error) {
+	query := "?fieldManager=" + manager
+	if force {
+		query += "&force=true"
+	}
+	return srv.patch(ctx, path+"/"+name+query, "application/apply-patch+yaml", config)
+}
+
+// conflictPut reads an object, sets one data key, and PUTs it back with the
+// given query. managedFields is left out of the body, as an older client
+// would, so the server's own bookkeeping is all that decides ownership.
+func conflictPut(ctx context.Context, srv *server, path, name, query, key, value string) (map[string]any, error) {
+	obj, err := srv.getJSON(ctx, path+"/"+name)
+	if err != nil {
+		return nil, err
+	}
+	data, _ := obj["data"].(map[string]any)
+	if data == nil {
+		data = map[string]any{}
+		obj["data"] = data
+	}
+	data[key] = value
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		delete(meta, "managedFields")
+	}
+	res, raw, err := srv.send(ctx, http.MethodPut, path+"/"+name+query, obj)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("PUT %s/%s%s setting data.%s answered %d rather than 200\nthe body was:\n%s",
+			path, name, query, key, res.StatusCode, tail(string(raw)))
+	}
+	return srv.getJSON(ctx, path+"/"+name)
+}
+
+// conflictWantNamed insists a conflict's Status says who holds the field and
+// which field it is, in the message and in details.causes.
+func conflictWantNamed(what string, raw []byte, manager, field string) error {
+	status, _ := decode(raw)
+	key := field[strings.LastIndex(field, ".")+1:]
+	message, _ := status["message"].(string)
+	if !strings.Contains(message, manager) || !strings.Contains(message, key) {
+		return fmt.Errorf("the 409 for %s has message %q, which does not name both the manager %q and the field %s: the message is all kubectl shows, and the person reading it needs to know whose field it is and which one to decide whether to force",
+			what, message, manager, field)
+	}
+	details, _ := status["details"].(map[string]any)
+	causes, _ := details["causes"].([]any)
+	for _, c := range causes {
+		cause, _ := c.(map[string]any)
+		if f, _ := cause["field"].(string); strings.Contains(f, key) {
+			return nil
+		}
+	}
+	return fmt.Errorf("the 409 for %s has details.causes %v, with no cause whose field is %s: each conflict is one cause, {\"type\": \"FieldManagerConflict\", \"message\": ..., \"field\": ...}, which is what a client reads to resolve them one by one",
+		what, details["causes"], field)
+}
+
+// conflictManaged is an object's managedFields entries.
+func conflictManaged(obj map[string]any) []map[string]any {
+	meta, _ := obj["metadata"].(map[string]any)
+	list, _ := meta["managedFields"].([]any)
+	var entries []map[string]any
+	for _, e := range list {
+		if entry, ok := e.(map[string]any); ok {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+// conflictOwned is the set of field paths one manager owns by one operation,
+// and whether it has an entry at all.
+func conflictOwned(obj map[string]any, manager, operation string) (map[string]bool, bool) {
+	for _, entry := range conflictManaged(obj) {
+		if entry["manager"] == manager && entry["operation"] == operation {
+			return conflictLeaves(entry["fieldsV1"], ""), true
+		}
+	}
+	return map[string]bool{}, false
+}
+
+func conflictEntries(obj map[string]any, manager, operation string) int {
+	n := 0
+	for _, entry := range conflictManaged(obj) {
+		if entry["manager"] == manager && entry["operation"] == operation {
+			n++
+		}
+	}
+	return n
+}
+
+// conflictLeaves flattens fieldsV1 into dotted paths: {"f:data":{"f:a":{}}}
+// is .data.a.
+func conflictLeaves(node any, at string) map[string]bool {
+	out := map[string]bool{}
+	m, _ := node.(map[string]any)
+	children := 0
+	for key, child := range m {
+		if name, ok := strings.CutPrefix(key, "f:"); ok {
+			children++
+			for leaf := range conflictLeaves(child, at+"."+name) {
+				out[leaf] = true
+			}
+		}
+	}
+	if children == 0 && at != "" {
+		out[at] = true
+	}
+	return out
+}
+
+func conflictWantOwns(obj map[string]any, manager, operation string, want ...string) error {
+	fields, there := conflictOwned(obj, manager, operation)
+	if !there {
+		return fmt.Errorf("metadata.managedFields has no entry for manager %q with operation %s, and it should own %s\nmanagedFields: %s",
+			manager, operation, strings.Join(want, ", "), conflictDescribe(obj))
+	}
+	for _, field := range want {
+		if !fields[field] {
+			return fmt.Errorf("%s's %s entry in metadata.managedFields does not own %s\nmanagedFields: %s", manager, operation, field, conflictDescribe(obj))
+		}
+	}
+	return nil
+}
+
+// conflictDescribe is managedFields as one line per entry, for error messages.
+func conflictDescribe(obj map[string]any) string {
+	entries := conflictManaged(obj)
+	if len(entries) == 0 {
+		return "(none)"
+	}
+	var lines []string
+	for _, entry := range entries {
+		lines = append(lines, fmt.Sprintf("%v (%v): %s", entry["manager"], entry["operation"],
+			strings.Join(conflictSorted(conflictLeaves(entry["fieldsV1"], "")), ", ")))
+	}
+	return "\n  " + strings.Join(lines, "\n  ")
+}
+
+func conflictSorted(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// stageSubresourceStatus checks an object is split in two at the API: spec
+// written through the object, status through its /status subresource, and
+// neither write able to touch the other half.
+//
+// The split is about ownership. A user owns what they asked for; a controller
+// owns what it observed. Two endpoints let RBAC grant one without the other,
+// and keep a user's stale read-modify-write from erasing a status a controller
+// wrote in between.
+func stageSubresourceStatus(ctx context.Context, _ *kube.Env, bin string) error {
+	srv, cleanup, err := serve(ctx, bin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := statusDiscovery(ctx, srv); err != nil {
+		return err
+	}
+
+	const (
+		name = "status-demo"
+		path = "/api/v1/namespaces/" + name
+	)
+	created, err := srv.create(ctx, "/api/v1/namespaces", map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata":   map[string]any{"name": name, "labels": map[string]any{"team": "a"}},
+	})
+	if err != nil {
+		return err
+	}
+	first := metaField(created, "resourceVersion")
+
+	// The main endpoint, carrying a status the client read and then edited.
+	// The labels are the client's to change; the phase is not.
+	res, body, err := srv.send(ctx, http.MethodPut, path, statusNamespace(name, first, "b", "Terminating"))
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PUT %s answered %d, and a namespace is updated like a configmap: 200 with the object as stored — the verb is new for this resource, not new to the server\nthe body was:\n%s",
+			path, res.StatusCode, tail(string(body)))
+	}
+	updated, err := decode(body)
+	if err != nil {
+		return fmt.Errorf("the reply to PUT %s is not JSON (%w)\nthe body was:\n%s", path, err, tail(string(body)))
+	}
+	if err := statusWant(updated, "the reply to PUT "+path, "b", "Active"); err != nil {
+		return fmt.Errorf("%w\n\nthe main endpoint writes everything but status: a status in the body is ignored and the stored one kept, because a client that read the object, changed a label and sent it back is sending a status it never meant to write", err)
+	}
+	second := metaField(updated, "resourceVersion")
+	if second == first {
+		return fmt.Errorf("the namespace still has resourceVersion %q after PUT %s changed its labels: a write moves the store forward whichever endpoint it came through", first, path)
+	}
+	stored, err := srv.getJSON(ctx, path)
+	if err != nil {
+		return err
+	}
+	if err := statusWant(stored, "GET "+path+" after the PUT", "b", "Active"); err != nil {
+		return fmt.Errorf("%w\n\nthe reply to a write has to be what was stored, and the store is where status is protected", err)
+	}
+
+	// Opened from the version just written, so the next event is the status
+	// write and nothing earlier.
+	w, err := srv.watch(ctx, "/api/v1/namespaces?watch=true&resourceVersion="+url.QueryEscape(second))
+	if err != nil {
+		return err
+	}
+	defer w.stop()
+
+	// The subresource, the other way round: the phase is taken, the labels in
+	// the body are not.
+	res, body, err = srv.send(ctx, http.MethodPut, path+"/status", statusNamespace(name, second, "c", "Terminating"))
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("PUT %s/status answered %d: the status subresource is how a controller writes what it observed, and it answers 200 with the whole object as stored\nthe body was:\n%s",
+			path, res.StatusCode, tail(string(body)))
+	}
+	written, err := decode(body)
+	if err != nil {
+		return fmt.Errorf("the reply to PUT %s/status is not JSON (%w)\nthe body was:\n%s", path, err, tail(string(body)))
+	}
+	if err := statusWant(written, "the reply to PUT "+path+"/status", "b", "Terminating"); err != nil {
+		return fmt.Errorf("%w\n\n/status takes status from the body and nothing else: the labels are the user's, and a controller holding an old copy of them must not be able to put that copy back", err)
+	}
+	third := metaField(written, "resourceVersion")
+	if third == second {
+		return fmt.Errorf("the namespace still has resourceVersion %q after PUT %s/status changed its phase: a status write is a write, and a client holding the old version has to be able to tell", second, path)
+	}
+	kind, obj, err := w.next(ctx, "MODIFIED "+name+" for the status write")
+	if err != nil {
+		return fmt.Errorf("%w\n\na status write goes through the same store as any other, so it reaches watchers the same way — it is what every controller watching the object is waiting for", err)
+	}
+	if kind != "MODIFIED" || metaField(obj, "name") != name {
+		return fmt.Errorf("the watch on /api/v1/namespaces from resourceVersion %s sent %s %s where MODIFIED %s was expected: the status write is the only write since that version", second, kind, metaField(obj, "name"), name)
+	}
+	if phase := statusPhase(obj); phase != "Terminating" {
+		return fmt.Errorf("the MODIFIED event for the status write carries status.phase %q rather than Terminating: an event holds the object as it is after the write", phase)
+	}
+
+	// The subresource reads as the object it is part of.
+	viaStatus, err := srv.getJSON(ctx, path+"/status")
+	if err != nil {
+		return fmt.Errorf("%w\n\nGET on the status subresource answers the whole object, the same as GET on the object: a controller reads through the endpoint it writes through", err)
+	}
+	if err := statusWant(viaStatus, "GET "+path+"/status", "b", "Terminating"); err != nil {
+		return err
+	}
+	if rv := metaField(viaStatus, "resourceVersion"); rv != third {
+		return fmt.Errorf("GET %s/status answered resourceVersion %q, and the namespace is at %q: it is the same object, read through another URL", path, rv, third)
+	}
+
+	// Stale on either endpoint is the conflict it always was. This is the case
+	// the split exists for: two writers working from the same old read.
+	for _, target := range []string{path, path + "/status"} {
+		res, body, err := srv.send(ctx, http.MethodPut, target, statusNamespace(name, first, "d", "Active"))
+		if err != nil {
+			return err
+		}
+		if err := statusConflict(target, res, body); err != nil {
+			return err
+		}
+	}
+	stored, err = srv.getJSON(ctx, path)
+	if err != nil {
+		return err
+	}
+	if rv := metaField(stored, "resourceVersion"); rv != third {
+		return fmt.Errorf("after two refused PUTs the namespace is at resourceVersion %q rather than %q: a write that answered 409 has to have left the store alone", rv, third)
+	}
+
+	for _, target := range []string{"/api/v1/namespaces/absent", "/api/v1/namespaces/absent/status"} {
+		res, body, err := srv.send(ctx, http.MethodPut, target, statusNamespace("absent", "", "a", "Active"))
+		if err != nil {
+			return err
+		}
+		if err := wantStatus("PUT "+target+", where absent has never been created", res, body, http.StatusNotFound, "NotFound"); err != nil {
+			return fmt.Errorf("%w\n\nan update needs something to update: a controller reporting on an object that has gone needs to hear it has gone, not to bring it back", err)
+		}
+	}
+
+	res, body, err = srv.send(ctx, http.MethodPut, path, statusNamespace("something-else", "", "a", "Active"))
+	if err != nil {
+		return err
+	}
+	if err := wantStatus("PUT "+path+" carrying metadata.name \"something-else\"", res, body, http.StatusBadRequest, "BadRequest"); err != nil {
+		return fmt.Errorf("%w\n\nthe name in the body has to agree with the one in the URL, for a namespace as for a configmap: an update is not a rename", err)
+	}
+	return nil
+}
+
+// statusDiscovery insists /api/v1 offers update on namespaces and lists the
+// status subresource: kubectl and client-go's UpdateStatus are written against
+// what discovery says exists.
+func statusDiscovery(ctx context.Context, srv *server) error {
+	list, err := srv.getJSON(ctx, "/api/v1")
+	if err != nil {
+		return err
+	}
+	entries := map[string]map[string]any{}
+	resources, _ := list["resources"].([]any)
+	for _, r := range resources {
+		if m, ok := r.(map[string]any); ok {
+			name, _ := m["name"].(string)
+			entries[name] = m
+		}
+	}
+	if verbs, _ := entries["namespaces"]["verbs"].([]any); !contains(verbs, "update") {
+		return fmt.Errorf("the namespaces entry in GET /api/v1 does not offer the verb \"update\" (it offers %v): a namespace can now be written back, and a client is not told so any other way", entries["namespaces"]["verbs"])
+	}
+	sub := entries["namespaces/status"]
+	if sub == nil {
+		return fmt.Errorf("GET /api/v1 lists no resource named namespaces/status: a subresource is discovered as its own entry, <resource>/<subresource>, and that name is what an RBAC rule grants to let a controller write status without writing spec")
+	}
+	if namespaced, _ := sub["namespaced"].(bool); namespaced {
+		return fmt.Errorf("the namespaces/status entry says namespaced: true, and a subresource is scoped like the resource it belongs to — namespaces are cluster-scoped")
+	}
+	if sub["kind"] != "Namespace" {
+		return fmt.Errorf("the namespaces/status entry has kind %v rather than Namespace: what goes in and comes out of /status is the whole object", sub["kind"])
+	}
+	verbs, _ := sub["verbs"].([]any)
+	for _, want := range []string{"get", "update"} {
+		if !contains(verbs, want) {
+			return fmt.Errorf("the namespaces/status entry does not offer the verb %q (it offers %v): status is read and replaced through this endpoint", want, sub["verbs"])
+		}
+	}
+	return nil
+}
+
+// statusNamespace is a whole Namespace as a client would send it back, with
+// both halves edited, so each endpoint can be seen to take only its own.
+func statusNamespace(name, resourceVersion, team, phase string) map[string]any {
+	meta := map[string]any{"name": name, "labels": map[string]any{"team": team}}
+	if resourceVersion != "" {
+		meta["resourceVersion"] = resourceVersion
+	}
+	return map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata":   meta,
+		"status":     map[string]any{"phase": phase},
+	}
+}
+
+func statusPhase(obj map[string]any) string {
+	status, _ := obj["status"].(map[string]any)
+	phase, _ := status["phase"].(string)
+	return phase
+}
+
+// statusWant checks both halves of a namespace: its team label and its phase.
+func statusWant(obj map[string]any, what, team, phase string) error {
+	meta, _ := obj["metadata"].(map[string]any)
+	labels, _ := meta["labels"].(map[string]any)
+	if labels["team"] != team {
+		return fmt.Errorf("%s has labels %v, where team should be %q", what, meta["labels"], team)
+	}
+	if got := statusPhase(obj); got != phase {
+		return fmt.Errorf("%s has status.phase %q, where it should be %q", what, got, phase)
+	}
+	return nil
+}
+
+func statusConflict(target string, res *http.Response, body []byte) error {
+	if err := wantStatus("PUT "+target+" with the resourceVersion the namespace had when it was created", res, body, http.StatusConflict, "Conflict"); err != nil {
+		return fmt.Errorf("%w\n\nsplitting the object does not split its version: there is one resourceVersion for the whole namespace, and a write through either endpoint from an old read is refused rather than allowed to undo what happened since", err)
 	}
 	return nil
 }

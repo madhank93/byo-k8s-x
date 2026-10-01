@@ -604,17 +604,8 @@ func run() error {
 					"singularName": "namespace",
 					"namespaced":   false,
 					"kind":         "Namespace",
-					"verbs":        []string{"create", "delete", "get", "list", "update", "watch"},
+					"verbs":        []string{"create", "delete", "get", "list", "watch"},
 					"shortNames":   []string{"ns"},
-				},
-				// A subresource is listed as a resource of its own, which is
-				// what lets a role grant it without the object it belongs to.
-				map[string]any{
-					"name":         "namespaces/status",
-					"singularName": "",
-					"namespaced":   false,
-					"kind":         "Namespace",
-					"verbs":        []string{"get", "update"},
 				},
 			},
 		})
@@ -699,7 +690,7 @@ func run() error {
 			return trackUpdate(old, obj, updater(r)), nil
 		})
 		if err != nil {
-			writeModifyError(w, err, "configmaps", name)
+			writeModifyError(w, err, name)
 			return
 		}
 		// 200, not 201: a client that asked to update an object it had read
@@ -729,7 +720,7 @@ func run() error {
 			return trackUpdate(old, obj, updater(r)), nil
 		})
 		if err != nil {
-			writeModifyError(w, err, "configmaps", name)
+			writeModifyError(w, err, name)
 			return
 		}
 		writeJSON(w, http.StatusOK, stored)
@@ -789,7 +780,7 @@ func run() error {
 
 	mux.HandleFunc("GET /api/v1/namespaces", listHandler(objects, "namespaces", "NamespaceList"))
 
-	getNamespace := func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/v1/namespaces/{name}", func(w http.ResponseWriter, r *http.Request) {
 		if !freshEnough(w, r, objects) {
 			return
 		}
@@ -800,12 +791,7 @@ func run() error {
 			return
 		}
 		writeJSON(w, http.StatusOK, obj)
-	}
-	mux.HandleFunc("GET /api/v1/namespaces/{name}", getNamespace)
-
-	mux.HandleFunc("PUT /api/v1/namespaces/{name}", putNamespace(objects, false))
-	mux.HandleFunc("GET /api/v1/namespaces/{name}/status", getNamespace)
-	mux.HandleFunc("PUT /api/v1/namespaces/{name}/status", putNamespace(objects, true))
+	})
 
 	mux.HandleFunc("DELETE /api/v1/namespaces/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
@@ -1426,7 +1412,7 @@ func decodeObject(w http.ResponseWriter, r *http.Request, namespace string) (obj
 }
 
 // writeModifyError answers a write to an existing object that did not happen.
-func writeModifyError(w http.ResponseWriter, err error, resource, name string) {
+func writeModifyError(w http.ResponseWriter, err error, name string) {
 	var conflicts *applyConflict
 	switch {
 	case errors.As(err, &conflicts):
@@ -1434,15 +1420,15 @@ func writeModifyError(w http.ResponseWriter, err error, resource, name string) {
 			"kind": "Status", "apiVersion": "v1", "metadata": map[string]any{},
 			"status": "Failure", "reason": "Conflict", "code": http.StatusConflict,
 			"message": conflicts.Error(),
-			"details": map[string]any{"name": name, "kind": resource, "causes": conflicts.causes},
+			"details": map[string]any{"name": name, "kind": "configmaps", "causes": conflicts.causes},
 		})
 	case errors.Is(err, errNotFound):
-		writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("%s %q not found", resource, name))
+		writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("configmaps %q not found", name))
 	case errors.Is(err, errConflict):
 		// The conflict every controller retries on: read it again, apply the
 		// change to what is there now, write it back.
 		writeStatus(w, http.StatusConflict, "Conflict",
-			fmt.Sprintf("Operation cannot be fulfilled on %s %q: the object has been modified; please apply your changes to the latest version and try again", resource, name))
+			fmt.Sprintf("Operation cannot be fulfilled on configmaps %q: the object has been modified; please apply your changes to the latest version and try again", name))
 	case errors.Is(err, errInvalidPatch):
 		writeStatus(w, http.StatusUnprocessableEntity, "Invalid", err.Error())
 	default:
@@ -1613,7 +1599,7 @@ func serverSideApply(w http.ResponseWriter, r *http.Request, objects *store, nam
 		return obj, nil
 	})
 	if err != nil {
-		writeModifyError(w, err, "configmaps", name)
+		writeModifyError(w, err, name)
 		return
 	}
 	code := http.StatusOK
@@ -2082,49 +2068,6 @@ func listIndex(token string, highest int) (int, error) {
 		return 0, fmt.Errorf("%q is not an index of this list", token)
 	}
 	return i, nil
-}
-
-// putNamespace answers both writes to a namespace, which differ only in which
-// half of the object they may change. The main endpoint keeps the stored
-// status; /status keeps everything but the status.
-//
-// Status is what a controller observed and spec is what a user asked for. Two
-// endpoints let a role grant one without the other, and stop a user's PUT of
-// an object read a minute ago from erasing what a controller wrote since.
-func putNamespace(objects *store, statusOnly bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		name := r.PathValue("name")
-		var obj object
-		if err := json.NewDecoder(r.Body).Decode(&obj); err != nil || obj == nil {
-			writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not a JSON object")
-			return
-		}
-		if got := metaString(obj, "name"); got != "" && got != name {
-			writeStatus(w, http.StatusBadRequest, "BadRequest",
-				fmt.Sprintf("the name of the object (%q) does not match the name on the URL (%q)", got, name))
-			return
-		}
-		stored, err := objects.modify("namespaces", "", name, func(old object) (object, error) {
-			next := obj
-			if statusOnly {
-				next = clone(old)
-				next["status"] = obj["status"]
-				// The precondition is the client's, whichever half it writes.
-				next["metadata"].(map[string]any)["resourceVersion"] = metaString(obj, "resourceVersion")
-			} else if status, ok := old["status"]; ok {
-				next["status"] = clone(status)
-			} else {
-				delete(next, "status")
-			}
-			next["apiVersion"], next["kind"] = "v1", "Namespace"
-			return trackUpdate(old, next, updater(r)), nil
-		})
-		if err != nil {
-			writeModifyError(w, err, "namespaces", name)
-			return
-		}
-		writeJSON(w, http.StatusOK, stored)
-	}
 }
 
 // writeJSON sends one object. The content type is not decoration: a client

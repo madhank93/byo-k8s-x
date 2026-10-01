@@ -346,6 +346,11 @@ func (s *store) locked(resource, namespace string) []object {
 	return items
 }
 
+// update replaces an object that has to be there already.
+func (s *store) update(resource, namespace, name string, obj object) (object, error) {
+	return s.modify(resource, namespace, name, func(object) (object, error) { return obj, nil })
+}
+
 // modify rewrites an object that has to be there already, keeping the fields
 // identity is made of and refusing a write built on a version that has moved on.
 //
@@ -401,6 +406,13 @@ func (s *store) upsert(resource, namespace, name string, change func(old object)
 	meta["uid"] = metaString(old, "uid")
 	meta["creationTimestamp"] = metaString(old, "creationTimestamp")
 	meta["resourceVersion"] = metaString(old, "resourceVersion")
+	// A client that never heard of managedFields sends an object without
+	// them, and that is not a request to forget who owns what.
+	if _, ok := meta["managedFields"]; !ok {
+		if oldMeta, _ := old["metadata"].(map[string]any); oldMeta["managedFields"] != nil {
+			meta["managedFields"] = oldMeta["managedFields"]
+		}
+	}
 	obj["metadata"] = meta
 	// A write that changes nothing is not a write. Moving the version for it
 	// would wake every watcher to look at an object that is what it was, and
@@ -604,17 +616,8 @@ func run() error {
 					"singularName": "namespace",
 					"namespaced":   false,
 					"kind":         "Namespace",
-					"verbs":        []string{"create", "delete", "get", "list", "update", "watch"},
+					"verbs":        []string{"create", "delete", "get", "list", "watch"},
 					"shortNames":   []string{"ns"},
-				},
-				// A subresource is listed as a resource of its own, which is
-				// what lets a role grant it without the object it belongs to.
-				map[string]any{
-					"name":         "namespaces/status",
-					"singularName": "",
-					"namespaced":   false,
-					"kind":         "Namespace",
-					"verbs":        []string{"get", "update"},
 				},
 			},
 		})
@@ -695,11 +698,9 @@ func run() error {
 			return
 		}
 
-		stored, err := objects.modify("configmaps", namespace, name, func(old object) (object, error) {
-			return trackUpdate(old, obj, updater(r)), nil
-		})
+		stored, err := objects.update("configmaps", namespace, name, obj)
 		if err != nil {
-			writeModifyError(w, err, "configmaps", name)
+			writeModifyError(w, err, name)
 			return
 		}
 		// 200, not 201: a client that asked to update an object it had read
@@ -726,10 +727,10 @@ func run() error {
 				return nil, err
 			}
 			obj["apiVersion"], obj["kind"] = "v1", "ConfigMap"
-			return trackUpdate(old, obj, updater(r)), nil
+			return obj, nil
 		})
 		if err != nil {
-			writeModifyError(w, err, "configmaps", name)
+			writeModifyError(w, err, name)
 			return
 		}
 		writeJSON(w, http.StatusOK, stored)
@@ -789,7 +790,7 @@ func run() error {
 
 	mux.HandleFunc("GET /api/v1/namespaces", listHandler(objects, "namespaces", "NamespaceList"))
 
-	getNamespace := func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/v1/namespaces/{name}", func(w http.ResponseWriter, r *http.Request) {
 		if !freshEnough(w, r, objects) {
 			return
 		}
@@ -800,12 +801,7 @@ func run() error {
 			return
 		}
 		writeJSON(w, http.StatusOK, obj)
-	}
-	mux.HandleFunc("GET /api/v1/namespaces/{name}", getNamespace)
-
-	mux.HandleFunc("PUT /api/v1/namespaces/{name}", putNamespace(objects, false))
-	mux.HandleFunc("GET /api/v1/namespaces/{name}/status", getNamespace)
-	mux.HandleFunc("PUT /api/v1/namespaces/{name}/status", putNamespace(objects, true))
+	})
 
 	mux.HandleFunc("DELETE /api/v1/namespaces/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
@@ -1426,23 +1422,15 @@ func decodeObject(w http.ResponseWriter, r *http.Request, namespace string) (obj
 }
 
 // writeModifyError answers a write to an existing object that did not happen.
-func writeModifyError(w http.ResponseWriter, err error, resource, name string) {
-	var conflicts *applyConflict
+func writeModifyError(w http.ResponseWriter, err error, name string) {
 	switch {
-	case errors.As(err, &conflicts):
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"kind": "Status", "apiVersion": "v1", "metadata": map[string]any{},
-			"status": "Failure", "reason": "Conflict", "code": http.StatusConflict,
-			"message": conflicts.Error(),
-			"details": map[string]any{"name": name, "kind": resource, "causes": conflicts.causes},
-		})
 	case errors.Is(err, errNotFound):
-		writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("%s %q not found", resource, name))
+		writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("configmaps %q not found", name))
 	case errors.Is(err, errConflict):
 		// The conflict every controller retries on: read it again, apply the
 		// change to what is there now, write it back.
 		writeStatus(w, http.StatusConflict, "Conflict",
-			fmt.Sprintf("Operation cannot be fulfilled on %s %q: the object has been modified; please apply your changes to the latest version and try again", resource, name))
+			fmt.Sprintf("Operation cannot be fulfilled on configmaps %q: the object has been modified; please apply your changes to the latest version and try again", name))
 	case errors.Is(err, errInvalidPatch):
 		writeStatus(w, http.StatusUnprocessableEntity, "Invalid", err.Error())
 	default:
@@ -1521,7 +1509,6 @@ func decodePatch(w http.ResponseWriter, r *http.Request) (func(object) (object, 
 // config file can delete a key without anyone writing a delete.
 func serverSideApply(w http.ResponseWriter, r *http.Request, objects *store, namespace, name string) {
 	manager := r.URL.Query().Get("fieldManager")
-	force := r.URL.Query().Get("force") == "true"
 	if manager == "" {
 		writeStatus(w, http.StatusBadRequest, "BadRequest", "PATCH with application/apply-patch+yaml requires the fieldManager query parameter: ownership is recorded by manager, and an apply without one has nobody to own it")
 		return
@@ -1559,28 +1546,6 @@ func serverSideApply(w http.ResponseWriter, r *http.Request, objects *store, nam
 		}
 		entries := managedEntries(obj)
 		mine := slices.IndexFunc(entries, func(e map[string]any) bool { return e["manager"] == manager && e["operation"] == "Apply" })
-
-		// Setting a field somebody else owns to the value it already has is
-		// agreeing with them, and both own it after. Setting it to anything
-		// else is overruling them, which only force may do.
-		conflicts := &applyConflict{}
-		for key, path := range applied {
-			want, _ := leafValue(config, path)
-			if have, ok := leafValue(obj, path); ok && reflect.DeepEqual(have, want) {
-				continue
-			}
-			for i, e := range entries {
-				if _, owns := entryLeaves(e)[key]; owns && i != mine {
-					conflicts.add(e["manager"].(string), path)
-					if force {
-						disown(e, key)
-					}
-				}
-			}
-		}
-		if len(conflicts.causes) > 0 && !force {
-			return nil, conflicts
-		}
 		if mine >= 0 {
 			for key, path := range entryLeaves(entries[mine]) {
 				if _, still := applied[key]; !still && !ownedByOther(entries, mine, key) {
@@ -1613,7 +1578,7 @@ func serverSideApply(w http.ResponseWriter, r *http.Request, objects *store, nam
 		return obj, nil
 	})
 	if err != nil {
-		writeModifyError(w, err, "configmaps", name)
+		writeModifyError(w, err, name)
 		return
 	}
 	code := http.StatusOK
@@ -2084,49 +2049,6 @@ func listIndex(token string, highest int) (int, error) {
 	return i, nil
 }
 
-// putNamespace answers both writes to a namespace, which differ only in which
-// half of the object they may change. The main endpoint keeps the stored
-// status; /status keeps everything but the status.
-//
-// Status is what a controller observed and spec is what a user asked for. Two
-// endpoints let a role grant one without the other, and stop a user's PUT of
-// an object read a minute ago from erasing what a controller wrote since.
-func putNamespace(objects *store, statusOnly bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		name := r.PathValue("name")
-		var obj object
-		if err := json.NewDecoder(r.Body).Decode(&obj); err != nil || obj == nil {
-			writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not a JSON object")
-			return
-		}
-		if got := metaString(obj, "name"); got != "" && got != name {
-			writeStatus(w, http.StatusBadRequest, "BadRequest",
-				fmt.Sprintf("the name of the object (%q) does not match the name on the URL (%q)", got, name))
-			return
-		}
-		stored, err := objects.modify("namespaces", "", name, func(old object) (object, error) {
-			next := obj
-			if statusOnly {
-				next = clone(old)
-				next["status"] = obj["status"]
-				// The precondition is the client's, whichever half it writes.
-				next["metadata"].(map[string]any)["resourceVersion"] = metaString(obj, "resourceVersion")
-			} else if status, ok := old["status"]; ok {
-				next["status"] = clone(status)
-			} else {
-				delete(next, "status")
-			}
-			next["apiVersion"], next["kind"] = "v1", "Namespace"
-			return trackUpdate(old, next, updater(r)), nil
-		})
-		if err != nil {
-			writeModifyError(w, err, "namespaces", name)
-			return
-		}
-		writeJSON(w, http.StatusOK, stored)
-	}
-}
-
 // writeJSON sends one object. The content type is not decoration: a client
 // that asked for JSON and got text decides the server is broken.
 func writeJSON(w http.ResponseWriter, code int, body any) {
@@ -2153,125 +2075,4 @@ func writeStatus(w http.ResponseWriter, code int, reason, message string) {
 		"reason":     reason,
 		"code":       code,
 	})
-}
-
-// applyConflict is an apply refused because it would overrule other managers,
-// one cause per field and manager — what a client shows the person who ran it.
-type applyConflict struct {
-	causes []map[string]any
-}
-
-func (c *applyConflict) add(manager string, path []string) {
-	c.causes = append(c.causes, map[string]any{
-		"type":    "FieldManagerConflict",
-		"message": fmt.Sprintf("conflict with %q", manager),
-		"field":   "." + strings.Join(path, "."),
-	})
-}
-
-func (c *applyConflict) Error() string {
-	lines := []string{}
-	for _, cause := range c.causes {
-		lines = append(lines, fmt.Sprintf("%s using v1: %s", cause["message"], cause["field"]))
-	}
-	sort.Strings(lines)
-	return fmt.Sprintf("Apply failed with %d conflict(s): %s", len(lines), strings.Join(lines, "; "))
-}
-
-// leafValue reads the value at a path, and whether there is one.
-func leafValue(obj map[string]any, path []string) (any, bool) {
-	var node any = obj
-	for _, k := range path {
-		m, ok := node.(map[string]any)
-		if !ok {
-			return nil, false
-		}
-		if node, ok = m[k]; !ok {
-			return nil, false
-		}
-	}
-	return node, true
-}
-
-// disown takes one field out of a managedFields entry.
-func disown(entry map[string]any, key string) {
-	leaves := entryLeaves(entry)
-	delete(leaves, key)
-	entry["fieldsV1"] = leafTree(leaves)
-}
-
-// updater is who a PUT or a PATCH is on behalf of. A client that does not say
-// is still recorded, as somebody, so the fields it changed stop being owned by
-// whoever set them before.
-func updater(r *http.Request) string {
-	if m := r.URL.Query().Get("fieldManager"); m != "" {
-		return m
-	}
-	return "unknown"
-}
-
-// trackUpdate records a write that is not an apply: every field whose value it
-// changed now belongs to manager alone. An update never conflicts — it is an
-// instruction, not a statement of intent — but it does mean the manager who
-// applied the old value is told so the next time it applies it.
-func trackUpdate(old, obj object, manager string) object {
-	meta, _ := obj["metadata"].(map[string]any)
-	if meta == nil {
-		meta = map[string]any{}
-		obj["metadata"] = meta
-	}
-	// A client that never heard of managedFields sends an object without
-	// them, and that is not a request to forget who owns what.
-	if _, ok := meta["managedFields"]; !ok {
-		if oldMeta, _ := old["metadata"].(map[string]any); oldMeta["managedFields"] != nil {
-			meta["managedFields"] = clone(oldMeta["managedFields"])
-		}
-	}
-	before, after := map[string][]string{}, map[string][]string{}
-	collectLeaves(map[string]any(old), nil, before)
-	collectLeaves(map[string]any(obj), nil, after)
-	changed := map[string][]string{}
-	for key, path := range before {
-		if v, ok := leafValue(obj, path); !ok || !reflect.DeepEqual(v, mustLeaf(old, path)) {
-			changed[key] = path
-		}
-	}
-	for key, path := range after {
-		if _, ok := before[key]; !ok {
-			changed[key] = path
-		}
-	}
-	if len(changed) == 0 {
-		return obj
-	}
-
-	entries := managedEntries(obj)
-	for _, e := range entries {
-		for key := range changed {
-			disown(e, key)
-		}
-	}
-	mine := slices.IndexFunc(entries, func(e map[string]any) bool { return e["manager"] == manager && e["operation"] == "Update" })
-	if mine < 0 {
-		entries = append(entries, map[string]any{
-			"manager": manager, "operation": "Update", "apiVersion": "v1",
-			"fieldsType": "FieldsV1", "fieldsV1": map[string]any{},
-		})
-		mine = len(entries) - 1
-	}
-	owned := entryLeaves(entries[mine])
-	for key, path := range changed {
-		if _, ok := after[key]; ok {
-			owned[key] = path
-		}
-	}
-	entries[mine]["fieldsV1"] = leafTree(owned)
-	entries[mine]["time"] = time.Now().UTC().Format(time.RFC3339)
-	setManagedEntries(obj, entries)
-	return obj
-}
-
-func mustLeaf(obj object, path []string) any {
-	v, _ := leafValue(obj, path)
-	return v
 }
