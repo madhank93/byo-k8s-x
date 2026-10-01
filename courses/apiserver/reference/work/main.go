@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha512"
@@ -588,32 +589,19 @@ func run() error {
 	})
 	// The group-less core API is /api; everything else lives under /apis, in a
 	// named group, each listed with the versions it serves.
-	mux.HandleFunc("GET /apis", func(w http.ResponseWriter, _ *http.Request) {
-		version := map[string]any{"groupVersion": "authentication.k8s.io/v1", "version": "v1"}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"kind":       "APIGroupList",
-			"apiVersion": "v1",
-			"groups": []any{map[string]any{
-				"name":             "authentication.k8s.io",
-				"versions":         []any{version},
-				"preferredVersion": version,
-			}},
-		})
+	var groups apiGroups
+	groups.add("authentication.k8s.io/v1", map[string]any{
+		"name":         "selfsubjectreviews",
+		"singularName": "selfsubjectreview",
+		"namespaced":   false,
+		"kind":         "SelfSubjectReview",
+		"verbs":        []string{"create"},
 	})
-	mux.HandleFunc("GET /apis/authentication.k8s.io/v1", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"kind":         "APIResourceList",
-			"apiVersion":   "v1",
-			"groupVersion": "authentication.k8s.io/v1",
-			"resources": []any{map[string]any{
-				"name":         "selfsubjectreviews",
-				"singularName": "selfsubjectreview",
-				"namespaced":   false,
-				"kind":         "SelfSubjectReview",
-				"verbs":        []string{"create"},
-			}},
-		})
-	})
+	for _, t := range namedResources {
+		serveResource(mux, objects, t)
+		groups.add(t.groupVersion(), t.discovery())
+	}
+	groups.serve(mux)
 	// Who the server decided the caller is: what kubectl auth whoami asks,
 	// and the first thing to check when a request is refused.
 	mux.HandleFunc("POST /apis/authentication.k8s.io/v1/selfsubjectreviews", func(w http.ResponseWriter, r *http.Request) {
@@ -694,15 +682,15 @@ func run() error {
 		})
 	})
 
-	serveNamespaced(mux, objects, resourceType{resource: "configmaps", kind: "ConfigMap"})
-	serveNamespaced(mux, objects, replicationControllers)
+	serveResource(mux, objects, resourceType{resource: "configmaps", kind: "ConfigMap"})
+	serveResource(mux, objects, replicationControllers)
 	serveStatus(mux, objects, replicationControllers)
 	serveScale(mux, objects)
 
 	// Namespaces are cluster-scoped: no namespace in their URLs, because they
 	// are what a namespace in a URL refers to.
 	mux.HandleFunc("POST /api/v1/namespaces", func(w http.ResponseWriter, r *http.Request) {
-		obj, ok := decodeObject(w, r, "", "Namespace")
+		obj, ok := decodeObject(w, r, "", "v1", "Namespace")
 		if !ok {
 			return
 		}
@@ -730,7 +718,7 @@ func run() error {
 		writeJSON(w, http.StatusCreated, stored)
 	})
 
-	mux.HandleFunc("GET /api/v1/namespaces", listHandler(objects, "namespaces", "NamespaceList"))
+	mux.HandleFunc("GET /api/v1/namespaces", listHandler(objects, resourceType{resource: "namespaces", kind: "Namespace", clusterScoped: true}))
 
 	getNamespace := func(w http.ResponseWriter, r *http.Request) {
 		if !freshEnough(w, r, objects) {
@@ -789,13 +777,108 @@ func run() error {
 	return nil
 }
 
-// resourceType is what differs between two namespaced resources served the
-// same way: the names, what a create fills in, and whether status is a half of
-// the object only its own endpoint may write.
+// resourceType is what differs between two resources served the same way: the
+// group and version they live in, the names, whether they sit in a namespace,
+// what a create fills in, and whether status is a half of the object only its
+// own endpoint may write.
+//
+// An empty group is the core group, served under /api/v1; every other group is
+// under /apis/<group>/<version>, and an empty version means v1.
 type resourceType struct {
+	group, version string
 	resource, kind string
+	clusterScoped  bool
 	defaults       func(obj object)
 	hasStatus      bool
+}
+
+// groupVersion is what an object of this type carries as its apiVersion.
+func (t resourceType) groupVersion() string {
+	version := cmp.Or(t.version, "v1")
+	if t.group == "" {
+		return version
+	}
+	return t.group + "/" + version
+}
+
+// root is where this type's group-version is served.
+func (t resourceType) root() string {
+	if t.group == "" {
+		return "/api/" + t.groupVersion()
+	}
+	return "/apis/" + t.groupVersion()
+}
+
+// collection is the URL pattern of the collection a create is posted to.
+func (t resourceType) collection() string {
+	if t.clusterScoped {
+		return t.root() + "/" + t.resource
+	}
+	return t.root() + "/namespaces/{namespace}/" + t.resource
+}
+
+// discovery is this type's entry in its group-version's APIResourceList.
+func (t resourceType) discovery() map[string]any {
+	return map[string]any{
+		"name":         t.resource,
+		"singularName": strings.ToLower(t.kind),
+		"namespaced":   !t.clusterScoped,
+		"kind":         t.kind,
+		"verbs":        []string{"create", "delete", "get", "list", "patch", "update", "watch"},
+	}
+}
+
+// namedResources are the stored resources served outside the core group. Each
+// is plain data here: stored, listed and watched like a ConfigMap, and nothing
+// acts on what it says.
+var namedResources = []resourceType{
+	{group: "rbac.authorization.k8s.io", resource: "roles", kind: "Role"},
+	{group: "rbac.authorization.k8s.io", resource: "rolebindings", kind: "RoleBinding"},
+	{group: "rbac.authorization.k8s.io", resource: "clusterroles", kind: "ClusterRole", clusterScoped: true},
+	{group: "rbac.authorization.k8s.io", resource: "clusterrolebindings", kind: "ClusterRoleBinding", clusterScoped: true},
+	{group: "admissionregistration.k8s.io", resource: "mutatingwebhookconfigurations", kind: "MutatingWebhookConfiguration", clusterScoped: true},
+	{group: "admissionregistration.k8s.io", resource: "validatingwebhookconfigurations", kind: "ValidatingWebhookConfiguration", clusterScoped: true},
+}
+
+// apiGroups is discovery for /apis: each group-version served there, in the
+// order first added, with the resources it offers. Every group here serves one
+// version, so that version is also the one it prefers.
+type apiGroups struct {
+	order     []string
+	resources map[string][]any
+}
+
+func (g *apiGroups) add(groupVersion string, entry map[string]any) {
+	if g.resources == nil {
+		g.resources = map[string][]any{}
+	}
+	if _, ok := g.resources[groupVersion]; !ok {
+		g.order = append(g.order, groupVersion)
+	}
+	g.resources[groupVersion] = append(g.resources[groupVersion], entry)
+}
+
+// serve answers GET /apis and GET /apis/<group>/<version> for every
+// group-version added so far.
+func (g *apiGroups) serve(mux *http.ServeMux) {
+	list := []any{}
+	for _, gv := range g.order {
+		name, version, _ := strings.Cut(gv, "/")
+		v := map[string]any{"groupVersion": gv, "version": version}
+		list = append(list, map[string]any{"name": name, "versions": []any{v}, "preferredVersion": v})
+		resources := map[string]any{
+			"kind":         "APIResourceList",
+			"apiVersion":   "v1",
+			"groupVersion": gv,
+			"resources":    g.resources[gv],
+		}
+		mux.HandleFunc("GET /apis/"+gv, func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusOK, resources)
+		})
+	}
+	mux.HandleFunc("GET /apis", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"kind": "APIGroupList", "apiVersion": "v1", "groups": list})
+	})
 }
 
 // replicationControllers is the core group's scalable resource: a count of
@@ -841,13 +924,19 @@ func (t resourceType) keepStatus(old, obj object) {
 	}
 }
 
-// serveNamespaced serves one namespaced resource: the collection in a
-// namespace and across all of them, and each object by name.
-func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
-	mux.HandleFunc("POST /api/v1/namespaces/{namespace}/"+t.resource, func(w http.ResponseWriter, r *http.Request) {
+// serveResource serves one resource: the collection, and each object by name.
+// A namespaced resource's collection is per namespace, and is also served
+// across all of them.
+//
+// A cluster-scoped resource's URLs have no {namespace} in them, and an absent
+// path value is the empty string — which every handler and the store already
+// read as "no namespace".
+func serveResource(mux *http.ServeMux, objects *store, t resourceType) {
+	collection, item := t.collection(), t.collection()+"/{name}"
+	mux.HandleFunc("POST "+collection, func(w http.ResponseWriter, r *http.Request) {
 		namespace := r.PathValue("namespace")
 
-		obj, ok := decodeObject(w, r, namespace, t.kind)
+		obj, ok := decodeObject(w, r, namespace, t.groupVersion(), t.kind)
 		if !ok {
 			return
 		}
@@ -855,7 +944,8 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 		if name == "" {
 			// 422 rather than 400: the request was understood and the object
 			// it carried is the thing that is wrong.
-			writeStatus(w, http.StatusUnprocessableEntity, "Invalid", t.kind+" in version \"v1\" cannot be handled: metadata.name is required")
+			writeStatus(w, http.StatusUnprocessableEntity, "Invalid",
+				fmt.Sprintf("%s in version %q cannot be handled: metadata.name is required", t.kind, cmp.Or(t.version, "v1")))
 			return
 		}
 
@@ -863,8 +953,7 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 		// and writing into one that was never created leaves objects nothing
 		// will ever clean up — no quota applies to them, no delete reaches
 		// them, and nothing lists them but the namespace nobody made.
-		if _, ok := objects.get("namespaces", "", namespace); !ok {
-			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("namespaces %q not found", namespace))
+		if !namespaceExists(w, objects, t, namespace) {
 			return
 		}
 
@@ -889,9 +978,9 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 		writeJSON(w, http.StatusCreated, stored)
 	})
 
-	mux.HandleFunc("GET /api/v1/namespaces/{namespace}/"+t.resource, listHandler(objects, t.resource, t.kind+"List"))
+	mux.HandleFunc("GET "+collection, listHandler(objects, t))
 
-	mux.HandleFunc("GET /api/v1/namespaces/{namespace}/"+t.resource+"/{name}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+item, func(w http.ResponseWriter, r *http.Request) {
 		if !freshEnough(w, r, objects) {
 			return
 		}
@@ -906,10 +995,10 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 		writeJSON(w, http.StatusOK, obj)
 	})
 
-	mux.HandleFunc("PUT /api/v1/namespaces/{namespace}/"+t.resource+"/{name}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("PUT "+item, func(w http.ResponseWriter, r *http.Request) {
 		namespace, name := r.PathValue("namespace"), r.PathValue("name")
 
-		obj, ok := decodeObject(w, r, namespace, t.kind)
+		obj, ok := decodeObject(w, r, namespace, t.groupVersion(), t.kind)
 		if !ok {
 			return
 		}
@@ -938,7 +1027,7 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 	// A patch is an update that says only what changed. The client sends no
 	// copy of the object, so it has nothing stale to write back: the change is
 	// applied to what is stored when the write happens.
-	mux.HandleFunc("PATCH /api/v1/namespaces/{namespace}/"+t.resource+"/{name}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("PATCH "+item, func(w http.ResponseWriter, r *http.Request) {
 		namespace, name := r.PathValue("namespace"), r.PathValue("name")
 		if mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mediaType == "application/apply-patch+yaml" {
 			serverSideApply(w, r, objects, t, namespace, name)
@@ -953,7 +1042,7 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 			if err != nil {
 				return nil, err
 			}
-			obj["apiVersion"], obj["kind"] = "v1", t.kind
+			obj["apiVersion"], obj["kind"] = t.groupVersion(), t.kind
 			t.keepStatus(old, obj)
 			return trackUpdate(old, obj, updater(r)), nil
 		})
@@ -964,7 +1053,7 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 		writeJSON(w, http.StatusOK, stored)
 	})
 
-	mux.HandleFunc("DELETE /api/v1/namespaces/{namespace}/"+t.resource+"/{name}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("DELETE "+item, func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		removed, err := objects.remove(t.resource, r.PathValue("namespace"), name)
 		if err != nil && !errors.Is(err, errNotFound) {
@@ -988,13 +1077,29 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 	// The same resource with no namespace in the path: every object of it in
 	// the cluster, which is what kubectl get -A asks for. A client tells the
 	// two URLs apart from discovery alone.
-	mux.HandleFunc("GET /api/v1/"+t.resource, listHandler(objects, t.resource, t.kind+"List"))
+	if !t.clusterScoped {
+		mux.HandleFunc("GET "+t.root()+"/"+t.resource, listHandler(objects, t))
+	}
 }
 
-// serveStatus serves the /status subresource of a namespaced resource: read
-// as the whole object, written as its status alone.
+// namespaceExists answers 404 for a write into a namespace that was never
+// created, and reports whether the write can go on. A cluster-scoped resource
+// is in no namespace, so there is nothing to check.
+func namespaceExists(w http.ResponseWriter, objects *store, t resourceType, namespace string) bool {
+	if t.clusterScoped {
+		return true
+	}
+	if _, ok := objects.get("namespaces", "", namespace); !ok {
+		writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("namespaces %q not found", namespace))
+		return false
+	}
+	return true
+}
+
+// serveStatus serves the /status subresource of a resource: read as the whole
+// object, written as its status alone.
 func serveStatus(mux *http.ServeMux, objects *store, t resourceType) {
-	path := "/api/v1/namespaces/{namespace}/" + t.resource + "/{name}/status"
+	path := t.collection() + "/{name}/status"
 	mux.HandleFunc("GET "+path, func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		obj, ok := objects.get(t.resource, r.PathValue("namespace"), name)
@@ -1006,7 +1111,7 @@ func serveStatus(mux *http.ServeMux, objects *store, t resourceType) {
 	})
 	mux.HandleFunc("PUT "+path, func(w http.ResponseWriter, r *http.Request) {
 		namespace, name := r.PathValue("namespace"), r.PathValue("name")
-		obj, ok := decodeObject(w, r, namespace, t.kind)
+		obj, ok := decodeObject(w, r, namespace, t.groupVersion(), t.kind)
 		if !ok {
 			return
 		}
@@ -1127,7 +1232,7 @@ func scaleOf(rc object) object {
 // its pattern and the cluster-wide one does not, and an absent path value is
 // the empty string — which is already what the store reads as "every
 // namespace". The difference between the two URLs is the path, and nothing else.
-func listHandler(objects *store, resource, kind string) http.HandlerFunc {
+func listHandler(objects *store, t resourceType) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !freshEnough(w, r, objects) {
 			return
@@ -1145,7 +1250,7 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 		// it is the same URL with a flag on it — same resource, same
 		// namespace, same selectors, a different shape of answer.
 		if watching(r) {
-			streamWatch(w, r, objects, resource, kind, selected)
+			streamWatch(w, r, objects, t, selected)
 			return
 		}
 
@@ -1160,7 +1265,7 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 			return
 		}
 
-		all, version := objects.list(resource, r.PathValue("namespace"))
+		all, version := objects.list(t.resource, r.PathValue("namespace"))
 		items := []object{}
 		for _, obj := range all {
 			if selected(obj) {
@@ -1186,7 +1291,7 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 			listVersion = token.Version
 			rest := []object{}
 			for _, obj := range items {
-				if objectKey(resource, obj) > token.Start {
+				if objectKey(t.resource, obj) > token.Start {
 					rest = append(rest, obj)
 				}
 			}
@@ -1199,15 +1304,15 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 			// only then. An empty continue on the last page is what tells a
 			// client to stop, and a client that is handed one forever pages
 			// forever.
-			meta["continue"] = continueToken{Version: listVersion, Start: objectKey(resource, items[limit-1])}.encode()
+			meta["continue"] = continueToken{Version: listVersion, Start: objectKey(t.resource, items[limit-1])}.encode()
 			// A hint rather than a promise: it is what was left when this page
 			// was cut, and kubectl prints it as "(N remaining)".
 			meta["remainingItemCount"] = len(items) - limit
 			items = items[:limit]
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"kind":       kind,
-			"apiVersion": "v1",
+			"kind":       t.kind + "List",
+			"apiVersion": t.groupVersion(),
 			// The list's own resourceVersion, which is not any item's: it is
 			// where a watch started from this answer would begin, and it stays
 			// the same across every page of one list.
@@ -1232,7 +1337,7 @@ func watching(r *http.Request) bool {
 // controller, the scheduler, the kubelet and kube-proxy are all a cache filled
 // from one of these and kept in step by it — nothing polls, and that is the
 // only reason a cluster of any size works at all.
-func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resource, kind string, selected func(object) bool) {
+func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, t resourceType, selected func(object) bool) {
 	namespace := r.PathValue("namespace")
 	// The version the client says it already has. Absent and 0 both mean "I
 	// have nothing" — 0 is not version zero, it is "whatever you have
@@ -1243,7 +1348,7 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 		// that is ahead of this server.
 		since, _ = strconv.ParseInt(raw, 10, 64)
 	}
-	watch, err := objects.watchFrom(resource, namespace, since)
+	watch, err := objects.watchFrom(t.resource, namespace, since)
 	if errors.Is(err, errExpired) {
 		// The error every informer is written to handle: its cache is too old
 		// to be caught up, so it throws the cache away, lists again, and
@@ -1304,7 +1409,7 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 	// how every informer in Kubernetes stays in step, and it is why the list
 	// carries a version of its own at all.
 	for _, event := range watch.replay {
-		if event.Resource != resource || (namespace != "" && event.Namespace != namespace) {
+		if event.Resource != t.resource || (namespace != "" && event.Namespace != namespace) {
 			continue
 		}
 		if selected(event.Object) && !send(event.Type, event.Object) {
@@ -1345,8 +1450,8 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 			if current := objects.currentVersion(); current > latest {
 				latest = current
 				if !send("BOOKMARK", object{
-					"apiVersion": "v1",
-					"kind":       strings.TrimSuffix(kind, "List"),
+					"apiVersion": t.groupVersion(),
+					"kind":       t.kind,
 					"metadata":   map[string]any{"resourceVersion": strconv.FormatInt(current, 10)},
 				}) {
 					return
@@ -1362,7 +1467,7 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 				// lists again and starts over.
 				return
 			}
-			if event.Resource != resource || (namespace != "" && event.Namespace != namespace) {
+			if event.Resource != t.resource || (namespace != "" && event.Namespace != namespace) {
 				continue
 			}
 			// The same selectors as a list, on the same objects. This is what
@@ -1681,7 +1786,7 @@ func freshEnough(w http.ResponseWriter, r *http.Request, s *store) bool {
 // A namespace in the body has to agree with the one in the path: the URL is
 // what a client was authorized against, and a body that names a different
 // namespace is asking to write somewhere nobody checked.
-func decodeObject(w http.ResponseWriter, r *http.Request, namespace, kind string) (object, bool) {
+func decodeObject(w http.ResponseWriter, r *http.Request, namespace, apiVersion, kind string) (object, bool) {
 	var obj object
 	if err := json.NewDecoder(r.Body).Decode(&obj); err != nil {
 		writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not valid JSON: "+err.Error())
@@ -1692,7 +1797,7 @@ func decodeObject(w http.ResponseWriter, r *http.Request, namespace, kind string
 			fmt.Sprintf("the namespace of the provided object does not match the namespace sent on the request: %q != %q", got, namespace))
 		return nil, false
 	}
-	obj["apiVersion"], obj["kind"] = "v1", kind
+	obj["apiVersion"], obj["kind"] = apiVersion, kind
 	return obj, true
 }
 
@@ -1816,8 +1921,7 @@ func serverSideApply(w http.ResponseWriter, r *http.Request, objects *store, t r
 			fmt.Sprintf("the namespace of the provided object does not match the namespace sent on the request: %q != %q", got, namespace))
 		return
 	}
-	if _, ok := objects.get("namespaces", "", namespace); !ok {
-		writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("namespaces %q not found", namespace))
+	if !namespaceExists(w, objects, t, namespace) {
 		return
 	}
 
@@ -1864,7 +1968,7 @@ func serverSideApply(w http.ResponseWriter, r *http.Request, objects *store, t r
 			delete(meta, "managedFields")
 		}
 		obj = mergePatch(map[string]any(obj), incoming).(map[string]any)
-		obj["apiVersion"], obj["kind"] = "v1", t.kind
+		obj["apiVersion"], obj["kind"] = t.groupVersion(), t.kind
 		if old == nil && t.defaults != nil {
 			t.defaults(obj)
 		} else if old != nil {
@@ -1872,7 +1976,7 @@ func serverSideApply(w http.ResponseWriter, r *http.Request, objects *store, t r
 		}
 
 		entry := map[string]any{
-			"manager": manager, "operation": "Apply", "apiVersion": "v1",
+			"manager": manager, "operation": "Apply", "apiVersion": t.groupVersion(),
 			"fieldsType": "FieldsV1", "fieldsV1": leafTree(applied),
 			"time": time.Now().UTC().Format(time.RFC3339),
 		}
@@ -2530,7 +2634,7 @@ func trackUpdate(old, obj object, manager string) object {
 	mine := slices.IndexFunc(entries, func(e map[string]any) bool { return e["manager"] == manager && e["operation"] == "Update" })
 	if mine < 0 {
 		entries = append(entries, map[string]any{
-			"manager": manager, "operation": "Update", "apiVersion": "v1",
+			"manager": manager, "operation": "Update", "apiVersion": obj["apiVersion"],
 			"fieldsType": "FieldsV1", "fieldsV1": map[string]any{},
 		})
 		mine = len(entries) - 1
