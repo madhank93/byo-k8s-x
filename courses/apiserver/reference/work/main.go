@@ -25,6 +25,7 @@ import (
 	"math"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -381,13 +382,16 @@ func scan(objects map[string]object, resource, namespace string) []object {
 // makes a patch safe to send without a resourceVersion: it is applied to the
 // object as it is at the moment of the write, never to a copy read earlier.
 // change must not modify the object it is given — that is the store's copy.
-func (s *store) modify(resource, namespace, name string, change func(old object) (object, error)) (object, error) {
+//
+// admit, when there is one, sees what change produced before it is written;
+// see upsert for what that costs.
+func (s *store) modify(resource, namespace, name string, change func(old object) (object, error), admit admitFunc) (object, error) {
 	obj, _, err := s.upsert(resource, namespace, name, func(old object) (object, error) {
 		if old == nil {
 			return nil, errNotFound
 		}
 		return change(old)
-	})
+	}, admit)
 	return obj, err
 }
 
@@ -395,7 +399,40 @@ func (s *store) modify(resource, namespace, name string, change func(old object)
 // did: change is handed nil when nothing is stored under the name. Deciding
 // which of the two it is happens under the same lock as the write, or two
 // creates of one name both think they are first.
-func (s *store) upsert(resource, namespace, name string, change func(old object) (object, error)) (object, bool, error) {
+//
+// With admission the change cannot be worked out under the lock: a webhook is
+// a network call, and a slow one would stall every reader. So change and admit
+// run against a snapshot, and the write goes through only if the object is
+// still the one they saw — otherwise the whole thing starts again from what is
+// there now, the same optimistic loop the real server runs against etcd.
+func (s *store) upsert(resource, namespace, name string, change func(old object) (object, error), admit admitFunc) (object, bool, error) {
+	if admit == nil {
+		return s.commit(resource, namespace, name, change)
+	}
+	for range 5 {
+		old, _ := s.get(resource, namespace, name)
+		obj, err := change(old)
+		if err != nil {
+			return nil, false, err
+		}
+		if obj, err = admit(obj, old); err != nil {
+			return nil, false, err
+		}
+		stored, created, err := s.commit(resource, namespace, name, func(current object) (object, error) {
+			if (current == nil) != (old == nil) || metaString(current, "resourceVersion") != metaString(old, "resourceVersion") {
+				return nil, errMoved
+			}
+			return obj, nil
+		})
+		if !errors.Is(err, errMoved) {
+			return stored, created, err
+		}
+	}
+	return nil, false, errConflict
+}
+
+// commit is upsert with change worked out under the lock.
+func (s *store) commit(resource, namespace, name string, change func(old object) (object, error)) (object, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := registryKey(resource, namespace, name)
@@ -456,14 +493,19 @@ func sameJSON(a, b object) bool {
 	return bytes.Equal(x, y)
 }
 
-// remove takes an object back out and returns it as it last was.
-func (s *store) remove(resource, namespace, name string) (object, error) {
+// remove takes an object back out and returns it as it last was. A non-empty
+// precondition is a resourceVersion the object must still be at, which is how
+// a delete that was admitted is kept to the object that was admitted.
+func (s *store) remove(resource, namespace, name, precondition string) (object, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := registryKey(resource, namespace, name)
 	old, ok := s.objects[key]
 	if !ok {
 		return nil, errNotFound
+	}
+	if precondition != "" && precondition != metaString(old, "resourceVersion") {
+		return nil, errConflict
 	}
 	// A delete is a write like any other, so it moves the counter: a watcher
 	// has to be able to place the removal after the create it already saw.
@@ -544,6 +586,7 @@ var (
 	errConflict      = errors.New("the object has been modified")
 	errExpired       = errors.New("too old resource version")
 	errInvalidPatch  = errors.New("the patch cannot be applied")
+	errMoved         = errors.New("the object changed while the write was being admitted")
 )
 
 // clone is a deep copy of an object, or of any part of one, for a change that
@@ -845,7 +888,7 @@ func run() error {
 
 	mux.HandleFunc("DELETE /api/v1/namespaces/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
-		removed, err := objects.remove("namespaces", "", name)
+		removed, err := objects.remove("namespaces", "", name, "")
 		if errors.Is(err, errNotFound) {
 			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("namespaces %q not found", name))
 			return
@@ -1086,6 +1129,13 @@ func serveResource(mux *http.ServeMux, objects *store, t resourceType) {
 			writeModifyError(w, err, t.resource, name)
 			return
 		}
+		if admit := admitter(objects, r, t, ""); admit != nil {
+			var err error
+			if obj, err = admit(obj, nil); err != nil {
+				writeModifyError(w, err, t.resource, name)
+				return
+			}
+		}
 		stored, err := objects.create(t.resource, namespace, name, obj)
 		if errors.Is(err, errAlreadyExists) {
 			writeStatus(w, http.StatusConflict, "AlreadyExists",
@@ -1138,12 +1188,13 @@ func serveResource(mux *http.ServeMux, objects *store, t resourceType) {
 		}
 
 		stored, err := objects.modify(t.resource, namespace, name, func(old object) (object, error) {
-			t.keepStatus(old, obj)
-			if err := t.admit(r, namespace, obj); err != nil {
+			next := clone(obj)
+			t.keepStatus(old, next)
+			if err := t.admit(r, namespace, next); err != nil {
 				return nil, err
 			}
-			return trackUpdate(old, obj, updater(r)), nil
-		})
+			return trackUpdate(old, next, updater(r)), nil
+		}, admitter(objects, r, t, ""))
 		if err != nil {
 			writeModifyError(w, err, t.resource, name)
 			return
@@ -1177,7 +1228,7 @@ func serveResource(mux *http.ServeMux, objects *store, t resourceType) {
 				return nil, err
 			}
 			return trackUpdate(old, obj, updater(r)), nil
-		})
+		}, admitter(objects, r, t, ""))
 		if err != nil {
 			writeModifyError(w, err, t.resource, name)
 			return
@@ -1186,8 +1237,27 @@ func serveResource(mux *http.ServeMux, objects *store, t resourceType) {
 	})
 
 	mux.HandleFunc("DELETE "+item, func(w http.ResponseWriter, r *http.Request) {
-		name := r.PathValue("name")
-		removed, err := objects.remove(t.resource, r.PathValue("namespace"), name)
+		namespace, name := r.PathValue("namespace"), r.PathValue("name")
+		// A delete is admitted against the object as it is, and then removes
+		// that object only: one written in between was never admitted.
+		version := ""
+		if admit := admitter(objects, r, t, ""); admit != nil {
+			old, ok := objects.get(t.resource, namespace, name)
+			if !ok {
+				writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("%s %q not found", t.resource, name))
+				return
+			}
+			if _, err := admit(nil, old); err != nil {
+				writeModifyError(w, err, t.resource, name)
+				return
+			}
+			version = metaString(old, "resourceVersion")
+		}
+		removed, err := objects.remove(t.resource, namespace, name, version)
+		if errors.Is(err, errConflict) {
+			writeModifyError(w, err, t.resource, name)
+			return
+		}
 		if err != nil && !errors.Is(err, errNotFound) {
 			writeStatus(w, http.StatusInternalServerError, "InternalError", "the object could not be removed: "+err.Error())
 			return
@@ -1257,7 +1327,7 @@ func serveStatus(mux *http.ServeMux, objects *store, t resourceType) {
 			next["status"] = obj["status"]
 			next["metadata"].(map[string]any)["resourceVersion"] = metaString(obj, "resourceVersion")
 			return trackUpdate(old, next, updater(r)), nil
-		})
+		}, admitter(objects, r, t, "status"))
 		if err != nil {
 			writeModifyError(w, err, t.resource, name)
 			return
@@ -1289,7 +1359,7 @@ func serveScale(mux *http.ServeMux, objects *store) {
 			// is the same stale read it would be on the object itself.
 			next["metadata"].(map[string]any)["resourceVersion"] = metaString(scale, "resourceVersion")
 			return trackUpdate(old, next, updater(r)), nil
-		})
+		}, nil)
 		if err != nil {
 			writeModifyError(w, err, resource, name)
 			return
@@ -1937,9 +2007,12 @@ func decodeObject(w http.ResponseWriter, r *http.Request, namespace, apiVersion,
 func writeModifyError(w http.ResponseWriter, err error, resource, name string) {
 	var conflicts *applyConflict
 	var forbidden *forbiddenError
+	var refused *statusError
 	switch {
 	case errors.As(err, &forbidden):
 		writeStatus(w, http.StatusForbidden, "Forbidden", forbidden.message)
+	case errors.As(err, &refused):
+		writeStatus(w, refused.code, refused.reason, refused.message)
 	case errors.As(err, &conflicts):
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"kind": "Status", "apiVersion": "v1", "metadata": map[string]any{},
@@ -2129,7 +2202,7 @@ func serverSideApply(w http.ResponseWriter, r *http.Request, objects *store, t r
 			return nil, err
 		}
 		return obj, nil
-	})
+	}, admitter(objects, r, t, ""))
 	if err != nil {
 		writeModifyError(w, err, t.resource, name)
 		return
@@ -2636,7 +2709,7 @@ func putNamespace(objects *store, statusOnly bool) http.HandlerFunc {
 			}
 			next["apiVersion"], next["kind"] = "v1", "Namespace"
 			return trackUpdate(old, next, updater(r)), nil
-		})
+		}, nil)
 		if err != nil {
 			writeModifyError(w, err, "namespaces", name)
 			return
@@ -3442,6 +3515,382 @@ func (p *rbac) bootstrap() error {
 		}
 	}
 	return nil
+}
+
+// admitFunc is the last word on a write before it is stored: handed the object
+// about to be written and the one it replaces, it returns what to write
+// instead, or why not. obj is nil for a delete, old is nil for a create.
+type admitFunc func(obj, old object) (object, error)
+
+// statusError is a refusal that carries its own HTTP code and reason.
+type statusError struct {
+	code    int
+	reason  string
+	message string
+}
+
+func (e *statusError) Error() string { return e.message }
+
+func internalError(format string, args ...any) error {
+	return &statusError{code: http.StatusInternalServerError, reason: "InternalError",
+		message: "Internal error occurred: " + fmt.Sprintf(format, args...)}
+}
+
+// webhookConfiguration is a MutatingWebhookConfiguration or a
+// ValidatingWebhookConfiguration, in the fields this server acts on.
+type webhookConfiguration struct {
+	Webhooks []webhook `json:"webhooks"`
+}
+
+type webhook struct {
+	Name         string `json:"name"`
+	ClientConfig struct {
+		URL      string `json:"url"`
+		CABundle []byte `json:"caBundle"` // base64 in JSON, which []byte decodes
+	} `json:"clientConfig"`
+	Rules             []webhookRule  `json:"rules"`
+	FailurePolicy     string         `json:"failurePolicy"`
+	TimeoutSeconds    *int           `json:"timeoutSeconds"`
+	NamespaceSelector *labelSelector `json:"namespaceSelector"`
+	ObjectSelector    *labelSelector `json:"objectSelector"`
+}
+
+type webhookRule struct {
+	Operations  []string `json:"operations"`
+	APIGroups   []string `json:"apiGroups"`
+	APIVersions []string `json:"apiVersions"`
+	Resources   []string `json:"resources"`
+	Scope       string   `json:"scope"`
+}
+
+type labelSelector struct {
+	MatchLabels      map[string]string `json:"matchLabels"`
+	MatchExpressions []struct {
+		Key      string   `json:"key"`
+		Operator string   `json:"operator"`
+		Values   []string `json:"values"`
+	} `json:"matchExpressions"`
+}
+
+// matches reports whether a set of labels is selected. An absent selector, and
+// an empty one, select everything.
+func (s *labelSelector) matches(labels map[string]string) bool {
+	if s == nil {
+		return true
+	}
+	for k, v := range s.MatchLabels {
+		if got, ok := labels[k]; !ok || got != v {
+			return false
+		}
+	}
+	for _, e := range s.MatchExpressions {
+		value, ok := labels[e.Key]
+		var pass bool
+		switch e.Operator {
+		case "In":
+			pass = ok && slices.Contains(e.Values, value)
+		case "NotIn":
+			pass = !ok || !slices.Contains(e.Values, value)
+		case "Exists":
+			pass = ok
+		case "DoesNotExist":
+			pass = !ok
+		}
+		if !pass {
+			return false
+		}
+	}
+	return true
+}
+
+// admitter is the admission chain for one request to one resource, or nil
+// when no webhook is configured at all — which leaves every write exactly as
+// it was before admission existed.
+//
+// The webhook configurations themselves are never sent to a webhook: one that
+// refused them could never be removed.
+func admitter(objects *store, r *http.Request, t resourceType, subresource string) admitFunc {
+	if t.group == "admissionregistration.k8s.io" {
+		return nil
+	}
+	mutating := webhooksOf(objects, "mutatingwebhookconfigurations")
+	validating := webhooksOf(objects, "validatingwebhookconfigurations")
+	if len(mutating) == 0 && len(validating) == 0 {
+		return nil
+	}
+	a := &admission{objects: objects, r: r, t: t, subresource: subresource,
+		namespace: r.PathValue("namespace"), name: r.PathValue("name")}
+	return func(obj, old object) (object, error) {
+		return a.admit(mutating, validating, obj, old)
+	}
+}
+
+// webhooksOf reads every webhook of one kind of configuration, in the order
+// they run: by configuration name, which is the order a list comes back in,
+// then as listed inside each.
+func webhooksOf(objects *store, resource string) []webhook {
+	items, _ := objects.list(resource, "")
+	var hooks []webhook
+	for _, item := range items {
+		var config webhookConfiguration
+		raw, _ := json.Marshal(item)
+		if json.Unmarshal(raw, &config) == nil {
+			hooks = append(hooks, config.Webhooks...)
+		}
+	}
+	return hooks
+}
+
+// admission is one request on its way through the chain.
+type admission struct {
+	objects         *store
+	r               *http.Request
+	t               resourceType
+	subresource     string
+	namespace, name string
+}
+
+// admit runs the chain: every mutating webhook in turn, each seeing what the
+// one before it made; then the server's own validation of the result; then
+// every validating webhook at once, all of which must allow it.
+func (a *admission) admit(mutating, validating []webhook, obj, old object) (object, error) {
+	// A create's name is in its body, not its URL.
+	if a.name == "" {
+		a.name = metaString(obj, "name")
+	}
+	op := "UPDATE"
+	switch {
+	case obj == nil:
+		op = "DELETE"
+	case old == nil:
+		op = "CREATE"
+	}
+	for _, h := range mutating {
+		if !a.matches(h, op, obj, old) {
+			continue
+		}
+		next, err := a.call(h, true, op, obj, old)
+		if err != nil {
+			return nil, err
+		}
+		obj = next
+	}
+	if obj != nil {
+		if err := a.validate(obj); err != nil {
+			return nil, err
+		}
+	}
+	// Validating webhooks cannot change anything, so nothing orders them.
+	errs := make([]error, len(validating))
+	var wg sync.WaitGroup
+	for i, h := range validating {
+		if !a.matches(h, op, obj, old) {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = a.call(h, false, op, obj, old)
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return obj, nil
+}
+
+// validate is the server's own say on an object a webhook may have changed. A
+// webhook can add and alter fields, but not make the object invalid or move it
+// somewhere else.
+func (a *admission) validate(obj object) error {
+	invalid := func(field string, value any, why string) error {
+		return &statusError{code: http.StatusUnprocessableEntity, reason: "Invalid",
+			message: fmt.Sprintf("%s %q is invalid: %s: Invalid value: %v: %s", a.t.kind, a.name, field, value, why)}
+	}
+	if got := metaString(obj, "name"); got != a.name {
+		return invalid("metadata.name", got, "the object cannot be renamed")
+	}
+	// A create's namespace is only filled in from the URL as it is stored.
+	if got := metaString(obj, "namespace"); got != "" && got != a.namespace {
+		return invalid("metadata.namespace", got, "the object cannot be moved to another namespace")
+	}
+	if obj["apiVersion"] != a.t.groupVersion() || obj["kind"] != a.t.kind {
+		return invalid("kind", obj["kind"], "the object cannot change its kind")
+	}
+	if a.t.resource == "replicationcontrollers" {
+		spec, _ := obj["spec"].(map[string]any)
+		if replicas, ok := spec["replicas"].(float64); !ok || replicas < 0 || replicas != math.Trunc(replicas) {
+			return invalid("spec.replicas", spec["replicas"], "must be a whole number, zero or more")
+		}
+	}
+	return nil
+}
+
+// matches reports whether a webhook wants to be told about this request.
+func (a *admission) matches(h webhook, op string, obj, old object) bool {
+	ruled := slices.ContainsFunc(h.Rules, func(rule webhookRule) bool {
+		scoped := rule.Scope == "" || rule.Scope == "*" || (rule.Scope == "Cluster") == a.t.clusterScoped
+		return scoped && anyOf(rule.Operations, op) && anyOf(rule.APIGroups, a.t.group) &&
+			anyOf(rule.APIVersions, cmp.Or(a.t.version, "v1")) &&
+			webhookResourceMatches(rule.Resources, a.t.resource, a.subresource)
+	})
+	if !ruled {
+		return false
+	}
+	// A delete has no new object, and an update may change the labels: the
+	// selector is satisfied by either side.
+	if !h.ObjectSelector.matches(labelsOf(obj)) && !h.ObjectSelector.matches(labelsOf(old)) {
+		return false
+	}
+	if a.namespace != "" && h.NamespaceSelector != nil {
+		ns, _ := a.objects.get("namespaces", "", a.namespace)
+		if !h.NamespaceSelector.matches(labelsOf(ns)) {
+			return false
+		}
+	}
+	return true
+}
+
+func anyOf(list []string, want string) bool {
+	return slices.Contains(list, "*") || slices.Contains(list, want)
+}
+
+// webhookResourceMatches reads a rule's resources: "*" is every resource but none of
+// their subresources, "*/*" is everything, "x/*" every subresource of x and
+// "*/y" subresource y of anything.
+func webhookResourceMatches(patterns []string, resource, subresource string) bool {
+	for _, p := range patterns {
+		res, sub, _ := strings.Cut(p, "/")
+		if res != "*" && res != resource {
+			continue
+		}
+		if sub == subresource || (sub == "*" && subresource != "") || p == "*/*" {
+			return true
+		}
+	}
+	return false
+}
+
+// call asks one webhook and reads its verdict. A webhook that cannot be
+// reached, does not answer in time, or answers something else entirely has
+// failed; failurePolicy says whether that refuses the request or is ignored.
+func (a *admission) call(h webhook, mutating bool, op string, obj, old object) (object, error) {
+	response, err := a.send(h, op, obj, old)
+	if err != nil {
+		if h.FailurePolicy == "Ignore" {
+			return obj, nil
+		}
+		return nil, internalError("failed calling webhook %q: %v", h.Name, err)
+	}
+	if !response.Allowed {
+		status := response.Status
+		message := fmt.Sprintf("admission webhook %q denied the request", h.Name)
+		switch {
+		case status.Message != "":
+			message += ": " + status.Message
+		case status.Reason != "":
+			message += ": " + status.Reason
+		default:
+			message += " without explanation"
+		}
+		return nil, &statusError{code: cmp.Or(status.Code, http.StatusForbidden), reason: status.Reason, message: message}
+	}
+	if !mutating || obj == nil || len(response.Patch) == 0 {
+		return obj, nil
+	}
+	if response.PatchType != "JSONPatch" {
+		return nil, internalError("webhook %q answered patchType %q, and JSONPatch is the only one there is", h.Name, response.PatchType)
+	}
+	var ops []patchOp
+	if err := json.Unmarshal(response.Patch, &ops); err != nil {
+		return nil, internalError("webhook %q answered a patch that is not a JSON patch: %v", h.Name, err)
+	}
+	patched, err := jsonPatch(map[string]any(clone(obj)), ops)
+	result, ok := patched.(map[string]any)
+	if err != nil || !ok {
+		return nil, internalError("the patch from webhook %q cannot be applied: %v", h.Name, err)
+	}
+	return result, nil
+}
+
+type admissionResponse struct {
+	UID     string `json:"uid"`
+	Allowed bool   `json:"allowed"`
+	Status  struct {
+		Code    int    `json:"code"`
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	} `json:"status"`
+	PatchType string `json:"patchType"`
+	Patch     []byte `json:"patch"` // base64 in JSON
+}
+
+// send is the HTTPS round trip. The webhook's certificate is checked against
+// its caBundle alone: anything able to answer on that address is not enough.
+func (a *admission) send(h webhook, op string, obj, old object) (*admissionResponse, error) {
+	if u, err := url.Parse(h.ClientConfig.URL); err != nil || u.Scheme != "https" {
+		return nil, fmt.Errorf("clientConfig.url %q is not an https URL", h.ClientConfig.URL)
+	}
+	var roots *x509.CertPool
+	if len(h.ClientConfig.CABundle) > 0 {
+		roots = x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(h.ClientConfig.CABundle) {
+			return nil, errors.New("clientConfig.caBundle holds no PEM certificate")
+		}
+	}
+	timeout := 10 * time.Second
+	if h.TimeoutSeconds != nil {
+		timeout = time.Duration(*h.TimeoutSeconds) * time.Second
+	}
+	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: timeout}
+
+	user := a.r.Context().Value(userKey{}).(userInfo)
+	who := map[string]any{"username": user.name, "groups": user.groups}
+	if user.uid != "" {
+		who["uid"] = user.uid
+	}
+	version := cmp.Or(a.t.version, "v1")
+	kind := map[string]any{"group": a.t.group, "version": version, "kind": a.t.kind}
+	resource := map[string]any{"group": a.t.group, "version": version, "resource": a.t.resource}
+	uid := newUID()
+	request := map[string]any{
+		"uid": uid, "kind": kind, "resource": resource, "requestKind": kind, "requestResource": resource,
+		"name": a.name, "namespace": a.namespace, "operation": op, "userInfo": who,
+		"object": obj, "oldObject": old, "dryRun": false,
+	}
+	if a.subresource != "" {
+		request["subResource"], request["requestSubResource"] = a.subresource, a.subresource
+	}
+	body, _ := json.Marshal(map[string]any{"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "request": request})
+
+	res, err := client.Post(h.ClientConfig.URL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("the webhook answered %d", res.StatusCode)
+	}
+	var review struct {
+		Response *admissionResponse `json:"response"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 3<<20)).Decode(&review); err != nil {
+		return nil, fmt.Errorf("the webhook's answer is not an AdmissionReview: %w", err)
+	}
+	if review.Response == nil {
+		return nil, errors.New("the webhook's AdmissionReview has no response")
+	}
+	// The uid ties the verdict to this request; one for any other request is
+	// no verdict on this one.
+	if review.Response.UID != uid {
+		return nil, fmt.Errorf("expected response.uid=%q, got %q", uid, review.Response.UID)
+	}
+	return review.Response, nil
 }
 
 // certUser is the user a verified client certificate names: the common name

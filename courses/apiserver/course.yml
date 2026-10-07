@@ -86,3 +86,6 @@ stages:
   - slug: authz-rbac
     name: May they do this
     difficulty: hard
+  - slug: admission-chain
+    name: Everyone else gets a say
+    difficulty: hard
