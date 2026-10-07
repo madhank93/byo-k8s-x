@@ -81,8 +81,9 @@ type store struct {
 const historyLimit = 1000
 
 func newStore(dir string) *store {
-	s := &store{objects: map[string]object{}, dir: dir, watchers: map[int]chan watchEvent{}}
-	s.published.Store(&s.objects)
+	empty := map[string]object{}
+	s := &store{objects: empty, dir: dir, watchers: map[int]chan watchEvent{}}
+	s.published.Store(&empty)
 	return s
 }
 

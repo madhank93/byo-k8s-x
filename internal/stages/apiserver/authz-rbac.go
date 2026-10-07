@@ -513,6 +513,26 @@ func rbacEscalation(ctx context.Context, admin, alice, bob rbacCaller) error {
 		return err
 	}
 
+	// bind on one role is the way round it for bindings.
+	if err := admin.allowed(ctx, http.MethodPost, roles, nil,
+		rbacRole("Role", "writer-binder", rbacRule([]string{"rbac.authorization.k8s.io"}, []string{"clusterroles"}, []string{"bind"}, "configmap-writer")),
+		"admin is in system:masters"); err != nil {
+		return err
+	}
+	if err := admin.allowed(ctx, http.MethodPost, bindings, nil,
+		rbacBinding("RoleBinding", "alice-binds-writer", "Role", "writer-binder", rbacSubject("User", "alice")),
+		"admin is in system:masters"); err != nil {
+		return err
+	}
+	if err := alice.allowed(ctx, http.MethodPost, bindings, nil,
+		rbacBinding("RoleBinding", "bob-writes", "ClusterRole", "configmap-writer", rbacSubject("User", "bob")),
+		editor+", and now the Role writer-binder in dev too: the verb bind on the ClusterRole configmap-writer, by name. bind is what lets a user hand out a role they do not hold themselves — the check is bind on the role the binding refers to, in the binding's namespace"); err != nil {
+		return err
+	}
+	if err := bob.allowed(ctx, http.MethodDelete, rbacDevCM+"/other", nil, nil, "alice bound the ClusterRole configmap-writer (create, update, delete on configmaps) to bob in dev"); err != nil {
+		return err
+	}
+
 	// escalate is the way round it, for whoever is trusted to grant what
 	// they do not use.
 	if err := admin.allowed(ctx, http.MethodPost, roles, nil,
