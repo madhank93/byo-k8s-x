@@ -143,7 +143,7 @@ and the assertion is which node they land on.
 
 ## Tier 2 — the API plane
 
-### `apiserver` — Build your own kube-apiserver · 30 stages
+### [x] `apiserver` — Build your own kube-apiserver · 30 stages
 
 The capstone of the control plane. Everything the other courses talk to, built
 until the real `kubectl` can drive it.

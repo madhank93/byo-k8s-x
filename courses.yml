@@ -35,7 +35,7 @@ entries:
 
   - slug: apiserver
     name: Build your own kube-apiserver
-    status: planned
+    status: shipped
     tier: the API plane
     blurb: REST over etcd, watch, server-side apply, RBAC — driven by real kubectl.
 

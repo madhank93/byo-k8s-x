@@ -41,6 +41,14 @@ jobs:
       - uses: helm/kind-action@v1
         with:
           install_only: true
+      # The apiserver course's last stage drives the learner's server with the
+      # real kubectl, so it gets the version mise.toml pins, not the runner's.
+      - name: Install the pinned kubectl
+        run: |
+          version=$(awk -F'"' '/^kubectl = /{print $2}' mise.toml)
+          curl -fsSLo "$RUNNER_TEMP/kubectl" "https://dl.k8s.io/release/v$version/bin/linux/amd64/kubectl"
+          sudo install -m 0755 "$RUNNER_TEMP/kubectl" /usr/local/bin/kubectl
+          kubectl version --client
       # Sized by the courses themselves (course.yml `workers`), so CI creates
       # the cluster exactly the way a learner does.
       - run: go run ./cmd/byok8s up
