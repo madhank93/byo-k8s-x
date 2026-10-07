@@ -92,3 +92,6 @@ stages:
   - slug: audit-log
     name: Who did what, written down
     difficulty: hard
+  - slug: kubectl-drives-it
+    name: The client you did not write
+    difficulty: hard
