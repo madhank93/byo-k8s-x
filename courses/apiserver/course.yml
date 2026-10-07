@@ -80,3 +80,6 @@ stages:
   - slug: authn-token
     name: Who is asking
     difficulty: medium
+  - slug: authz-rbac
+    name: May they do this
+    difficulty: hard

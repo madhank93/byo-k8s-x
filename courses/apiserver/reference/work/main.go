@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -64,6 +65,10 @@ type store struct {
 	nextID   int
 	history  []watchEvent // recent changes, for a watch that resumes
 	floor    int64        // the oldest version a watch can still resume from
+	// published is objects as of the last write, readable without the lock.
+	// Every write replaces the map rather than changing it, so a published
+	// map never changes; a check made from inside a write reads it.
+	published atomic.Pointer[map[string]object]
 }
 
 // historyLimit is how far back a resuming watch can reach. It is the whole of
@@ -74,7 +79,16 @@ type store struct {
 const historyLimit = 1000
 
 func newStore(dir string) *store {
-	return &store{objects: map[string]object{}, dir: dir, watchers: map[int]chan watchEvent{}}
+	s := &store{objects: map[string]object{}, dir: dir, watchers: map[int]chan watchEvent{}}
+	s.published.Store(&s.objects)
+	return s
+}
+
+// view is the store as of the last write, without taking the lock: what the
+// authorizer reads, since it is asked from inside writes as well as before
+// them.
+func (s *store) view() map[string]object {
+	return *s.published.Load()
 }
 
 // watchEvent is one change, in the shape a watcher is told about it. The
@@ -221,6 +235,7 @@ func (s *store) load() error {
 	}
 	if snap.Objects != nil {
 		s.objects = snap.Objects
+		s.published.Store(&snap.Objects)
 	}
 	s.version = snap.Version
 	// Nothing that happened before this process started can be replayed: the
@@ -258,6 +273,7 @@ func (s *store) write(next map[string]object, version int64) error {
 		}
 	}
 	s.objects, s.version = next, version
+	s.published.Store(&next)
 	return nil
 }
 
@@ -331,9 +347,14 @@ func (s *store) list(resource, namespace string) ([]object, int64) {
 
 // locked is the scan itself, for the callers that already hold the lock.
 func (s *store) locked(resource, namespace string) []object {
+	return scan(s.objects, resource, namespace)
+}
+
+// scan is every object of a resource in a namespace, in key order.
+func scan(objects map[string]object, resource, namespace string) []object {
 	prefix := listPrefix(resource, namespace)
 	var keys []string
-	for key := range s.objects {
+	for key := range objects {
 		if strings.HasPrefix(key, prefix) {
 			keys = append(keys, key)
 		}
@@ -345,7 +366,7 @@ func (s *store) locked(resource, namespace string) []object {
 	// null, because a client reads the field before it knows it is empty.
 	items := []object{}
 	for _, key := range keys {
-		items = append(items, s.objects[key])
+		items = append(items, objects[key])
 	}
 	return items
 }
@@ -548,6 +569,7 @@ func run() error {
 	addr := flag.String("addr", "127.0.0.1:8080", "the address to serve the API on")
 	data := flag.String("data", "", "a directory to keep the objects in; empty keeps them in memory only")
 	tokenFile := flag.String("token-auth-file", "", "a CSV of token,user,uid[,groups] to authenticate bearer tokens against; empty turns authentication off")
+	authzMode := flag.String("authorization-mode", "AlwaysAllow", "AlwaysAllow, or RBAC to decide each request from the roles and bindings stored in the server")
 	flag.Parse()
 
 	var tokens map[string]userInfo
@@ -564,6 +586,18 @@ func run() error {
 	}
 	if err := objects.bootstrap(); err != nil {
 		return err
+	}
+	// nil is AlwaysAllow: every request that got past authentication goes on.
+	var policy *rbac
+	switch *authzMode {
+	case "AlwaysAllow":
+	case "RBAC":
+		policy = &rbac{objects: objects}
+		if err := policy.bootstrap(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("-authorization-mode %q: want AlwaysAllow or RBAC", *authzMode)
 	}
 
 	mux := http.NewServeMux()
@@ -597,7 +631,17 @@ func run() error {
 		"kind":         "SelfSubjectReview",
 		"verbs":        []string{"create"},
 	})
+	groups.add("authorization.k8s.io/v1", map[string]any{
+		"name":         "selfsubjectaccessreviews",
+		"singularName": "selfsubjectaccessreview",
+		"namespaced":   false,
+		"kind":         "SelfSubjectAccessReview",
+		"verbs":        []string{"create"},
+	})
 	for _, t := range namedResources {
+		if policy != nil && t.group == rbacGroup {
+			t.check = policy.escalation(t)
+		}
 		serveResource(mux, objects, t)
 		groups.add(t.groupVersion(), t.discovery())
 	}
@@ -616,6 +660,32 @@ func run() error {
 			"metadata":   map[string]any{"creationTimestamp": nil},
 			"status":     map[string]any{"userInfo": info},
 		})
+	})
+	// May the caller do this: what kubectl auth can-i asks. The answer is the
+	// same decision the server would make on the real request.
+	mux.HandleFunc("POST /apis/authorization.k8s.io/v1/selfsubjectaccessreviews", func(w http.ResponseWriter, r *http.Request) {
+		var review map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&review); err != nil || review == nil {
+			writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not a JSON object")
+			return
+		}
+		attrs, err := reviewAttributes(review, r.Context().Value(userKey{}).(userInfo))
+		if err != nil {
+			writeStatus(w, http.StatusUnprocessableEntity, "Invalid", err.Error())
+			return
+		}
+		status := map[string]any{"allowed": true}
+		if policy != nil {
+			allowed, reason := policy.decide(attrs)
+			status["allowed"] = allowed
+			if reason != "" {
+				status["reason"] = reason
+			}
+		}
+		review["apiVersion"], review["kind"] = "authorization.k8s.io/v1", "SelfSubjectAccessReview"
+		review["metadata"] = map[string]any{"creationTimestamp": nil}
+		review["status"] = status
+		writeJSON(w, http.StatusCreated, review)
 	})
 	mux.HandleFunc("GET /api/v1", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -760,7 +830,7 @@ func run() error {
 		writeStatus(w, http.StatusNotFound, "NotFound", "the server could not find the requested resource: "+r.URL.Path)
 	})
 
-	srv := &http.Server{Addr: *addr, Handler: authenticate(tokens, mux)}
+	srv := &http.Server{Addr: *addr, Handler: authenticate(tokens, authorize(policy, mux))}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	go func() {
@@ -790,6 +860,18 @@ type resourceType struct {
 	clusterScoped  bool
 	defaults       func(obj object)
 	hasStatus      bool
+	// check refuses a write the caller may make but whose content they may
+	// not, which is a question about the body rather than the URL.
+	check func(r *http.Request, namespace string, obj object) error
+}
+
+// admit runs this type's content check, if it has one, on an object about to
+// be stored.
+func (t resourceType) admit(r *http.Request, namespace string, obj object) error {
+	if t.check == nil {
+		return nil
+	}
+	return t.check(r, namespace, obj)
 }
 
 // groupVersion is what an object of this type carries as its apiVersion.
@@ -960,6 +1042,10 @@ func serveResource(mux *http.ServeMux, objects *store, t resourceType) {
 		if t.defaults != nil {
 			t.defaults(obj)
 		}
+		if err := t.admit(r, namespace, obj); err != nil {
+			writeModifyError(w, err, t.resource, name)
+			return
+		}
 		stored, err := objects.create(t.resource, namespace, name, obj)
 		if errors.Is(err, errAlreadyExists) {
 			writeStatus(w, http.StatusConflict, "AlreadyExists",
@@ -1013,6 +1099,9 @@ func serveResource(mux *http.ServeMux, objects *store, t resourceType) {
 
 		stored, err := objects.modify(t.resource, namespace, name, func(old object) (object, error) {
 			t.keepStatus(old, obj)
+			if err := t.admit(r, namespace, obj); err != nil {
+				return nil, err
+			}
 			return trackUpdate(old, obj, updater(r)), nil
 		})
 		if err != nil {
@@ -1044,6 +1133,9 @@ func serveResource(mux *http.ServeMux, objects *store, t resourceType) {
 			}
 			obj["apiVersion"], obj["kind"] = t.groupVersion(), t.kind
 			t.keepStatus(old, obj)
+			if err := t.admit(r, namespace, obj); err != nil {
+				return nil, err
+			}
 			return trackUpdate(old, obj, updater(r)), nil
 		})
 		if err != nil {
@@ -1804,7 +1896,10 @@ func decodeObject(w http.ResponseWriter, r *http.Request, namespace, apiVersion,
 // writeModifyError answers a write to an existing object that did not happen.
 func writeModifyError(w http.ResponseWriter, err error, resource, name string) {
 	var conflicts *applyConflict
+	var forbidden *forbiddenError
 	switch {
+	case errors.As(err, &forbidden):
+		writeStatus(w, http.StatusForbidden, "Forbidden", forbidden.message)
 	case errors.As(err, &conflicts):
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"kind": "Status", "apiVersion": "v1", "metadata": map[string]any{},
@@ -1990,6 +2085,9 @@ func serverSideApply(w http.ResponseWriter, r *http.Request, objects *store, t r
 			entries = append(entries, entry)
 		}
 		setManagedEntries(obj, entries)
+		if err := t.admit(r, namespace, obj); err != nil {
+			return nil, err
+		}
 		return obj, nil
 	})
 	if err != nil {
@@ -2854,4 +2952,448 @@ func authenticate(tokens map[string]userInfo, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
 	})
+}
+
+const rbacGroup = "rbac.authorization.k8s.io"
+
+// attributes are everything authorization is allowed to know about a request:
+// who, which verb, and what it is aimed at. The body is not among them, which
+// is why what a role may contain is checked separately, by escalation.
+type attributes struct {
+	user     userInfo
+	verb     string
+	resource bool // false for a path that names no object, like /apis
+
+	group, kind, subresource, namespace, name string
+	path                                      string
+}
+
+// requestAttributes reads a request's attributes off its method and URL.
+//
+// /api/v1/<rest> is the core group and /apis/<group>/<version>/<rest> a named
+// one; anything shorter or elsewhere is a non-resource path. A namespace's own
+// URL puts the namespace in both places, which is what lets a RoleBinding in a
+// namespace grant reading that namespace.
+func requestAttributes(r *http.Request, user userInfo) attributes {
+	a := attributes{user: user, path: r.URL.Path, verb: strings.ToLower(r.Method)}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	switch {
+	case len(parts) >= 3 && parts[0] == "api":
+		parts = parts[2:]
+	case len(parts) >= 4 && parts[0] == "apis":
+		a.group, parts = parts[1], parts[3:]
+	default:
+		return a
+	}
+	a.resource = true
+	if parts[0] == "namespaces" && len(parts) > 1 {
+		a.namespace = parts[1]
+		if len(parts) > 2 && parts[2] != "status" {
+			parts = parts[2:]
+		}
+	}
+	a.kind = parts[0]
+	if len(parts) > 1 {
+		a.name = parts[1]
+	}
+	if len(parts) > 2 {
+		a.subresource = parts[2]
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		// A watch and a list are one URL and two permissions: a role that may
+		// read a collection once may not necessarily follow it for ever.
+		switch {
+		case watching(r):
+			a.verb = "watch"
+		case a.name == "":
+			a.verb = "list"
+		default:
+			a.verb = "get"
+		}
+	case http.MethodPost:
+		a.verb = "create"
+	case http.MethodPut:
+		a.verb = "update"
+	case http.MethodDelete:
+		a.verb = "delete"
+		if a.name == "" {
+			a.verb = "deletecollection"
+		}
+	}
+	return a
+}
+
+// forbidden is the message a refused request is answered with, in the words
+// the real server uses, which is what people paste into searches.
+func (a attributes) forbidden() string {
+	who := fmt.Sprintf("User %q", a.user.name)
+	if !a.resource {
+		return fmt.Sprintf("forbidden: %s cannot %s path %q", who, a.verb, a.path)
+	}
+	resource := a.kind
+	if a.subresource != "" {
+		resource += "/" + a.subresource
+	}
+	msg := fmt.Sprintf("%s cannot %s resource %q in API group %q", who, a.verb, resource, a.group)
+	if a.namespace != "" {
+		msg += fmt.Sprintf(" in the namespace %q", a.namespace)
+	} else {
+		msg += " at the cluster scope"
+	}
+	qualified := a.kind
+	if a.group != "" {
+		qualified += "." + a.group
+	}
+	if a.name != "" {
+		return fmt.Sprintf("%s %q is forbidden: %s", qualified, a.name, msg)
+	}
+	return qualified + " is forbidden: " + msg
+}
+
+// policyRule is one rule of a Role or ClusterRole. Every list is an OR, the
+// lists are ANDed together, and "*" matches anything in its list.
+type policyRule struct {
+	Verbs           []string `json:"verbs"`
+	APIGroups       []string `json:"apiGroups"`
+	Resources       []string `json:"resources"`
+	ResourceNames   []string `json:"resourceNames"`
+	NonResourceURLs []string `json:"nonResourceURLs"`
+
+	grantedBy string // the binding and role this rule came through, for a reason
+}
+
+// binding is the part of a RoleBinding or ClusterRoleBinding that decides
+// anything: who, and which role.
+type binding struct {
+	RoleRef struct {
+		Kind string `json:"kind"`
+		Name string `json:"name"`
+	} `json:"roleRef"`
+	Subjects []struct {
+		Kind string `json:"kind"`
+		Name string `json:"name"`
+	} `json:"subjects"`
+}
+
+// subject is who in a binding the user is, or "" when it does not name them.
+// ServiceAccount subjects are not supported: this server has no service
+// accounts to authenticate.
+func (b binding) subject(user userInfo) string {
+	for _, s := range b.Subjects {
+		switch {
+		case s.Kind == "User" && s.Name == user.name:
+			return fmt.Sprintf("User %q", s.Name)
+		case s.Kind == "Group" && slices.Contains(user.groups, s.Name):
+			return fmt.Sprintf("Group %q", s.Name)
+		}
+	}
+	return ""
+}
+
+// rbac decides requests from the Roles, ClusterRoles and bindings in the
+// store, read again on every request: a binding takes effect, or stops, on
+// the next request after the write, with nothing cached to go stale. It reads
+// the store's view, because a role is checked from inside the write storing it.
+type rbac struct {
+	objects *store
+}
+
+// mastersGroup is allowed everything, bindings or none. It is how the first
+// administrator exists before there is a single role to bind them to.
+const mastersGroup = "system:masters"
+
+// decide answers whether the request may go on, and why when it may.
+func (p *rbac) decide(a attributes) (bool, string) {
+	if slices.Contains(a.user.groups, mastersGroup) {
+		return true, ""
+	}
+	for _, rule := range p.rulesFor(a.user, a.namespace) {
+		if rule.allows(a) {
+			return true, "RBAC: allowed by " + rule.grantedBy
+		}
+	}
+	return false, ""
+}
+
+// rulesFor is every rule granted to user that applies in namespace: those
+// bound cluster-wide, and those bound in that namespace. An empty namespace
+// is the cluster scope, where only cluster-wide bindings count.
+func (p *rbac) rulesFor(user userInfo, namespace string) []policyRule {
+	view := p.objects.view()
+	var rules []policyRule
+	grant := func(kind string, obj object, roleResource, roleNamespace string) {
+		b := as[binding](obj)
+		via := b.subject(user)
+		if via == "" {
+			return
+		}
+		role, ok := view[registryKey(roleResource, roleNamespace, b.RoleRef.Name)]
+		if !ok {
+			return
+		}
+		for _, rule := range roleRules(role) {
+			rule.grantedBy = fmt.Sprintf("%s %q of %s %q to %s", kind, metaString(obj, "name"), b.RoleRef.Kind, b.RoleRef.Name, via)
+			rules = append(rules, rule)
+		}
+	}
+	for _, obj := range scan(view, "clusterrolebindings", "") {
+		// A ClusterRoleBinding can only grant a ClusterRole: a Role belongs
+		// to one namespace and has nothing to say about the others.
+		if as[binding](obj).RoleRef.Kind == "ClusterRole" {
+			grant("ClusterRoleBinding", obj, "clusterroles", "")
+		}
+	}
+	if namespace == "" {
+		return rules
+	}
+	for _, obj := range scan(view, "rolebindings", namespace) {
+		// A RoleBinding to a ClusterRole grants that role's rules here and
+		// nowhere else: one definition, reused namespace by namespace.
+		switch as[binding](obj).RoleRef.Kind {
+		case "Role":
+			grant("RoleBinding", obj, "roles", namespace)
+		case "ClusterRole":
+			grant("RoleBinding", obj, "clusterroles", "")
+		}
+	}
+	return rules
+}
+
+// as reads a decoded JSON value into a typed shape, leaving out whatever does
+// not fit it.
+func as[T any](v any) T {
+	raw, _ := json.Marshal(v)
+	var out T
+	_ = json.Unmarshal(raw, &out)
+	return out
+}
+
+// roleRules reads the rules out of a stored Role or ClusterRole.
+func roleRules(role object) []policyRule {
+	return as[[]policyRule](role["rules"])
+}
+
+// matches is a rule's list allowing a value: naming it, or "*".
+func matches(list []string, value string) bool {
+	return slices.Contains(list, value) || slices.Contains(list, "*")
+}
+
+// urlMatches is a nonResourceURLs list allowing a path, where an entry ending
+// in * is a prefix.
+func urlMatches(urls []string, path string) bool {
+	for _, u := range urls {
+		if u == path || (strings.HasSuffix(u, "*") && strings.HasPrefix(path, strings.TrimSuffix(u, "*"))) {
+			return true
+		}
+	}
+	return false
+}
+
+// resourceMatches is a rule's resources allowing one, where a subresource is
+// its own entry: "replicationcontrollers" does not grant
+// "replicationcontrollers/scale", and "*/scale" grants every scale.
+func resourceMatches(resources []string, resource, subresource string) bool {
+	combined := resource
+	if subresource != "" {
+		combined += "/" + subresource
+	}
+	for _, r := range resources {
+		if r == "*" || r == combined || (subresource != "" && r == "*/"+subresource) {
+			return true
+		}
+	}
+	return false
+}
+
+func (rule policyRule) allows(a attributes) bool {
+	if !matches(rule.Verbs, a.verb) {
+		return false
+	}
+	if !a.resource {
+		return urlMatches(rule.NonResourceURLs, a.path)
+	}
+	if !matches(rule.APIGroups, a.group) || !resourceMatches(rule.Resources, a.kind, a.subresource) {
+		return false
+	}
+	// Names narrow a rule to particular objects, so a request that names no
+	// object — a list, a watch, a create — is never covered by one.
+	return len(rule.ResourceNames) == 0 || (a.name != "" && slices.Contains(rule.ResourceNames, a.name))
+}
+
+// authorize refuses every request the policy does not allow, after
+// authentication has said who it is from and before any handler sees it.
+// A nil policy is AlwaysAllow.
+func authorize(policy *rbac, next http.Handler) http.Handler {
+	if policy == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz", "/livez", "/readyz":
+		default:
+			a := requestAttributes(r, r.Context().Value(userKey{}).(userInfo))
+			if allowed, _ := policy.decide(a); !allowed {
+				writeStatus(w, http.StatusForbidden, "Forbidden", a.forbidden())
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// forbiddenError is a write refused for what it contains.
+type forbiddenError struct{ message string }
+
+func (e *forbiddenError) Error() string { return e.message }
+
+// escalation is the check on writing a role or a binding: nobody may hand out
+// a permission they do not hold. Without it, permission to create Roles is
+// permission to do anything, one Role and one RoleBinding away.
+//
+// The escalate verb on roles, and bind on the role a binding refers to, are
+// the two ways round it, for whoever is trusted to grant what they do not use.
+func (p *rbac) escalation(t resourceType) func(r *http.Request, namespace string, obj object) error {
+	return func(r *http.Request, namespace string, obj object) error {
+		user := r.Context().Value(userKey{}).(userInfo)
+		if slices.Contains(user.groups, mastersGroup) {
+			return nil
+		}
+		holds := func(verb, resource, name string) bool {
+			allowed, _ := p.decide(attributes{user: user, verb: verb, resource: true, group: rbacGroup, kind: resource, namespace: namespace, name: name})
+			return allowed
+		}
+		var granting []policyRule
+		switch t.resource {
+		case "roles", "clusterroles":
+			if holds("escalate", t.resource, metaString(obj, "name")) {
+				return nil
+			}
+			granting = roleRules(obj)
+		default:
+			ref := as[binding](obj).RoleRef
+			roleResource, roleNamespace := "clusterroles", ""
+			if ref.Kind == "Role" {
+				roleResource, roleNamespace = "roles", namespace
+			}
+			if holds("bind", roleResource, ref.Name) {
+				return nil
+			}
+			role, ok := p.objects.view()[registryKey(roleResource, roleNamespace, ref.Name)]
+			if !ok {
+				return &forbiddenError{fmt.Sprintf("%s.%s %q is forbidden: %s %q not found, and binding a role needs either every permission in it or the bind verb on it",
+					t.resource, rbacGroup, metaString(obj, "name"), roleResource, ref.Name)}
+			}
+			granting = roleRules(role)
+		}
+		missing := notHeld(granting, p.rulesFor(user, namespace))
+		if len(missing) == 0 {
+			return nil
+		}
+		return &forbiddenError{fmt.Sprintf("%s.%s %q is forbidden: user %q (groups=%q) is attempting to grant RBAC permissions not currently held:\n%s",
+			t.resource, rbacGroup, metaString(obj, "name"), user.name, user.groups, strings.Join(missing, "\n"))}
+	}
+}
+
+// notHeld breaks each wanted rule into single permissions — one verb on one
+// resource in one group, or on one path — and returns those none of the held
+// rules covers. A wildcard wanted is only covered by the same wildcard held.
+func notHeld(want, held []policyRule) []string {
+	var missing []string
+	covered := func(test func(policyRule) bool) bool {
+		return slices.ContainsFunc(held, test)
+	}
+	for _, rule := range want {
+		for _, verb := range rule.Verbs {
+			for _, url := range rule.NonResourceURLs {
+				if !covered(func(h policyRule) bool { return matches(h.Verbs, verb) && urlMatches(h.NonResourceURLs, url) }) {
+					missing = append(missing, fmt.Sprintf("{NonResourceURLs:[%q], Verbs:[%q]}", url, verb))
+				}
+			}
+			for _, group := range rule.APIGroups {
+				for _, resource := range rule.Resources {
+					names := rule.ResourceNames
+					if len(names) == 0 {
+						names = []string{""}
+					}
+					for _, name := range names {
+						kind, sub, _ := strings.Cut(resource, "/")
+						if !covered(func(h policyRule) bool {
+							return matches(h.Verbs, verb) && matches(h.APIGroups, group) &&
+								(slices.Contains(h.Resources, resource) || resourceMatches(h.Resources, kind, sub)) &&
+								(len(h.ResourceNames) == 0 || (name != "" && slices.Contains(h.ResourceNames, name)))
+						}) {
+							missing = append(missing, fmt.Sprintf("{APIGroups:[%q], Resources:[%q], ResourceNames:[%q], Verbs:[%q]}", group, resource, name, verb))
+						}
+					}
+				}
+			}
+		}
+	}
+	return missing
+}
+
+// reviewAttributes reads the request a SelfSubjectAccessReview asks about.
+// The user is always the caller: a self review cannot ask about anyone else.
+func reviewAttributes(review map[string]any, user userInfo) (attributes, error) {
+	spec, _ := review["spec"].(map[string]any)
+	field := func(m map[string]any, key string) string {
+		s, _ := m[key].(string)
+		return s
+	}
+	if ra, ok := spec["resourceAttributes"].(map[string]any); ok {
+		return attributes{
+			user: user, resource: true, verb: field(ra, "verb"),
+			group: field(ra, "group"), kind: field(ra, "resource"), subresource: field(ra, "subresource"),
+			namespace: field(ra, "namespace"), name: field(ra, "name"),
+		}, nil
+	}
+	if nra, ok := spec["nonResourceAttributes"].(map[string]any); ok {
+		return attributes{user: user, verb: field(nra, "verb"), path: field(nra, "path")}, nil
+	}
+	return attributes{}, errors.New("spec.resourceAttributes or spec.nonResourceAttributes is required: a review asks about one request")
+}
+
+// bootstrap creates the roles a cluster cannot work without, when they are
+// missing. Without them a signed-in user with no bindings cannot even run
+// discovery, and so cannot find out they are allowed nothing.
+//
+//   - system:discovery: GET on the discovery, OpenAPI, version and health paths
+//   - system:basic-user: creating self reviews, so anyone can ask who they are
+//     and what they may do
+//
+// both bound to system:authenticated.
+func (p *rbac) bootstrap() error {
+	labels := map[string]any{"kubernetes.io/bootstrapping": "rbac-defaults"}
+	roles := map[string][]any{
+		"system:discovery": {map[string]any{
+			"verbs": []any{"get"},
+			"nonResourceURLs": []any{"/api", "/api/*", "/apis", "/apis/*", "/healthz", "/livez",
+				"/openapi", "/openapi/*", "/readyz", "/version", "/version/"},
+		}},
+		"system:basic-user": {
+			map[string]any{"verbs": []any{"create"}, "apiGroups": []any{"authorization.k8s.io"}, "resources": []any{"selfsubjectaccessreviews"}},
+			map[string]any{"verbs": []any{"create"}, "apiGroups": []any{"authentication.k8s.io"}, "resources": []any{"selfsubjectreviews"}},
+		},
+	}
+	for _, name := range slices.Sorted(maps.Keys(roles)) {
+		meta := map[string]any{"name": name, "labels": clone(labels)}
+		writes := []struct {
+			resource string
+			obj      object
+		}{
+			{"clusterroles", object{"apiVersion": rbacGroup + "/v1", "kind": "ClusterRole", "metadata": meta, "rules": roles[name]}},
+			{"clusterrolebindings", object{
+				"apiVersion": rbacGroup + "/v1", "kind": "ClusterRoleBinding", "metadata": clone(meta),
+				"roleRef":  map[string]any{"apiGroup": rbacGroup, "kind": "ClusterRole", "name": name},
+				"subjects": []any{map[string]any{"apiGroup": rbacGroup, "kind": "Group", "name": "system:authenticated"}},
+			}},
+		}
+		for _, write := range writes {
+			if _, err := p.objects.create(write.resource, "", name, write.obj); err != nil && !errors.Is(err, errAlreadyExists) {
+				return fmt.Errorf("create the %s %s: %w", write.resource, name, err)
+			}
+		}
+	}
+	return nil
 }
