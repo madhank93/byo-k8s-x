@@ -32,7 +32,8 @@ score = ((allocatable - requested) / allocatable) averaged over cpu and memory
 ```
 
 `requested` is what the pods already on that node asked for, plus what this pod
-asks for. Not usage — requests. A node running an idle pod that reserved 8 CPUs
+asks for — skipping finished pods, exactly as the fit check in stage 4 does, or
+the score and the filter disagree about the same node. Not usage — requests. A node running an idle pod that reserved 8 CPUs
 is 8 CPUs full, however little it is actually doing, because that is the promise
 the cluster made.
 

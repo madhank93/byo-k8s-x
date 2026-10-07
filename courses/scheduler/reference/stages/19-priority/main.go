@@ -75,11 +75,12 @@ func leastAllocated(pod *corev1.Pod, node *corev1.Node, placed []*corev1.Pod) in
 	return total / counted
 }
 
-// usedOn is what the pods already on a node have asked of it.
+// usedOn is what the pods already on a node have asked of it. A finished pod
+// holds nothing, here as when deciding what fits.
 func usedOn(node *corev1.Node, placed []*corev1.Pod) corev1.ResourceList {
 	used := corev1.ResourceList{}
 	for _, p := range placed {
-		if p.Spec.NodeName != node.Name {
+		if p.Spec.NodeName != node.Name || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		for name, q := range requests(p) {
