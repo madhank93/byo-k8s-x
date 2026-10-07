@@ -83,3 +83,6 @@ stages:
   - slug: authn-cert
     name: The certificate is the name
     difficulty: hard
+  - slug: admission-chain
+    name: Everyone else gets a say
+    difficulty: hard
