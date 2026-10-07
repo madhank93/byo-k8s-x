@@ -321,6 +321,8 @@ func auditWatch(ctx context.Context, srv *server, log string) error {
 
 // auditConcurrent checks events from requests running at once come out as
 // whole lines: a log in which two events are spliced together loses both.
+// Half the events are larger than a bufio.Writer's buffer and half fit in
+// it, so an unlocked writer tears lines whether or not it buffers.
 func auditConcurrent(ctx context.Context, srv *server, log string) error {
 	const workers, each = 32, 10
 	filler := strings.Repeat("abcdefghijklmnopqrstuvwxyz0123456789", 400)
@@ -335,8 +337,12 @@ func auditConcurrent(ctx context.Context, srv *server, log string) error {
 		go func() {
 			defer wg.Done()
 			for i := range each {
+				blob := filler
+				if w%2 == 1 {
+					blob = "small"
+				}
 				cm := map[string]any{"apiVersion": "v1", "kind": "ConfigMap",
-					"metadata": map[string]any{"name": fmt.Sprintf("load-%d-%d", w, i)}, "data": map[string]any{"blob": filler}}
+					"metadata": map[string]any{"name": fmt.Sprintf("load-%d-%d", w, i)}, "data": map[string]any{"blob": blob}}
 				call, err := auditDo(ctx, srv, http.MethodPost, "/api/v1/namespaces/team-b/configmaps", auditAlice, "", cm, http.StatusCreated)
 				mu.Lock()
 				if err != nil && fail == nil {
@@ -353,7 +359,7 @@ func auditConcurrent(ctx context.Context, srv *server, log string) error {
 	}
 	events, err := auditWait(ctx, log, calls, "ResponseComplete")
 	if err != nil {
-		return fmt.Errorf("%w\n\nthese were %d large creates sent %d at a time: an event has to reach the file as one write of one whole line, made while holding a lock, or two requests finishing together splice their events into lines that parse as neither", err, len(calls), workers)
+		return fmt.Errorf("%w\n\nthese were %d creates, large and small, sent %d at a time: an event has to reach the file as one write of one whole line, made while holding a lock, or two requests finishing together splice their events into lines that parse as neither", err, len(calls), workers)
 	}
 	want := auditWant{level: "RequestResponse", verb: "create", user: "alice", resource: "configmaps", namespace: "team-b", requestObject: true, responseObject: true}
 	for _, c := range calls {

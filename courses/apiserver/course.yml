@@ -83,3 +83,6 @@ stages:
   - slug: authn-cert
     name: The certificate is the name
     difficulty: hard
+  - slug: audit-log
+    name: Who did what, written down
+    difficulty: hard
