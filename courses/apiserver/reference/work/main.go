@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -733,7 +734,8 @@ func run() error {
 	mux.HandleFunc("GET /api/v1/namespaces", listHandler(objects, "namespaces", "NamespaceList"))
 
 	getNamespace := func(w http.ResponseWriter, r *http.Request) {
-		if !freshEnough(w, r, objects) {
+		table, ok := negotiate(w, r)
+		if !ok || !freshEnough(w, r, objects) {
 			return
 		}
 		name := r.PathValue("name")
@@ -742,7 +744,7 @@ func run() error {
 			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("namespaces %q not found", name))
 			return
 		}
-		writeJSON(w, http.StatusOK, obj)
+		writeRead(w, table, "namespaces", obj)
 	}
 	mux.HandleFunc("GET /api/v1/namespaces/{name}", getNamespace)
 
@@ -892,7 +894,8 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 	mux.HandleFunc("GET /api/v1/namespaces/{namespace}/"+t.resource, listHandler(objects, t.resource, t.kind+"List"))
 
 	mux.HandleFunc("GET /api/v1/namespaces/{namespace}/"+t.resource+"/{name}", func(w http.ResponseWriter, r *http.Request) {
-		if !freshEnough(w, r, objects) {
+		table, ok := negotiate(w, r)
+		if !ok || !freshEnough(w, r, objects) {
 			return
 		}
 		name := r.PathValue("name")
@@ -903,7 +906,7 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("%s %q not found", t.resource, name))
 			return
 		}
-		writeJSON(w, http.StatusOK, obj)
+		writeRead(w, table, t.resource, obj)
 	})
 
 	mux.HandleFunc("PUT /api/v1/namespaces/{namespace}/"+t.resource+"/{name}", func(w http.ResponseWriter, r *http.Request) {
@@ -940,7 +943,18 @@ func serveNamespaced(mux *http.ServeMux, objects *store, t resourceType) {
 	// applied to what is stored when the write happens.
 	mux.HandleFunc("PATCH /api/v1/namespaces/{namespace}/"+t.resource+"/{name}", func(w http.ResponseWriter, r *http.Request) {
 		namespace, name := r.PathValue("namespace"), r.PathValue("name")
-		if mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mediaType == "application/apply-patch+yaml" {
+		mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		// A JSON patch is a list of operations rather than the shape of the
+		// object, so it has no field names to check.
+		if mediaType != "application/json-patch+json" {
+			raw, err := io.ReadAll(r.Body)
+			var body any
+			if err == nil && json.Unmarshal(raw, &body) == nil && !checkFields(w, r, body, t.kind) {
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+		}
+		if mediaType == "application/apply-patch+yaml" {
 			serverSideApply(w, r, objects, t, namespace, name)
 			return
 		}
@@ -1129,7 +1143,8 @@ func scaleOf(rc object) object {
 // namespace". The difference between the two URLs is the path, and nothing else.
 func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !freshEnough(w, r, objects) {
+		table, ok := negotiate(w, r)
+		if !ok || !freshEnough(w, r, objects) {
 			return
 		}
 		selected, err := parseSelectors(r)
@@ -1145,7 +1160,7 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 		// it is the same URL with a flag on it — same resource, same
 		// namespace, same selectors, a different shape of answer.
 		if watching(r) {
-			streamWatch(w, r, objects, resource, kind, selected)
+			streamWatch(w, r, objects, resource, kind, selected, table)
 			return
 		}
 
@@ -1205,6 +1220,10 @@ func listHandler(objects *store, resource, kind string) http.HandlerFunc {
 			meta["remainingItemCount"] = len(items) - limit
 			items = items[:limit]
 		}
+		if table {
+			writeJSON(w, http.StatusOK, tableOf(resource, items, meta))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"kind":       kind,
 			"apiVersion": "v1",
@@ -1232,7 +1251,7 @@ func watching(r *http.Request) bool {
 // controller, the scheduler, the kubelet and kube-proxy are all a cache filled
 // from one of these and kept in step by it — nothing polls, and that is the
 // only reason a cluster of any size works at all.
-func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resource, kind string, selected func(object) bool) {
+func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resource, kind string, selected func(object) bool, table bool) {
 	namespace := r.PathValue("namespace")
 	// The version the client says it already has. Absent and 0 both mean "I
 	// have nothing" — 0 is not version zero, it is "whatever you have
@@ -1274,7 +1293,13 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, resourc
 	// still an open watch.
 	flusher.Flush()
 	send := func(eventType string, obj object) bool {
-		raw, err := json.Marshal(map[string]any{"type": eventType, "object": obj})
+		var body any = obj
+		if table && eventType != "BOOKMARK" {
+			// A client that listed as a Table watches as one: each event
+			// carries a one-row Table, so it prints as a line like the rest.
+			body = tableOf(resource, []object{obj}, map[string]any{"resourceVersion": metaString(obj, "resourceVersion")})
+		}
+		raw, err := json.Marshal(map[string]any{"type": eventType, "object": body})
 		if err != nil {
 			return false
 		}
@@ -1683,8 +1708,29 @@ func freshEnough(w http.ResponseWriter, r *http.Request, s *store) bool {
 // namespace is asking to write somewhere nobody checked.
 func decodeObject(w http.ResponseWriter, r *http.Request, namespace, kind string) (object, bool) {
 	var obj object
-	if err := json.NewDecoder(r.Body).Decode(&obj); err != nil {
-		writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not valid JSON: "+err.Error())
+	switch mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mediaType {
+	case protobufType:
+		// What kubectl create sends: the typed clients for built-in kinds
+		// write protobuf, and fall back to nothing if the server cannot read it.
+		raw, err := io.ReadAll(r.Body)
+		if err == nil {
+			obj, err = decodeProtobuf(raw, kind)
+		}
+		if err != nil {
+			writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not a protobuf "+kind+": "+err.Error())
+			return nil, false
+		}
+	case "", "application/json":
+		if err := json.NewDecoder(r.Body).Decode(&obj); err != nil {
+			writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not valid JSON: "+err.Error())
+			return nil, false
+		}
+	default:
+		writeStatus(w, http.StatusUnsupportedMediaType, "UnsupportedMediaType",
+			fmt.Sprintf("the body of the request was in an unknown format %q - accepted media types include: application/json, %s", mediaType, protobufType))
+		return nil, false
+	}
+	if !checkFields(w, r, map[string]any(obj), kind) {
 		return nil, false
 	}
 	if got := metaString(obj, "namespace"); got != "" && got != namespace {
@@ -2375,6 +2421,9 @@ func putNamespace(objects *store, statusOnly bool) http.HandlerFunc {
 			writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not a JSON object")
 			return
 		}
+		if !checkFields(w, r, map[string]any(obj), "Namespace") {
+			return
+		}
 		if got := metaString(obj, "name"); got != "" && got != name {
 			writeStatus(w, http.StatusBadRequest, "BadRequest",
 				fmt.Sprintf("the name of the object (%q) does not match the name on the URL (%q)", got, name))
@@ -2602,17 +2651,19 @@ func openAPIDocument() map[string]any {
 		return map[string]any{"$ref": "#/components/schemas/" + name}
 	}
 	const meta = "io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"
-	kind := func(k string, props map[string]any) map[string]any {
+	// The description is what kubectl explain prints under the kind's name.
+	kind := func(k, description string, props map[string]any) map[string]any {
 		props["apiVersion"], props["kind"], props["metadata"] = str, str, ref(meta)
 		schema := object(props)
+		schema["description"] = description
 		schema["x-kubernetes-group-version-kind"] = []any{map[string]any{"group": "", "version": "v1", "kind": k}}
 		return schema
 	}
 
 	schemas := map[string]any{
 		meta: object(map[string]any{
-			"name": str, "namespace": str, "uid": str, "resourceVersion": str, "creationTimestamp": str,
-			"labels": strMap, "annotations": strMap,
+			"name": str, "generateName": str, "namespace": str, "uid": str, "resourceVersion": str, "creationTimestamp": str,
+			"labels": strMap, "annotations": strMap, "generation": map[string]any{"type": "integer", "format": "int64"},
 			"finalizers": map[string]any{
 				"type": "array", "items": str,
 				"x-kubernetes-patch-strategy": "merge",
@@ -2627,46 +2678,69 @@ func openAPIDocument() map[string]any {
 			},
 			"managedFields": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 		}),
-		"io.k8s.api.core.v1.ConfigMap": kind("ConfigMap", map[string]any{
-			"data": strMap,
+		"io.k8s.api.core.v1.ConfigMap": kind("ConfigMap", "ConfigMap holds configuration data for pods to consume.", map[string]any{
+			"data": map[string]any{
+				"type": "object", "additionalProperties": str,
+				"description": "Data contains the configuration data, as UTF-8 strings keyed by name.",
+			},
+			"immutable": map[string]any{"type": "boolean"},
 			"binaryData": map[string]any{
 				"type": "object", "additionalProperties": map[string]any{"type": "string", "format": "byte"},
 			},
 		}),
-		"io.k8s.api.core.v1.Namespace": kind("Namespace", map[string]any{
+		"io.k8s.api.core.v1.Namespace": kind("Namespace", "Namespace provides a scope for Names.", map[string]any{
 			"spec":   object(map[string]any{"finalizers": map[string]any{"type": "array", "items": str}}),
 			"status": object(map[string]any{"phase": str}),
 		}),
-		"io.k8s.api.core.v1.ReplicationController": kind("ReplicationController", map[string]any{
+		"io.k8s.api.core.v1.ReplicationController": kind("ReplicationController", "ReplicationController represents the configuration of a replication controller.", map[string]any{
 			"spec": object(map[string]any{
-				"replicas": integer,
-				"selector": strMap,
-				"template": map[string]any{"type": "object"},
+				"replicas":        integer,
+				"minReadySeconds": integer,
+				"selector":        strMap,
+				"template":        map[string]any{"type": "object"},
 			}),
-			"status": object(map[string]any{"replicas": integer}),
+			"status": object(map[string]any{
+				"replicas": integer, "readyReplicas": integer, "availableReplicas": integer,
+				"fullyLabeledReplicas": integer, "observedGeneration": map[string]any{"type": "integer", "format": "int64"},
+			}),
 		}),
 	}
 
-	operations := func(verbs ...string) map[string]any {
+	// Each operation names the kind it serves, and each write the query
+	// parameters it honours. kubectl explain finds a resource's schema through
+	// the first, and kubectl apply looks for fieldValidation among the second
+	// before it trusts the server to check what it sends.
+	writeParams := []any{
+		map[string]any{"name": "fieldManager", "in": "query", "schema": str},
+		map[string]any{"name": "fieldValidation", "in": "query", "schema": str},
+	}
+	operations := func(group, k string, verbs ...string) map[string]any {
 		out := map[string]any{}
 		for _, verb := range verbs {
-			out[verb] = map[string]any{"responses": map[string]any{"200": map[string]any{"description": "OK"}}}
+			op := map[string]any{
+				"responses":                       map[string]any{"200": map[string]any{"description": "OK"}},
+				"x-kubernetes-group-version-kind": map[string]any{"group": group, "version": "v1", "kind": k},
+			}
+			if verb == "post" || verb == "put" || verb == "patch" {
+				op["parameters"] = writeParams
+			}
+			out[verb] = op
 		}
 		return out
 	}
 	paths := map[string]any{
-		"/api/v1/namespaces":               operations("get", "post"),
-		"/api/v1/namespaces/{name}":        operations("get", "put", "delete"),
-		"/api/v1/namespaces/{name}/status": operations("get", "put"),
-		"/api/v1/configmaps":               operations("get"),
-		"/api/v1/replicationcontrollers":   operations("get"),
+		"/api/v1/namespaces":               operations("", "Namespace", "get", "post"),
+		"/api/v1/namespaces/{name}":        operations("", "Namespace", "get", "put", "delete"),
+		"/api/v1/namespaces/{name}/status": operations("", "Namespace", "get", "put"),
+		"/api/v1/configmaps":               operations("", "ConfigMap", "get"),
+		"/api/v1/replicationcontrollers":   operations("", "ReplicationController", "get"),
 	}
-	for _, resource := range []string{"configmaps", "replicationcontrollers"} {
-		paths["/api/v1/namespaces/{namespace}/"+resource] = operations("get", "post")
-		paths["/api/v1/namespaces/{namespace}/"+resource+"/{name}"] = operations("get", "put", "patch", "delete")
+	for resource, k := range map[string]string{"configmaps": "ConfigMap", "replicationcontrollers": "ReplicationController"} {
+		paths["/api/v1/namespaces/{namespace}/"+resource] = operations("", k, "get", "post")
+		paths["/api/v1/namespaces/{namespace}/"+resource+"/{name}"] = operations("", k, "get", "put", "patch", "delete")
 	}
-	paths["/api/v1/namespaces/{namespace}/replicationcontrollers/{name}/status"] = operations("get", "put")
-	paths["/api/v1/namespaces/{namespace}/replicationcontrollers/{name}/scale"] = operations("get", "put", "patch")
+	paths["/api/v1/namespaces/{namespace}/replicationcontrollers/{name}/status"] = operations("", "ReplicationController", "get", "put")
+	paths["/api/v1/namespaces/{namespace}/replicationcontrollers/{name}/scale"] = operations("autoscaling", "Scale", "get", "put", "patch")
 
 	return map[string]any{
 		"openapi":    "3.0.0",
@@ -2750,4 +2824,383 @@ func authenticate(tokens map[string]userInfo, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
 	})
+}
+
+// negotiate reads the Accept header of a read and reports whether the client
+// asked for a Table, answering 406 itself when this server has nothing the
+// client accepts.
+//
+// The first media type this server can produce wins. A JSON variant it cannot
+// produce — a Table in a version it does not serve, or any other as= — is
+// skipped rather than answered with plain JSON the client did not ask for.
+func negotiate(w http.ResponseWriter, r *http.Request) (table, ok bool) {
+	accept := strings.TrimSpace(r.Header.Get("Accept"))
+	if accept == "" {
+		return false, true
+	}
+	for _, part := range strings.Split(accept, ",") {
+		mediaType, params, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err != nil {
+			continue
+		}
+		switch {
+		case mediaType == "application/json" && params["as"] == "Table" && params["g"] == "meta.k8s.io" && params["v"] == "v1":
+			return true, true
+		case mediaType == "application/json" && params["as"] == "", mediaType == "application/*", mediaType == "*/*":
+			return false, true
+		}
+	}
+	writeStatus(w, http.StatusNotAcceptable, "NotAcceptable",
+		"only the following media types are accepted: application/json, application/json;as=Table;v=v1;g=meta.k8s.io")
+	return false, false
+}
+
+// writeRead answers a read of one object, as itself or as a one-row Table.
+func writeRead(w http.ResponseWriter, table bool, resource string, obj object) {
+	if table {
+		writeJSON(w, http.StatusOK, tableOf(resource, []object{obj}, map[string]any{"resourceVersion": metaString(obj, "resourceVersion")}))
+		return
+	}
+	writeJSON(w, http.StatusOK, obj)
+}
+
+// tableOf is objects as kubectl get prints them: the server decides the
+// columns and fills the cells, and the client only lays them out. Each row
+// carries the object's metadata, which is what -A, -L and --show-labels read.
+func tableOf(resource string, objs []object, listMeta map[string]any) map[string]any {
+	columns, cells := tableColumns(resource)
+	rows := []any{}
+	for _, obj := range objs {
+		rows = append(rows, map[string]any{
+			"cells": cells(obj),
+			"object": map[string]any{
+				"kind":       "PartialObjectMetadata",
+				"apiVersion": "meta.k8s.io/v1",
+				"metadata":   obj["metadata"],
+			},
+		})
+	}
+	return map[string]any{
+		"kind":              "Table",
+		"apiVersion":        "meta.k8s.io/v1",
+		"metadata":          listMeta,
+		"columnDefinitions": columns,
+		"rows":              rows,
+	}
+}
+
+// tableColumns is the columns of one resource, and the cells of one row.
+func tableColumns(resource string) ([]any, func(object) []any) {
+	column := func(name, typ, description string) map[string]any {
+		format := ""
+		if name == "Name" {
+			format = "name"
+		}
+		return map[string]any{"name": name, "type": typ, "format": format, "description": description, "priority": 0}
+	}
+	name := column("Name", "string", "Name must be unique within a namespace.")
+	age := column("Age", "string", "CreationTimestamp is when the object was created.")
+	field := func(obj object, half, key string) any {
+		m, _ := obj[half].(map[string]any)
+		if v, ok := m[key]; ok {
+			return v
+		}
+		return 0
+	}
+	switch resource {
+	case "configmaps":
+		return []any{name, column("Data", "integer", "The number of keys in data and binaryData."), age}, func(obj object) []any {
+			data, _ := obj["data"].(map[string]any)
+			binary, _ := obj["binaryData"].(map[string]any)
+			return []any{metaString(obj, "name"), len(data) + len(binary), ageOf(obj)}
+		}
+	case "namespaces":
+		return []any{name, column("Status", "string", "The phase of the namespace."), age}, func(obj object) []any {
+			status, _ := obj["status"].(map[string]any)
+			return []any{metaString(obj, "name"), status["phase"], ageOf(obj)}
+		}
+	case "replicationcontrollers":
+		columns := []any{
+			name,
+			column("Desired", "integer", "The number of replicas asked for."),
+			column("Current", "integer", "The number of replicas that exist."),
+			column("Ready", "integer", "The number of replicas that are ready."),
+			age,
+		}
+		return columns, func(obj object) []any {
+			return []any{metaString(obj, "name"), field(obj, "spec", "replicas"), field(obj, "status", "replicas"),
+				field(obj, "status", "readyReplicas"), ageOf(obj)}
+		}
+	}
+	return []any{name, age}, func(obj object) []any { return []any{metaString(obj, "name"), ageOf(obj)} }
+}
+
+// ageOf is how long ago an object was created, in the short form kubectl
+// prints: 45s, 3m12s, 5h, 2d3h.
+func ageOf(obj object) string {
+	created, err := time.Parse(time.RFC3339, metaString(obj, "creationTimestamp"))
+	if err != nil {
+		return "<unknown>"
+	}
+	d := max(time.Since(created), 0)
+	switch s, m, h := int(d.Seconds()), int(d.Minutes()), int(d.Hours()); {
+	case s < 120:
+		return fmt.Sprintf("%ds", s)
+	case m < 10:
+		return fmt.Sprintf("%dm%ds", m, s%60)
+	case m < 180:
+		return fmt.Sprintf("%dm", m)
+	case h < 8:
+		return fmt.Sprintf("%dh%dm", h, m%60)
+	case h < 48:
+		return fmt.Sprintf("%dh", h)
+	case h < 24*8:
+		return fmt.Sprintf("%dd%dh", h/24, h%24)
+	default:
+		return fmt.Sprintf("%dd", h/24)
+	}
+}
+
+// protobufType is the media type of the Kubernetes protobuf encoding.
+const protobufType = "application/vnd.kubernetes.protobuf"
+
+// pbField is one field of a protobuf message: the JSON name it decodes to,
+// what its bytes are, and for a nested message, that message's fields.
+type pbField struct {
+	name   string
+	kind   string // string, bytes, bool, int, strings, time, message, map, bytesMap
+	fields map[int]pbField
+}
+
+var pbObjectMeta = map[int]pbField{
+	1: {name: "name", kind: "string"}, 2: {name: "generateName", kind: "string"},
+	3: {name: "namespace", kind: "string"}, 4: {name: "selfLink", kind: "string"},
+	5: {name: "uid", kind: "string"}, 6: {name: "resourceVersion", kind: "string"},
+	7: {name: "generation", kind: "int"}, 8: {name: "creationTimestamp", kind: "time"},
+	11: {name: "labels", kind: "map"}, 12: {name: "annotations", kind: "map"},
+	14: {name: "finalizers", kind: "strings"},
+}
+
+// pbKinds is every kind this server reads as protobuf, by field number, from
+// the generated.proto files of k8s.io/api. A kind not here is refused.
+var pbKinds = map[string]map[int]pbField{
+	"ConfigMap": {
+		1: {name: "metadata", kind: "message", fields: pbObjectMeta},
+		2: {name: "data", kind: "map"},
+		3: {name: "binaryData", kind: "bytesMap"},
+		4: {name: "immutable", kind: "bool"},
+	},
+	"Namespace": {
+		1: {name: "metadata", kind: "message", fields: pbObjectMeta},
+		2: {name: "spec", kind: "message", fields: map[int]pbField{1: {name: "finalizers", kind: "strings"}}},
+		3: {name: "status", kind: "message", fields: map[int]pbField{1: {name: "phase", kind: "string"}}},
+	},
+}
+
+// decodeProtobuf reads a protobuf body into the same JSON shape every other
+// write arrives in. The body is "k8s\x00" and then a runtime.Unknown: the
+// apiVersion and kind, and the object's own bytes.
+func decodeProtobuf(raw []byte, kind string) (object, error) {
+	body, ok := bytes.CutPrefix(raw, []byte("k8s\x00"))
+	if !ok {
+		return nil, errors.New(`it does not start with "k8s\x00"`)
+	}
+	envelope, err := pbDecode(body, map[int]pbField{
+		1: {name: "typeMeta", kind: "message", fields: map[int]pbField{1: {name: "apiVersion", kind: "string"}, 2: {name: "kind", kind: "string"}}},
+		2: {name: "raw", kind: "bytes"},
+		3: {name: "contentEncoding", kind: "string"},
+		4: {name: "contentType", kind: "string"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	typeMeta, _ := envelope["typeMeta"].(map[string]any)
+	if typeMeta["kind"] != kind {
+		return nil, fmt.Errorf("it holds a %v", typeMeta["kind"])
+	}
+	fields, ok := pbKinds[kind]
+	if !ok {
+		return nil, fmt.Errorf("this server reads %s as JSON only", kind)
+	}
+	inner, _ := envelope["raw"].([]byte)
+	obj, err := pbDecode(inner, fields)
+	if err != nil {
+		return nil, err
+	}
+	obj["apiVersion"], obj["kind"] = typeMeta["apiVersion"], kind
+	return obj, nil
+}
+
+// pbDecode reads one message in the protobuf wire format: a run of fields,
+// each a varint key (number<<3 | wire type) and then a varint or a
+// length-prefixed run of bytes. Empty values are left out, as JSON omits them.
+func pbDecode(buf []byte, fields map[int]pbField) (map[string]any, error) {
+	out := map[string]any{}
+	for len(buf) > 0 {
+		key, n := binary.Uvarint(buf)
+		if n <= 0 {
+			return nil, errors.New("a field key is cut short")
+		}
+		buf = buf[n:]
+		field, known := fields[int(key>>3)]
+		if !known {
+			return nil, fmt.Errorf("field %d is not one this server reads", key>>3)
+		}
+		var number uint64
+		var data []byte
+		switch wire := key & 7; {
+		case wire == 0 && (field.kind == "bool" || field.kind == "int"):
+			if number, n = binary.Uvarint(buf); n <= 0 {
+				return nil, fmt.Errorf("%s is cut short", field.name)
+			}
+			buf = buf[n:]
+		case wire == 2 && field.kind != "bool" && field.kind != "int":
+			length, n := binary.Uvarint(buf)
+			if n <= 0 || length > uint64(len(buf)-n) {
+				return nil, fmt.Errorf("%s is cut short", field.name)
+			}
+			data, buf = buf[n:n+int(length)], buf[n+int(length):]
+		default:
+			return nil, fmt.Errorf("%s has wire type %d", field.name, wire)
+		}
+
+		switch field.kind {
+		case "string":
+			if len(data) > 0 {
+				out[field.name] = string(data)
+			}
+		case "bytes":
+			out[field.name] = data
+		case "bool":
+			out[field.name] = number != 0
+		case "int":
+			if number != 0 {
+				out[field.name] = float64(int64(number))
+			}
+		case "strings":
+			list, _ := out[field.name].([]any)
+			out[field.name] = append(list, string(data))
+		case "time":
+			t, err := pbDecode(data, map[int]pbField{1: {name: "seconds", kind: "int"}, 2: {name: "nanos", kind: "int"}})
+			if err != nil {
+				return nil, err
+			}
+			if seconds, ok := t["seconds"].(float64); ok {
+				out[field.name] = time.Unix(int64(seconds), 0).UTC().Format(time.RFC3339)
+			}
+		case "message":
+			sub, err := pbDecode(data, field.fields)
+			if err != nil {
+				return nil, err
+			}
+			if len(sub) > 0 {
+				out[field.name] = sub
+			}
+		case "map", "bytesMap":
+			valueKind := "string"
+			if field.kind == "bytesMap" {
+				valueKind = "bytes"
+			}
+			entry, err := pbDecode(data, map[int]pbField{1: {name: "key", kind: "string"}, 2: {name: "value", kind: valueKind}})
+			if err != nil {
+				return nil, err
+			}
+			m, _ := out[field.name].(map[string]any)
+			if m == nil {
+				m = map[string]any{}
+				out[field.name] = m
+			}
+			k, _ := entry["key"].(string)
+			switch v := entry["value"].(type) {
+			case []byte:
+				m[k] = base64.StdEncoding.EncodeToString(v)
+			case string:
+				m[k] = v
+			default:
+				m[k] = ""
+			}
+		}
+	}
+	return out, nil
+}
+
+// apiSchemas are the schemas this server publishes, which are also what it
+// checks a write's field names against.
+var apiSchemas = openAPIDocument()["components"].(map[string]any)["schemas"].(map[string]any)
+
+// checkFields applies the fieldValidation a write asked for, answering the
+// client itself when the write must stop, and reports whether it may go on.
+//
+// A field the schema does not have is refused under Strict. Under Warn and
+// Ignore it is taken out of body, as the real server's typed decoding drops
+// it, and Warn says so in a Warning header per field, which kubectl prints.
+// Without the parameter nothing is checked.
+func checkFields(w http.ResponseWriter, r *http.Request, body any, kind string) bool {
+	directive := r.URL.Query().Get("fieldValidation")
+	switch directive {
+	case "":
+		return true
+	case "Ignore", "Warn", "Strict":
+	default:
+		writeStatus(w, http.StatusBadRequest, "BadRequest",
+			fmt.Sprintf(`fieldValidation: Unsupported value: %q: supported values: "Ignore", "Strict", "Warn"`, directive))
+		return false
+	}
+	schema, _ := apiSchemas["io.k8s.api.core.v1."+kind].(map[string]any)
+	var unknown []string
+	unknownFields(body, schema, "", &unknown, directive != "Strict")
+	if len(unknown) == 0 || directive == "Ignore" {
+		return true
+	}
+	sort.Strings(unknown)
+	for i, field := range unknown {
+		unknown[i] = fmt.Sprintf("unknown field %q", field)
+	}
+	if directive == "Warn" {
+		for _, problem := range unknown {
+			w.Header().Add("Warning", "299 - "+strconv.Quote(problem))
+		}
+		return true
+	}
+	writeStatus(w, http.StatusBadRequest, "BadRequest",
+		fmt.Sprintf("%s in version \"v1\" cannot be handled as a %s: strict decoding error: %s", kind, kind, strings.Join(unknown, ", ")))
+	return false
+}
+
+// unknownFields walks a value beside its schema and records the path of every
+// key the schema does not name. A schema with no properties — a map, or a
+// free-form object — accepts any key. Keys starting with $ are a strategic
+// merge patch's directives, not fields. With prune, each one found is also
+// deleted.
+func unknownFields(value any, schema map[string]any, at string, out *[]string, prune bool) {
+	if ref, ok := schema["$ref"].(string); ok {
+		schema, _ = apiSchemas[strings.TrimPrefix(ref, "#/components/schemas/")].(map[string]any)
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		props, ok := schema["properties"].(map[string]any)
+		if !ok {
+			return
+		}
+		for key, child := range v {
+			if strings.HasPrefix(key, "$") {
+				continue
+			}
+			path := strings.TrimPrefix(at+"."+key, ".")
+			sub, known := props[key].(map[string]any)
+			if !known {
+				*out = append(*out, path)
+				if prune {
+					delete(v, key)
+				}
+				continue
+			}
+			unknownFields(child, sub, path, out, prune)
+		}
+	case []any:
+		items, _ := schema["items"].(map[string]any)
+		for i, child := range v {
+			unknownFields(child, items, fmt.Sprintf("%s[%d]", at, i), out, prune)
+		}
+	}
 }
