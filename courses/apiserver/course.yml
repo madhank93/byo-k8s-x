@@ -83,3 +83,6 @@ stages:
   - slug: authn-cert
     name: The certificate is the name
     difficulty: hard
+  - slug: kubectl-drives-it
+    name: The client you did not write
+    difficulty: hard

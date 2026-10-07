@@ -764,7 +764,7 @@ func run() error {
 			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("namespaces %q not found", name))
 			return
 		}
-		writeJSON(w, http.StatusOK, obj)
+		writeRead(w, r, "namespaces", obj)
 	}
 	mux.HandleFunc("GET /api/v1/namespaces/{name}", getNamespace)
 
@@ -1031,7 +1031,7 @@ func serveResource(mux *http.ServeMux, objects *store, t resourceType) {
 			writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("%s %q not found", t.resource, name))
 			return
 		}
-		writeJSON(w, http.StatusOK, obj)
+		writeRead(w, r, t.resource, obj)
 	})
 
 	mux.HandleFunc("PUT "+item, func(w http.ResponseWriter, r *http.Request) {
@@ -1068,7 +1068,18 @@ func serveResource(mux *http.ServeMux, objects *store, t resourceType) {
 	// applied to what is stored when the write happens.
 	mux.HandleFunc("PATCH "+item, func(w http.ResponseWriter, r *http.Request) {
 		namespace, name := r.PathValue("namespace"), r.PathValue("name")
-		if mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mediaType == "application/apply-patch+yaml" {
+		mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		// A JSON patch is a list of operations rather than the shape of the
+		// object, so it has no field names to check.
+		if mediaType != "application/json-patch+json" {
+			raw, err := io.ReadAll(r.Body)
+			var body any
+			if err == nil && json.Unmarshal(raw, &body) == nil && !checkFields(w, r, body, t.kind) {
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+		}
+		if mediaType == "application/apply-patch+yaml" {
 			serverSideApply(w, r, objects, t, namespace, name)
 			return
 		}
@@ -1349,6 +1360,10 @@ func listHandler(objects *store, t resourceType) http.HandlerFunc {
 			meta["remainingItemCount"] = len(items) - limit
 			items = items[:limit]
 		}
+		if wantsTable(r) {
+			writeJSON(w, http.StatusOK, tableOf(t.resource, items, meta))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"kind":       t.kind + "List",
 			"apiVersion": t.groupVersion(),
@@ -1417,8 +1432,15 @@ func streamWatch(w http.ResponseWriter, r *http.Request, objects *store, t resou
 	// a response that never starts — a watch that has nothing to say yet is
 	// still an open watch.
 	flusher.Flush()
+	table := wantsTable(r)
 	send := func(eventType string, obj object) bool {
-		raw, err := json.Marshal(map[string]any{"type": eventType, "object": obj})
+		var body any = obj
+		if table && eventType != "BOOKMARK" {
+			// A client that listed as a Table watches as one: each event
+			// carries a one-row Table, so it prints as a line like the rest.
+			body = tableOf(t.resource, []object{obj}, map[string]any{"resourceVersion": metaString(obj, "resourceVersion")})
+		}
+		raw, err := json.Marshal(map[string]any{"type": eventType, "object": body})
 		if err != nil {
 			return false
 		}
@@ -1829,6 +1851,9 @@ func decodeObject(w http.ResponseWriter, r *http.Request, namespace, apiVersion,
 	var obj object
 	if err := json.NewDecoder(r.Body).Decode(&obj); err != nil {
 		writeStatus(w, http.StatusBadRequest, "BadRequest", "the body is not valid JSON: "+err.Error())
+		return nil, false
+	}
+	if !checkFields(w, r, map[string]any(obj), kind) {
 		return nil, false
 	}
 	if got := metaString(obj, "namespace"); got != "" && got != namespace {
@@ -2754,8 +2779,8 @@ func openAPIDocument() map[string]any {
 
 	schemas := map[string]any{
 		meta: object(map[string]any{
-			"name": str, "namespace": str, "uid": str, "resourceVersion": str, "creationTimestamp": str,
-			"labels": strMap, "annotations": strMap,
+			"name": str, "generateName": str, "namespace": str, "uid": str, "resourceVersion": str, "creationTimestamp": str,
+			"labels": strMap, "annotations": strMap, "generation": map[string]any{"type": "integer", "format": "int64"},
 			"finalizers": map[string]any{
 				"type": "array", "items": str,
 				"x-kubernetes-patch-strategy": "merge",
@@ -2771,7 +2796,8 @@ func openAPIDocument() map[string]any {
 			"managedFields": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 		}),
 		"io.k8s.api.core.v1.ConfigMap": kind("ConfigMap", map[string]any{
-			"data": strMap,
+			"data":      strMap,
+			"immutable": map[string]any{"type": "boolean"},
 			"binaryData": map[string]any{
 				"type": "object", "additionalProperties": map[string]any{"type": "string", "format": "byte"},
 			},
@@ -2790,26 +2816,37 @@ func openAPIDocument() map[string]any {
 		}),
 	}
 
-	operations := func(verbs ...string) map[string]any {
+	// kubectl finds a kind's writes by the kind each operation names, and
+	// looks for fieldValidation among their parameters before it leaves
+	// checking field names to the server rather than doing it itself.
+	writeParams := []any{map[string]any{"name": "fieldValidation", "in": "query", "schema": str}}
+	operations := func(group, k string, verbs ...string) map[string]any {
 		out := map[string]any{}
 		for _, verb := range verbs {
-			out[verb] = map[string]any{"responses": map[string]any{"200": map[string]any{"description": "OK"}}}
+			op := map[string]any{
+				"responses":                       map[string]any{"200": map[string]any{"description": "OK"}},
+				"x-kubernetes-group-version-kind": map[string]any{"group": group, "version": "v1", "kind": k},
+			}
+			if verb == "post" || verb == "put" || verb == "patch" {
+				op["parameters"] = writeParams
+			}
+			out[verb] = op
 		}
 		return out
 	}
 	paths := map[string]any{
-		"/api/v1/namespaces":               operations("get", "post"),
-		"/api/v1/namespaces/{name}":        operations("get", "put", "delete"),
-		"/api/v1/namespaces/{name}/status": operations("get", "put"),
-		"/api/v1/configmaps":               operations("get"),
-		"/api/v1/replicationcontrollers":   operations("get"),
+		"/api/v1/namespaces":               operations("", "Namespace", "get", "post"),
+		"/api/v1/namespaces/{name}":        operations("", "Namespace", "get", "put", "delete"),
+		"/api/v1/namespaces/{name}/status": operations("", "Namespace", "get", "put"),
+		"/api/v1/configmaps":               operations("", "ConfigMap", "get"),
+		"/api/v1/replicationcontrollers":   operations("", "ReplicationController", "get"),
 	}
-	for _, resource := range []string{"configmaps", "replicationcontrollers"} {
-		paths["/api/v1/namespaces/{namespace}/"+resource] = operations("get", "post")
-		paths["/api/v1/namespaces/{namespace}/"+resource+"/{name}"] = operations("get", "put", "patch", "delete")
+	for resource, k := range map[string]string{"configmaps": "ConfigMap", "replicationcontrollers": "ReplicationController"} {
+		paths["/api/v1/namespaces/{namespace}/"+resource] = operations("", k, "get", "post")
+		paths["/api/v1/namespaces/{namespace}/"+resource+"/{name}"] = operations("", k, "get", "put", "patch", "delete")
 	}
-	paths["/api/v1/namespaces/{namespace}/replicationcontrollers/{name}/status"] = operations("get", "put")
-	paths["/api/v1/namespaces/{namespace}/replicationcontrollers/{name}/scale"] = operations("get", "put", "patch")
+	paths["/api/v1/namespaces/{namespace}/replicationcontrollers/{name}/status"] = operations("", "ReplicationController", "get", "put")
+	paths["/api/v1/namespaces/{namespace}/replicationcontrollers/{name}/scale"] = operations("autoscaling", "Scale", "get", "put", "patch")
 
 	return map[string]any{
 		"openapi":    "3.0.0",
@@ -2914,4 +2951,180 @@ func certUser(r *http.Request) (userInfo, bool) {
 	}
 	groups := append(slices.Clone(subject.Organization), "system:authenticated")
 	return userInfo{name: subject.CommonName, groups: groups}, true
+}
+
+// wantsTable reports whether a read asked for a Table rather than the objects:
+// the first media type in Accept that this server can produce decides.
+func wantsTable(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept"), ",") {
+		mediaType, params, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err != nil {
+			continue
+		}
+		if mediaType == "application/json" && params["as"] == "Table" && params["g"] == "meta.k8s.io" && params["v"] == "v1" {
+			return true
+		}
+		if (mediaType == "application/json" && params["as"] == "") || mediaType == "*/*" {
+			return false
+		}
+	}
+	return false
+}
+
+// writeRead answers a read of one object, as itself or as a one-row Table.
+func writeRead(w http.ResponseWriter, r *http.Request, resource string, obj object) {
+	if wantsTable(r) {
+		writeJSON(w, http.StatusOK, tableOf(resource, []object{obj}, map[string]any{"resourceVersion": metaString(obj, "resourceVersion")}))
+		return
+	}
+	writeJSON(w, http.StatusOK, obj)
+}
+
+// tableOf is objects as kubectl get prints them: the server decides the
+// columns and fills the cells, and the client only lays them out. Each row
+// carries the object's metadata, which is what -A and --show-labels read.
+func tableOf(resource string, objs []object, listMeta map[string]any) map[string]any {
+	columns, cells := tableColumns(resource)
+	rows := []any{}
+	for _, obj := range objs {
+		rows = append(rows, map[string]any{
+			"cells": cells(obj),
+			"object": map[string]any{
+				"kind":       "PartialObjectMetadata",
+				"apiVersion": "meta.k8s.io/v1",
+				"metadata":   obj["metadata"],
+			},
+		})
+	}
+	return map[string]any{
+		"kind":              "Table",
+		"apiVersion":        "meta.k8s.io/v1",
+		"metadata":          listMeta,
+		"columnDefinitions": columns,
+		"rows":              rows,
+	}
+}
+
+// tableColumns is the columns of one resource, and the cells of one row.
+func tableColumns(resource string) ([]any, func(object) []any) {
+	column := func(name, typ string) map[string]any {
+		format := ""
+		if name == "Name" {
+			format = "name"
+		}
+		return map[string]any{"name": name, "type": typ, "format": format, "description": "", "priority": 0}
+	}
+	name, age := column("Name", "string"), column("Age", "string")
+	count := func(obj object, half, key string) any {
+		m, _ := obj[half].(map[string]any)
+		if v, ok := m[key]; ok {
+			return v
+		}
+		return 0
+	}
+	switch resource {
+	case "configmaps":
+		return []any{name, column("Data", "integer"), age}, func(obj object) []any {
+			data, _ := obj["data"].(map[string]any)
+			binary, _ := obj["binaryData"].(map[string]any)
+			return []any{metaString(obj, "name"), len(data) + len(binary), ageOf(obj)}
+		}
+	case "replicationcontrollers":
+		columns := []any{name, column("Desired", "integer"), column("Current", "integer"), column("Ready", "integer"), age}
+		return columns, func(obj object) []any {
+			return []any{metaString(obj, "name"), count(obj, "spec", "replicas"), count(obj, "status", "replicas"),
+				count(obj, "status", "readyReplicas"), ageOf(obj)}
+		}
+	}
+	return []any{name, age}, func(obj object) []any { return []any{metaString(obj, "name"), ageOf(obj)} }
+}
+
+// ageOf is how long ago an object was created.
+func ageOf(obj object) string {
+	created, err := time.Parse(time.RFC3339, metaString(obj, "creationTimestamp"))
+	if err != nil {
+		return "<unknown>"
+	}
+	return max(time.Since(created), 0).Round(time.Second).String()
+}
+
+// apiSchemas are the schemas this server publishes, which are also what it
+// checks a write's field names against.
+var apiSchemas = openAPIDocument()["components"].(map[string]any)["schemas"].(map[string]any)
+
+// checkFields applies the fieldValidation a write asked for, answering the
+// client itself when the write must stop, and reports whether it may go on.
+//
+// A field the schema does not have is refused under Strict. Under Warn and
+// Ignore it is taken out of body, as the real server's typed decoding drops
+// it, and Warn says so in a Warning header per field, which kubectl prints.
+// Without the parameter nothing is checked.
+func checkFields(w http.ResponseWriter, r *http.Request, body any, kind string) bool {
+	directive := r.URL.Query().Get("fieldValidation")
+	switch directive {
+	case "":
+		return true
+	case "Ignore", "Warn", "Strict":
+	default:
+		writeStatus(w, http.StatusBadRequest, "BadRequest",
+			fmt.Sprintf(`fieldValidation: Unsupported value: %q: supported values: "Ignore", "Strict", "Warn"`, directive))
+		return false
+	}
+	schema, _ := apiSchemas["io.k8s.api.core.v1."+kind].(map[string]any)
+	var unknown []string
+	unknownFields(body, schema, "", &unknown, directive != "Strict")
+	if len(unknown) == 0 || directive == "Ignore" {
+		return true
+	}
+	sort.Strings(unknown)
+	for i, field := range unknown {
+		unknown[i] = fmt.Sprintf("unknown field %q", field)
+	}
+	if directive == "Warn" {
+		for _, problem := range unknown {
+			w.Header().Add("Warning", "299 - "+strconv.Quote(problem))
+		}
+		return true
+	}
+	writeStatus(w, http.StatusBadRequest, "BadRequest",
+		fmt.Sprintf("%s in version \"v1\" cannot be handled as a %s: strict decoding error: %s", kind, kind, strings.Join(unknown, ", ")))
+	return false
+}
+
+// unknownFields walks a value beside its schema and records the path of every
+// key the schema does not name. A schema with no properties — a map, or a
+// free-form object — accepts any key. Keys starting with $ are a strategic
+// merge patch's directives, not fields. With prune, each one found is also
+// deleted.
+func unknownFields(value any, schema map[string]any, at string, out *[]string, prune bool) {
+	if ref, ok := schema["$ref"].(string); ok {
+		schema, _ = apiSchemas[strings.TrimPrefix(ref, "#/components/schemas/")].(map[string]any)
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		props, ok := schema["properties"].(map[string]any)
+		if !ok {
+			return
+		}
+		for key, child := range v {
+			if strings.HasPrefix(key, "$") {
+				continue
+			}
+			path := strings.TrimPrefix(at+"."+key, ".")
+			sub, known := props[key].(map[string]any)
+			if !known {
+				*out = append(*out, path)
+				if prune {
+					delete(v, key)
+				}
+				continue
+			}
+			unknownFields(child, sub, path, out, prune)
+		}
+	case []any:
+		items, _ := schema["items"].(map[string]any)
+		for i, child := range v {
+			unknownFields(child, items, fmt.Sprintf("%s[%d]", at, i), out, prune)
+		}
+	}
 }
