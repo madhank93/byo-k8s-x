@@ -89,3 +89,6 @@ stages:
   - slug: admission-chain
     name: Everyone else gets a say
     difficulty: hard
+  - slug: audit-log
+    name: Who did what, written down
+    difficulty: hard

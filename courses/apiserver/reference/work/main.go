@@ -24,6 +24,7 @@ import (
 	"maps"
 	"math"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -616,6 +617,8 @@ func run() error {
 	data := flag.String("data", "", "a directory to keep the objects in; empty keeps them in memory only")
 	tokenFile := flag.String("token-auth-file", "", "a CSV of token,user,uid[,groups] to authenticate bearer tokens against; empty turns authentication off")
 	authzMode := flag.String("authorization-mode", "AlwaysAllow", "AlwaysAllow, or RBAC to decide each request from the roles and bindings stored in the server")
+	auditPath := flag.String("audit-log-path", "", "a file to append one JSON audit event per line to; empty turns auditing off")
+	auditPolicyFile := flag.String("audit-policy-file", "", "an audit.k8s.io/v1 Policy, as JSON, saying what to record; empty records every request at Metadata")
 	certFile := flag.String("tls-cert-file", "", "the PEM certificate to serve HTTPS with; empty serves plain HTTP")
 	keyFile := flag.String("tls-private-key-file", "", "the PEM private key for -tls-cert-file")
 	clientCAFile := flag.String("client-ca-file", "", "a PEM bundle of CAs whose client certificates are users; empty accepts none")
@@ -648,6 +651,15 @@ func run() error {
 		// instead; one with a certificate this pool did not sign is not.
 		tlsConfig.ClientCAs = pool
 		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+	}
+
+	var audit *auditor
+	if *auditPath != "" {
+		var err error
+		if audit, err = newAuditor(*auditPath, *auditPolicyFile); err != nil {
+			return err
+		}
+		defer audit.out.Close()
 	}
 
 	var tokens map[string]userInfo
@@ -908,7 +920,12 @@ func run() error {
 		writeStatus(w, http.StatusNotFound, "NotFound", "the server could not find the requested resource: "+r.URL.Path)
 	})
 
-	srv := &http.Server{Addr: *addr, Handler: authenticate(tokens, *clientCAFile != "", authorize(policy, mux)), TLSConfig: tlsConfig}
+	handler := authenticate(tokens, *clientCAFile != "", authorize(policy, mux))
+	// Outside authentication, so a request it refuses is still recorded.
+	if audit != nil {
+		handler = audit.wrap(handler)
+	}
+	srv := &http.Server{Addr: *addr, Handler: handler, TLSConfig: tlsConfig}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	go func() {
@@ -3069,6 +3086,9 @@ func authenticate(tokens map[string]userInfo, certs bool, next http.Handler) htt
 			}
 			user = known
 		}
+		if record, ok := r.Context().Value(auditKey{}).(*auditRecord); ok {
+			record.user = &user
+		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
 	})
 }
@@ -3906,4 +3926,343 @@ func certUser(r *http.Request) (userInfo, bool) {
 	}
 	groups := append(slices.Clone(subject.Organization), "system:authenticated")
 	return userInfo{name: subject.CommonName, groups: groups}, true
+}
+
+// auditor writes the audit log: one JSON event per request, saying who asked
+// for what and what they were told, at the detail the policy picks.
+type auditor struct {
+	policy auditPolicy
+	mu     sync.Mutex
+	out    *os.File
+}
+
+// auditPolicy is an audit.k8s.io/v1 Policy. Rules are tried in order and the
+// first that matches sets the level; a request no rule matches is not logged.
+type auditPolicy struct {
+	Kind       string      `json:"kind"`
+	OmitStages []string    `json:"omitStages"`
+	Rules      []auditRule `json:"rules"`
+}
+
+// auditRule matches a request when every field it sets matches; a field left
+// empty matches anything.
+type auditRule struct {
+	Level           string          `json:"level"`
+	Users           []string        `json:"users"`
+	UserGroups      []string        `json:"userGroups"`
+	Verbs           []string        `json:"verbs"`
+	Namespaces      []string        `json:"namespaces"`
+	NonResourceURLs []string        `json:"nonResourceURLs"`
+	OmitStages      []string        `json:"omitStages"`
+	Resources       []auditResource `json:"resources"`
+}
+
+// auditResource is one API group and resources in it; no resources means all
+// of the group's.
+type auditResource struct {
+	Group     string   `json:"group"`
+	Resources []string `json:"resources"`
+}
+
+// auditLevels orders the levels: each records everything the one before does.
+var auditLevels = map[string]int{"None": 0, "Metadata": 1, "Request": 2, "RequestResponse": 3}
+
+// auditRecord is what the handlers inside the auditor learn about a request
+// that the event needs, such as who authentication decided it is from.
+type auditRecord struct {
+	user *userInfo
+}
+
+type auditKey struct{}
+
+// newAuditor opens the log for appending and reads the policy. The policy is
+// JSON: a YAML parser is not in the standard library, and JSON is YAML, so a
+// policy written this way is one the real server reads too.
+func newAuditor(path, policyFile string) (*auditor, error) {
+	policy := auditPolicy{Rules: []auditRule{{Level: "Metadata"}}}
+	if policyFile != "" {
+		raw, err := os.ReadFile(policyFile)
+		if err != nil {
+			return nil, fmt.Errorf("read the audit policy: %w", err)
+		}
+		policy = auditPolicy{}
+		if err := json.Unmarshal(raw, &policy); err != nil {
+			return nil, fmt.Errorf("parse the audit policy %s (it has to be JSON): %w", policyFile, err)
+		}
+		if policy.Kind != "Policy" {
+			return nil, fmt.Errorf("the audit policy %s is kind %q, not Policy", policyFile, policy.Kind)
+		}
+		for i, rule := range policy.Rules {
+			if _, ok := auditLevels[rule.Level]; !ok {
+				return nil, fmt.Errorf("the audit policy %s, rule %d: level %q is not None, Metadata, Request or RequestResponse", policyFile, i, rule.Level)
+			}
+		}
+	}
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open the audit log: %w", err)
+	}
+	return &auditor{policy: policy, out: out}, nil
+}
+
+// requestInfo is what a request means in API terms rather than HTTP ones: the
+// verb and the object it is about. Paths outside /api and /apis are
+// non-resource requests, whose verb is the lowercased HTTP method.
+type requestInfo struct {
+	resourceRequest                                              bool
+	verb, group, version, resource, subresource, namespace, name string
+}
+
+func parseRequestInfo(r *http.Request) requestInfo {
+	info := requestInfo{verb: strings.ToLower(r.Method)}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	var rest []string
+	switch {
+	case parts[0] == "api" && len(parts) >= 3:
+		info.version, rest = parts[1], parts[2:]
+	case parts[0] == "apis" && len(parts) >= 4:
+		info.group, info.version, rest = parts[1], parts[2], parts[3:]
+	default:
+		return info
+	}
+	info.resourceRequest = true
+	if rest[0] == "namespaces" && len(rest) > 1 {
+		info.namespace = rest[1]
+		// /namespaces/x/status is the namespace's own subresource; anything
+		// else after the name is a resource inside the namespace.
+		if len(rest) > 2 && rest[2] != "status" && rest[2] != "finalize" {
+			rest = rest[2:]
+		}
+	}
+	info.resource = rest[0]
+	if len(rest) > 1 {
+		info.name = rest[1]
+	}
+	if len(rest) > 2 {
+		info.subresource = rest[2]
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		switch {
+		case watching(r):
+			info.verb = "watch"
+		case info.name == "":
+			info.verb = "list"
+		default:
+			info.verb = "get"
+		}
+	case http.MethodPost:
+		info.verb = "create"
+	case http.MethodPut:
+		info.verb = "update"
+	case http.MethodPatch:
+		info.verb = "patch"
+	case http.MethodDelete:
+		info.verb = "delete"
+		if info.name == "" {
+			info.verb = "deletecollection"
+		}
+	}
+	return info
+}
+
+// levelFor finds the first rule matching the request and returns its level
+// and the stages it leaves out.
+func (p auditPolicy) levelFor(user userInfo, info requestInfo, path string) (string, []string) {
+	for _, rule := range p.Rules {
+		if rule.matches(user, info, path) {
+			return rule.Level, append(slices.Clone(p.OmitStages), rule.OmitStages...)
+		}
+	}
+	return "None", nil
+}
+
+func (rule auditRule) matches(user userInfo, info requestInfo, path string) bool {
+	if len(rule.Users) > 0 && !slices.Contains(rule.Users, user.name) {
+		return false
+	}
+	if len(rule.UserGroups) > 0 && !slices.ContainsFunc(user.groups, func(g string) bool { return slices.Contains(rule.UserGroups, g) }) {
+		return false
+	}
+	if len(rule.Verbs) > 0 && !slices.Contains(rule.Verbs, info.verb) {
+		return false
+	}
+	// A rule about resources says nothing about other URLs, and one about
+	// other URLs says nothing about resources.
+	if len(rule.Resources) > 0 || len(rule.Namespaces) > 0 {
+		if !info.resourceRequest {
+			return false
+		}
+		if len(rule.Namespaces) > 0 && !slices.Contains(rule.Namespaces, info.namespace) {
+			return false
+		}
+		if len(rule.Resources) > 0 && !slices.ContainsFunc(rule.Resources, info.inGroup) {
+			return false
+		}
+	}
+	if len(rule.NonResourceURLs) > 0 {
+		if info.resourceRequest {
+			return false
+		}
+		return slices.ContainsFunc(rule.NonResourceURLs, func(pattern string) bool {
+			if prefix, ok := strings.CutSuffix(pattern, "*"); ok {
+				return strings.HasPrefix(path, prefix)
+			}
+			return path == pattern
+		})
+	}
+	return true
+}
+
+func (info requestInfo) inGroup(g auditResource) bool {
+	return g.Group == info.group && (len(g.Resources) == 0 || slices.ContainsFunc(g.Resources, info.resourceMatches))
+}
+
+// resourceMatches reads a rule's resource the way RBAC does: "pods" is the
+// object and none of its subresources, "pods/log" one subresource, and "*"
+// either side of the slash is any.
+func (info requestInfo) resourceMatches(pattern string) bool {
+	resource, sub, _ := strings.Cut(pattern, "/")
+	if resource != "*" && resource != info.resource {
+		return false
+	}
+	if resource == "*" && sub == "" {
+		return true
+	}
+	return sub == info.subresource || (sub == "*" && info.subresource != "")
+}
+
+// wrap records every request that passes through it. A watch is recorded
+// twice: when it starts, which is the record anyone reading the log sees
+// while it is open, and when it ends.
+func (a *auditor) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received := time.Now()
+		id := r.Header.Get("Audit-ID")
+		if id == "" {
+			id = newUID()
+		}
+		w.Header().Set("Audit-Id", id)
+
+		var body []byte
+		if r.Body != nil {
+			body, _ = io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		info := parseRequestInfo(r)
+		record := &auditRecord{}
+		out := &auditWriter{ResponseWriter: w, code: http.StatusOK, keep: info.verb != "watch"}
+		event := func(stage string) {
+			a.log(stage, id, r, info, record, body, out, received)
+		}
+		if info.verb == "watch" {
+			out.started = func() { event("ResponseStarted") }
+		}
+		next.ServeHTTP(out, r.WithContext(context.WithValue(r.Context(), auditKey{}, record)))
+		event("ResponseComplete")
+	})
+}
+
+// log writes one event if the policy asks for it. Each event is one write of
+// one whole line under a lock, so concurrent requests never interleave.
+func (a *auditor) log(stage, id string, r *http.Request, info requestInfo, record *auditRecord, body []byte, out *auditWriter, received time.Time) {
+	user := userInfo{}
+	if record.user != nil {
+		user = *record.user
+	}
+	level, omit := a.policy.levelFor(user, info, r.URL.Path)
+	if level == "None" || slices.Contains(omit, stage) {
+		return
+	}
+	// A request authentication refused has no user: who it claimed to be is
+	// exactly what could not be established.
+	who := map[string]any{}
+	if record.user != nil {
+		who["username"], who["groups"] = user.name, user.groups
+		if user.uid != "" {
+			who["uid"] = user.uid
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	event := map[string]any{
+		"apiVersion":               "audit.k8s.io/v1",
+		"kind":                     "Event",
+		"level":                    level,
+		"auditID":                  id,
+		"stage":                    stage,
+		"requestURI":               r.URL.RequestURI(),
+		"verb":                     info.verb,
+		"user":                     who,
+		"sourceIPs":                []string{host},
+		"userAgent":                r.UserAgent(),
+		"responseStatus":           map[string]any{"code": out.code},
+		"requestReceivedTimestamp": received.UTC().Format(time.RFC3339Nano),
+		"stageTimestamp":           time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if info.resourceRequest {
+		ref := map[string]any{"resource": info.resource, "apiVersion": info.version}
+		for key, value := range map[string]string{"apiGroup": info.group, "namespace": info.namespace, "name": info.name, "subresource": info.subresource} {
+			if value != "" {
+				ref[key] = value
+			}
+		}
+		event["objectRef"] = ref
+	}
+	if auditLevels[level] >= auditLevels["Request"] && len(body) > 0 && json.Valid(body) {
+		event["requestObject"] = json.RawMessage(body)
+	}
+	if level == "RequestResponse" && stage == "ResponseComplete" && out.keep && json.Valid(out.body.Bytes()) {
+		event["responseObject"] = json.RawMessage(out.body.Bytes())
+	}
+	line, err := json.Marshal(event)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "audit: %v\n", err)
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, err := a.out.Write(append(line, '\n')); err != nil {
+		fmt.Fprintf(os.Stderr, "audit: %v\n", err)
+	}
+}
+
+// auditWriter remembers the status code and, unless the response is a
+// stream, the body, for the event written after the handler returns.
+type auditWriter struct {
+	http.ResponseWriter
+	code    int
+	body    bytes.Buffer
+	keep    bool
+	wrote   bool
+	started func()
+}
+
+func (w *auditWriter) WriteHeader(code int) {
+	if !w.wrote {
+		w.wrote, w.code = true, code
+		if w.started != nil {
+			w.started()
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *auditWriter) Write(b []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.keep {
+		w.body.Write(b)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// Flush passes through, or a watch behind the auditor never reaches its client.
+func (w *auditWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
