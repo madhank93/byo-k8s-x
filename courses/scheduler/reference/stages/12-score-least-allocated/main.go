@@ -53,7 +53,8 @@ func leastAllocated(pod *corev1.Pod, node *corev1.Node, placed []*corev1.Pod) in
 	want := requests(pod)
 	used := corev1.ResourceList{}
 	for _, p := range placed {
-		if p.Spec.NodeName != node.Name {
+		// A finished pod holds nothing, here as when deciding what fits.
+		if p.Spec.NodeName != node.Name || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		for name, q := range requests(p) {

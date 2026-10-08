@@ -10,6 +10,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -133,11 +135,18 @@ func stageScoreLeastAllocated(ctx context.Context, env *kube.Env, bin string) er
 	}
 	loaded := workers[0]
 
-	node, err := env.Client.CoreV1().Nodes().Get(ctx, loaded, metav1.GetOptions{})
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
-		return fmt.Errorf("get node %s: %w", loaded, err)
+		return err
 	}
-	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
 	ballast := cpu.MilliValue() * 75 / 100
 	if err := seedBallast(ctx, env, "ballast", loaded, milliCPU(ballast)); err != nil {
 		return err
@@ -201,11 +210,18 @@ func stageTopologySpread(ctx context.Context, env *kube.Env, bin string) error {
 		defer func() { _ = labelNode(context.WithoutCancel(ctx), env, node, zoneKey, "") }()
 	}
 
-	node, err := env.Client.CoreV1().Nodes().Get(ctx, far, metav1.GetOptions{})
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
-		return fmt.Errorf("get node %s: %w", far, err)
+		return err
 	}
-	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
 
 	zero := int64(0)
 	seeded := []string{"ballast-far", "held-1", "held-2"}
@@ -295,11 +311,18 @@ func stagePodAffinity(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	empty, crowded := workers[:2], workers[2]
 
-	node, err := env.Client.CoreV1().Nodes().Get(ctx, crowded, metav1.GetOptions{})
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
-		return fmt.Errorf("get node %s: %w", crowded, err)
+		return err
 	}
-	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
 
 	zero := int64(0)
 	seeded := []string{"ballast-crowded", "cache", "web-1", "web-2"}
@@ -453,11 +476,18 @@ func stageSpreadByOwner(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	crowded, rest := workers[0], workers[1:]
 
-	node, err := env.Client.CoreV1().Nodes().Get(ctx, crowded, metav1.GetOptions{})
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
-		return fmt.Errorf("get node %s: %w", crowded, err)
+		return err
 	}
-	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
 
 	// Enough to make the crowded node the best answer on room, and not enough
 	// to stop anything fitting anywhere.
@@ -845,12 +875,18 @@ func stageScoreBalanced(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	lopsided, level, full := workers[0], workers[1], workers[2]
 
-	node, err := env.Client.CoreV1().Nodes().Get(ctx, lopsided, metav1.GetOptions{})
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
-		return fmt.Errorf("get node %s: %w", lopsided, err)
+		return err
 	}
-	cpu := node.Status.Allocatable[corev1.ResourceCPU]
-	mem := node.Status.Allocatable[corev1.ResourceMemory]
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu, mem := room[corev1.ResourceCPU], room[corev1.ResourceMemory]
 
 	// A pod asking for the same share of each: it leaves the level node level,
 	// so every pod in the run faces the same choice as the first.
@@ -978,10 +1014,30 @@ func seedBallast(ctx context.Context, env *kube.Env, name, node string, asks cor
 			}},
 		},
 	}
-	if _, err := env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("seed ballast pod %s: %w", name, err)
-	}
-	return nil
+	// Ballast only holds room once the kubelet has admitted it. One refused for
+	// room that pods being torn down still hold is tried again until it runs.
+	return waitFor(ctx, "ballast pod "+name+" to run on "+node, 60*time.Second, func(ctx context.Context) (bool, error) {
+		got, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			_, err = env.Client.CoreV1().Pods(env.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+			if apierrors.IsAlreadyExists(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if err != nil {
+			return false, err
+		}
+		if got.Status.Phase == corev1.PodFailed {
+			zero := int64(0)
+			err := env.Client.CoreV1().Pods(env.Namespace).Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return got.Status.Phase == corev1.PodRunning, nil
+	})
 }
 
 // stageRequeue checks a pod that found no node is tried again when the cluster
@@ -1181,6 +1237,33 @@ func workerAllocatable(ctx context.Context, env *kube.Env) (corev1.ResourceList,
 	return smallest, nil
 }
 
+// workerRoom is the cpu and memory no pod has asked for on the fullest worker.
+// After levelWorkers every worker has exactly this much, and it is what a stage
+// counting how many pods fit sizes them against: allocatable alone counts room
+// that pods left by earlier stages, or earlier courses, still hold.
+func workerRoom(ctx context.Context, env *kube.Env) (corev1.ResourceList, error) {
+	list, err := env.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: "!node-role.kubernetes.io/control-plane"})
+	if err != nil {
+		return nil, fmt.Errorf("list worker nodes: %w", err)
+	}
+	if len(list.Items) == 0 {
+		return nil, fmt.Errorf("the cluster has no worker nodes\n  fix: byok8s down && byok8s up")
+	}
+	cpu, mem, err := requestedOn(ctx, env)
+	if err != nil {
+		return nil, err
+	}
+	freeCPU, freeMem := int64(math.MaxInt64), int64(math.MaxInt64)
+	for _, n := range list.Items {
+		freeCPU = min(freeCPU, n.Status.Allocatable.Cpu().MilliValue()-cpu[n.Name])
+		freeMem = min(freeMem, n.Status.Allocatable.Memory().Value()-mem[n.Name])
+	}
+	return corev1.ResourceList{
+		corev1.ResourceCPU:    *apiresource.NewMilliQuantity(freeCPU, apiresource.DecimalSI),
+		corev1.ResourceMemory: *apiresource.NewQuantity(freeMem, apiresource.BinarySI),
+	}, nil
+}
+
 // shareOfCPU is percent of a quantity of cpu, as a request to put on a pod.
 func shareOfCPU(cpu apiresource.Quantity, percent int64) string {
 	return fmt.Sprintf("%dm", cpu.MilliValue()*percent/100)
@@ -1297,19 +1380,25 @@ func dropFakeNode(ctx context.Context, env *kube.Env, name string) {
 // stage. A pod bound where it does not fit is failed by the kubelet, which is
 // how an overcommit shows.
 func stageFitResources(ctx context.Context, env *kube.Env, bin string) error {
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
+	if err != nil {
+		return err
+	}
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	alloc, err := workerAllocatable(ctx, env)
-	if err != nil {
-		return err
-	}
-	cpu, mem := alloc[corev1.ResourceCPU], alloc[corev1.ResourceMemory]
-	// More than half a worker: one such pod fits on a node and two never do,
-	// whatever size the workers happen to be.
+	cpu, mem := room[corev1.ResourceCPU], room[corev1.ResourceMemory]
+	// More than half of what a worker has free: one such pod fits on a node and
+	// two never do, whatever size the workers are and whatever is already on them.
 	for _, ask := range []struct {
 		resource corev1.ResourceName
 		amount   string
@@ -2009,11 +2098,18 @@ func stageVolumeBinding(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	spare, crowded := workers[0], workers[len(workers)-1]
 
-	node, err := env.Client.CoreV1().Nodes().Get(ctx, crowded, metav1.GetOptions{})
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
-		return fmt.Errorf("get node %s: %w", crowded, err)
+		return err
 	}
-	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
 
 	// PersistentVolumes are cluster scoped, so deleting the namespace does not
 	// take them with it and a name reused across runs would meet the leftover.
@@ -2235,10 +2331,10 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 			_ = env.Client.SchedulingV1().PriorityClasses().Delete(back, name, metav1.DeleteOptions{})
 		}
 	}()
-	if err := seedPriorityClass(ctx, env, low, 100); err != nil {
+	if err := seedPriorityClass(ctx, env, low, lowPriority); err != nil {
 		return err
 	}
-	if err := seedPriorityClass(ctx, env, high, 1000); err != nil {
+	if err := seedPriorityClass(ctx, env, high, highPriority); err != nil {
 		return err
 	}
 
@@ -2249,12 +2345,18 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 		defer cordonNode(context.WithoutCancel(ctx), env, w, false)
 	}
 
-	alloc, err := workerAllocatable(ctx, env)
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
 		return err
 	}
-	// More than half a worker each, so a worker that opens has room for one.
-	seat := shareOfCPU(alloc[corev1.ResourceCPU], 60)
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	// More than half of a worker's free room each, so a worker that opens has
+	// room for one.
+	seat := shareOfCPU(room[corev1.ResourceCPU], 60)
 
 	// Six against three: a program that picks without looking at priority is
 	// unlikely to be lucky three times over.
@@ -2321,8 +2423,8 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 		}
 		for name, node := range placed {
 			if !strings.HasPrefix(name, "high-") {
-				return fmt.Errorf("pod %s was placed on %s while a pod of class %s (value 1000) was still waiting: the pods waiting for room are compared by priority, not taken in the order they arrived\nthe program said:\n%s",
-					name, node, high, tail(p.Stdout()))
+				return fmt.Errorf("pod %s was placed on %s while a pod of class %s (value %d) was still waiting: the pods waiting for room are compared by priority, not taken in the order they arrived\nthe program said:\n%s",
+					name, node, high, highPriority, tail(p.Stdout()))
 			}
 		}
 		if len(placed) > i+1 {
@@ -2381,6 +2483,11 @@ func awaitFailedScheduling(ctx context.Context, env *kube.Env, name string, with
 // seedPriorityClass creates a PriorityClass. Admission copies its value into
 // the spec.priority of every pod that names it; the pod never carries the
 // number itself, and the API server refuses one that tries.
+// The priority stages' classes sit below zero, the priority of every pod that
+// names no class, so a scheduler that preempts never makes room out of pods
+// that earlier stages or courses left on the workers.
+const lowPriority, highPriority = -1000, -100
+
 func seedPriorityClass(ctx context.Context, env *kube.Env, name string, value int32) error {
 	pc := &schedulingv1.PriorityClass{
 		ObjectMeta:  metav1.ObjectMeta{Name: name},
@@ -2394,7 +2501,7 @@ func seedPriorityClass(ctx context.Context, env *kube.Env, name string, value in
 }
 
 // seedPriorityPod creates a pod naming this scheduler and one priority class,
-// asking for cpu of a worker's eleven.
+// asking for the given cpu.
 func seedPriorityPod(ctx context.Context, env *kube.Env, name, class, cpu string) error {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace},
@@ -2416,7 +2523,8 @@ func seedPriorityPod(ctx context.Context, env *kube.Env, name, class, cpu string
 	return nil
 }
 
-// placements is every pod in the stage's namespace that has a node, by name.
+// placements is every pod in the stage's namespace that was left to this
+// scheduler and has a node, by name. Ballast pinned to a node is not counted.
 func placements(ctx context.Context, env *kube.Env) (map[string]string, error) {
 	list, err := env.Client.CoreV1().Pods(env.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -2424,7 +2532,7 @@ func placements(ctx context.Context, env *kube.Env) (map[string]string, error) {
 	}
 	placed := map[string]string{}
 	for _, pod := range list.Items {
-		if pod.Spec.NodeName != "" {
+		if pod.Spec.SchedulerName == schedulerName && pod.Spec.NodeName != "" {
 			placed[pod.Name] = pod.Spec.NodeName
 		}
 	}
@@ -2456,10 +2564,10 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 			_ = env.Client.SchedulingV1().PriorityClasses().Delete(back, name, metav1.DeleteOptions{})
 		}
 	}()
-	if err := seedPriorityClass(ctx, env, low, 100); err != nil {
+	if err := seedPriorityClass(ctx, env, low, lowPriority); err != nil {
 		return err
 	}
-	if err := seedPriorityClass(ctx, env, high, 1000); err != nil {
+	if err := seedPriorityClass(ctx, env, high, highPriority); err != nil {
 		return err
 	}
 
@@ -2478,15 +2586,20 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	defer cleanup()
 
-	alloc, err := workerAllocatable(ctx, env)
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
 		return err
 	}
-	// Three of these fill a worker, and what the important pod asks for is
-	// more than one of them leaves behind and less than two do: the answer is
-	// two victims, whatever size the workers are.
-	small := shareOfCPU(alloc[corev1.ResourceCPU], 30)
-	large := shareOfCPU(alloc[corev1.ResourceCPU], 55)
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	// Three of these fill a worker's free room, and what the important pod asks
+	// for is more than one of them leaves behind and less than two do: the
+	// answer is two victims, whatever size the workers are.
+	small := shareOfCPU(room[corev1.ResourceCPU], 30)
+	large := shareOfCPU(room[corev1.ResourceCPU], 55)
 
 	// Three pods on each of three workers, which leaves no worker with the
 	// room the important pod wants: two of the three have to go, and only two,
@@ -2517,15 +2630,15 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	where, err := boundNode(ctx, env, "important", 75*time.Second)
 	if err != nil {
-		return fmt.Errorf("pod important is of class %s (value 1000) and every worker is full of pods of class %s (value 100): the pods in its way matter less than it does, so room is made by evicting them rather than waited for: %w\nthe program said:\n%s",
-			high, low, err, tail(p.Stdout()))
+		return fmt.Errorf("pod important is of class %s (value %d) and every worker is full of pods of class %s (value %d): the pods in its way matter less than it does, so room is made by evicting them rather than waited for: %w\nthe program said:\n%s",
+			high, highPriority, low, lowPriority, err, tail(p.Stdout()))
 	}
 
 	left, err := survivors(ctx, env, "low-")
 	if err != nil {
 		return err
 	}
-	// Two of the three on one worker is what six cpus costs: evicting one
+	// Two of the three on one worker is what pod important costs: evicting one
 	// leaves too little, and evicting three empties a worker for no reason.
 	const want = 2
 	if gone := len(workers)*perNode - len(left); gone != want {
@@ -2558,8 +2671,8 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 		return fmt.Errorf("pod another fits nowhere and may evict nobody, and no FailedScheduling event says so: %w\nthe program said:\n%s", err, tail(p.Stdout()))
 	}
 	if node, err := boundNode(ctx, env, "another", 15*time.Second); err == nil {
-		return fmt.Errorf("pod another is of class %s (value 100), as are the pods already on every worker, and it was placed on %s: a pod may only take room from pods that matter less than it does\nthe program said:\n%s",
-			low, node, tail(p.Stdout()))
+		return fmt.Errorf("pod another is of class %s (value %d), as are the pods already on every worker, and it was placed on %s: a pod may only take room from pods that matter less than it does\nthe program said:\n%s",
+			low, lowPriority, node, tail(p.Stdout()))
 	}
 	if after, err := survivors(ctx, env, "low-"); err != nil {
 		return err
@@ -2735,11 +2848,18 @@ func stageMultiProfile(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	loaded := workers[0]
 
-	node, err := env.Client.CoreV1().Nodes().Get(ctx, loaded, metav1.GetOptions{})
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
-		return fmt.Errorf("get node %s: %w", loaded, err)
+		return err
 	}
-	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
 
 	zero := int64(0)
 	seeded := []string{"ballast-loaded", "spread-me", "pack-me", "not-ours"}
@@ -2848,6 +2968,19 @@ func stagePercentageOfNodes(ctx context.Context, env *kube.Env, bin string) erro
 	}
 	total := len(all.Items)
 
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
+	if err != nil {
+		return err
+	}
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
+
 	zero := int64(0)
 	var seeded []string
 	defer func() {
@@ -2859,11 +2992,6 @@ func stagePercentageOfNodes(ctx context.Context, env *kube.Env, bin string) erro
 	for _, w := range workers[1:] {
 		name := "ballast-" + w
 		seeded = append(seeded, name)
-		node, err := env.Client.CoreV1().Nodes().Get(ctx, w, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("get node %s: %w", w, err)
-		}
-		cpu := node.Status.Allocatable[corev1.ResourceCPU]
 		if err := seedBallast(ctx, env, name, w, milliCPU(cpu.MilliValue()*50/100)); err != nil {
 			return err
 		}
