@@ -86,6 +86,15 @@ func init() {
 // already existed, so one pod is created before the program starts and one
 // while it runs. A pod naming another scheduler is not this program's.
 func stageWatchUnscheduled(ctx context.Context, env *kube.Env, bin string) error {
+	zero := int64(0)
+	seeded := []string{"before", "elsewhere", "after"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+
 	if err := seedPod(ctx, env, "before", schedulerName); err != nil {
 		return err
 	}
@@ -168,7 +177,14 @@ func stageScoreLeastAllocated(ctx context.Context, env *kube.Env, bin string) er
 
 	// One pod per worker and one more: a program that ignores the scores and
 	// takes nodes in turn has to land on the loaded one within this many.
-	for _, name := range []string{"small-1", "small-2", "small-3", "small-4"} {
+	small := []string{"small-1", "small-2", "small-3", "small-4"}
+	defer func() {
+		for _, name := range small {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	for _, name := range small {
 		if err := seedPod(ctx, env, name, schedulerName); err != nil {
 			return err
 		}
@@ -1064,6 +1080,12 @@ func stageRequeue(ctx context.Context, env *kube.Env, bin string) error {
 		}
 	}()
 
+	zero := int64(0)
+	defer func() {
+		_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), "later",
+			metav1.DeleteOptions{GracePeriodSeconds: &zero})
+	}()
+
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
 		return err
@@ -1094,6 +1116,15 @@ func stageRequeue(ctx context.Context, env *kube.Env, bin string) error {
 // they expected, so both answers belong there: a Normal event naming the node
 // when the pod is placed, and a Warning when nothing fits.
 func stageEvents(ctx context.Context, env *kube.Env, bin string) error {
+	zero := int64(0)
+	seeded := []string{"placed", "nowhere"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
 		return err
@@ -1167,6 +1198,15 @@ func stageBind(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	target := workers[len(workers)-1]
+
+	zero := int64(0)
+	seeded := []string{"before", "after"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
 
 	if err := seedPod(ctx, env, "before", schedulerName); err != nil {
 		return err
@@ -1309,6 +1349,13 @@ func stageNodeList(ctx context.Context, env *kube.Env, bin string) error {
 	defer cleanup()
 
 	var names []string
+	zero := int64(0)
+	defer func() {
+		for _, name := range names {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
 	for i := 1; i <= 10; i++ {
 		name := fmt.Sprintf("pod-%02d", i)
 		names = append(names, name)
@@ -1494,6 +1541,11 @@ func stageFitPorts(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 
+	zero := int64(0)
+	defer func() {
+		_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), "other-port",
+			metav1.DeleteOptions{GracePeriodSeconds: &zero})
+	}()
 	if err := seedPortPod(ctx, env, "other-port", 8081); err != nil {
 		return err
 	}
@@ -1547,6 +1599,15 @@ func stageTaints(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	defer taintNode(context.WithoutCancel(ctx), env, tainted, key, "", "")
 
+	zero := int64(0)
+	seeded := []string{"tolerating"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
 		return err
@@ -1557,6 +1618,7 @@ func stageTaints(ctx context.Context, env *kube.Env, bin string) error {
 	// on the control plane, which carries a NoSchedule taint of its own.
 	for i := 1; i <= 4; i++ {
 		name := fmt.Sprintf("plain-%d", i)
+		seeded = append(seeded, name)
 		if err := seedPod(ctx, env, name, schedulerName); err != nil {
 			return err
 		}
@@ -1614,6 +1676,15 @@ func stageUnschedulable(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	defer cordonNode(context.WithoutCancel(ctx), env, closed, false)
 
+	zero := int64(0)
+	seeded := []string{"tolerating"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
 		return err
@@ -1622,6 +1693,7 @@ func stageUnschedulable(ctx context.Context, env *kube.Env, bin string) error {
 
 	for i := 1; i <= 3; i++ {
 		name := fmt.Sprintf("plain-%d", i)
+		seeded = append(seeded, name)
 		if err := seedPod(ctx, env, name, schedulerName); err != nil {
 			return err
 		}
@@ -1678,6 +1750,15 @@ func stageNodeAffinity(ctx context.Context, env *kube.Env, bin string) error {
 		}
 		defer labelNode(context.WithoutCancel(ctx), env, l.node, l.key, "")
 	}
+
+	zero := int64(0)
+	seeded := []string{"nowhere", "or-terms", "and-expressions", "not-in-west"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
 
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
@@ -1769,6 +1850,15 @@ func stageNodeSelector(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	defer labelNode(context.WithoutCancel(ctx), env, chosen, key, "")
+
+	zero := int64(0)
+	seeded := []string{"nowhere", "selecting-1", "selecting-2", "selecting-3"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
 
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
