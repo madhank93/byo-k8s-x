@@ -9,10 +9,18 @@ package safeapply
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
+	"sigs.k8s.io/yaml"
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
 	"github.com/madhank93/byo-k8s-x/internal/runner"
@@ -35,6 +43,7 @@ func Lookup(slug string) (Stage, bool) {
 func init() {
 	register(Stage{Slug: "manifest-load", Run: stageManifestLoad})
 	register(Stage{Slug: "live-fetch", Run: stageLiveFetch})
+	register(Stage{Slug: "three-way-merge", Run: stageThreeWayMerge})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -151,6 +160,146 @@ metadata:
 	}
 	if res.ExitCode == 0 {
 		return fmt.Errorf("the server serves no example.com/v1 Widget, so that is an error, not an absent object; got exit 0 and:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// seedLastApplied sets up an object the way a client-side apply followed by
+// someone else's edit leaves it: byok8s owns a and b, other-tool added c, and
+// the last-applied annotation records {a, b}. The annotation belongs to
+// other-tool, so a server-side apply by byok8s that omits it leaves it alone.
+func seedLastApplied(w *work, name string, mine map[string]string, theirs map[string]string) error {
+	body, _ := json.Marshal(mine)
+	if err := w.applyAs("byok8s", fmt.Sprintf("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata: %s\n", name, body)); err != nil {
+		return err
+	}
+	last, _ := json.Marshal(map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap",
+		"metadata": map[string]any{"name": name}, "data": mine,
+	})
+	other := map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap",
+		"metadata": map[string]any{"name": name, "annotations": map[string]string{
+			"kubectl.kubernetes.io/last-applied-configuration": string(last),
+		}},
+	}
+	if len(theirs) > 0 {
+		other["data"] = theirs
+	}
+	b, _ := json.Marshal(other)
+	return w.applyAs("other-tool", string(b))
+}
+
+// stageThreeWayMerge — the patch takes live to desired, removing only what the
+// last-applied record says this manifest used to set.
+func stageThreeWayMerge(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := seedLastApplied(w, "web", map[string]string{"a": "1", "b": "2"}, map[string]string{"c": "3"}); err != nil {
+		return err
+	}
+	if err := seedLastApplied(w, "same", map[string]string{"x": "1"}, nil); err != nil {
+		return err
+	}
+
+	m := w.file("m.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web
+data:
+  a: 1x
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: same
+data:
+  x: "1"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: new
+data:
+  n: "1"
+`)
+	res, err := w.run("patch", "-f", m)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	got := map[string]string{}
+	for _, l := range lines(res.Stdout) {
+		k, v, _ := strings.Cut(l, " ")
+		got[k] = v
+	}
+	if got["ConfigMap/new"] != "create" {
+		return fmt.Errorf("ConfigMap/new does not exist yet, so expected the line \"ConfigMap/new create\", got:\n%s", tail(res.Stdout))
+	}
+	for name, want := range map[string]string{
+		"ConfigMap/web":  `{"data":{"a":"1x","b":null}}`,
+		"ConfigMap/same": `{}`,
+	} {
+		if err := sameJSON(got[name], want); err != nil {
+			return fmt.Errorf("%s: expected the patch %s, got %q: %v\n(b was last applied and is gone from the manifest, so it is deleted; c was added by someone else, so it is kept)\nstdout:\n%s",
+				name, want, got[name], err, tail(res.Stdout))
+		}
+	}
+	return nil
+}
+
+// sameJSON compares two JSON documents by value, not by spelling.
+func sameJSON(got, want string) error {
+	var g, x any
+	if err := json.Unmarshal([]byte(got), &g); err != nil {
+		return fmt.Errorf("not JSON")
+	}
+	if err := json.Unmarshal([]byte(want), &x); err != nil {
+		panic(err)
+	}
+	if !reflect.DeepEqual(g, x) {
+		return fmt.Errorf("different")
+	}
+	return nil
+}
+
+// gvrs are the kinds the stages seed. The harness knows them by name rather
+// than through discovery, because the seeding must not depend on anything the
+// learner is building.
+var gvrs = map[string]schema.GroupVersionResource{
+	"ConfigMap":  {Version: "v1", Resource: "configmaps"},
+	"Secret":     {Version: "v1", Resource: "secrets"},
+	"Deployment": {Group: "apps", Version: "v1", Resource: "deployments"},
+}
+
+// applyAs server-side applies a YAML or JSON object into the stage namespace
+// as some other field manager, forcing, so a stage can stage ownership.
+func (w *work) applyAs(manager, body string) error {
+	js, err := yaml.YAMLToJSON([]byte(body))
+	if err != nil {
+		panic(err)
+	}
+	var meta struct {
+		Kind     string
+		Metadata struct{ Name string }
+	}
+	if err := json.Unmarshal(js, &meta); err != nil {
+		panic(err)
+	}
+	dyn, err := dynamic.NewForConfig(w.env.Config)
+	if err != nil {
+		return err
+	}
+	force := true
+	_, err = dyn.Resource(gvrs[meta.Kind]).Namespace(w.env.Namespace).Patch(w.ctx, meta.Metadata.Name,
+		types.ApplyPatchType, js, metav1.PatchOptions{FieldManager: manager, Force: &force})
+	if err != nil {
+		return fmt.Errorf("seed %s/%s as %s: %w", meta.Kind, meta.Metadata.Name, manager, err)
 	}
 	return nil
 }

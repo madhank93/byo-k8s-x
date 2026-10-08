@@ -3,12 +3,15 @@
 // Stage 1: `objects -f FILE` reads a multi-document manifest and prints one
 // Kind/name line per object.
 // Stage 2: `get -f FILE` says which of those objects the cluster already has.
+// Stage 3: `patch -f FILE` computes the three-way merge patch client-side
+// apply would send.
 
 package main
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/jsonmergepatch"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
@@ -73,6 +77,27 @@ func run(cmd, file string) (int, error) {
 				state = "present"
 			}
 			fmt.Println(ref(o), state)
+		}
+		return 0, nil
+	case "patch":
+		c, objs, err := setup(file)
+		if err != nil {
+			return 2, err
+		}
+		for _, o := range objs {
+			live, err := c.live(o)
+			if err != nil {
+				return 2, err
+			}
+			if live == nil {
+				fmt.Println(ref(o), "create")
+				continue
+			}
+			p, err := threeWay(o, live)
+			if err != nil {
+				return 2, fmt.Errorf("%s: %w", ref(o), err)
+			}
+			fmt.Println(ref(o), string(p))
 		}
 		return 0, nil
 	}
@@ -156,6 +181,48 @@ func (c *client) live(o *unstructured.Unstructured) (*unstructured.Unstructured,
 		return nil, fmt.Errorf("%s: %w", ref(o), err)
 	}
 	return l, nil
+}
+
+// lastApplied is where client-side apply keeps what it sent last time.
+const lastApplied = "kubectl.kubernetes.io/last-applied-configuration"
+
+// threeWay is the JSON merge patch that takes live to desired. Changes come from
+// comparing live with desired; deletions only from comparing last-applied with
+// desired, so a field someone else added is left alone while a field this
+// manifest used to set and no longer does is removed.
+func threeWay(desired, live *unstructured.Unstructured) ([]byte, error) {
+	original := []byte("{}")
+	if a := live.GetAnnotations()[lastApplied]; a != "" {
+		original = []byte(a)
+	}
+	modified, err := json.Marshal(withoutLastApplied(desired).Object)
+	if err != nil {
+		return nil, err
+	}
+	current, err := json.Marshal(withoutLastApplied(live).Object)
+	if err != nil {
+		return nil, err
+	}
+	var orig map[string]any
+	if err := json.Unmarshal(original, &orig); err != nil {
+		return nil, fmt.Errorf("unreadable %s annotation: %w", lastApplied, err)
+	}
+	original, err = json.Marshal(withoutLastApplied(&unstructured.Unstructured{Object: orig}).Object)
+	if err != nil {
+		return nil, err
+	}
+	return jsonmergepatch.CreateThreeWayJSONMergePatch(original, modified, current)
+}
+
+// withoutLastApplied is a copy with the annotation removed, so the bookkeeping
+// never shows up as a change of its own.
+func withoutLastApplied(o *unstructured.Unstructured) *unstructured.Unstructured {
+	c := o.DeepCopy()
+	unstructured.RemoveNestedField(c.Object, "metadata", "annotations", lastApplied)
+	if a, ok, _ := unstructured.NestedMap(c.Object, "metadata", "annotations"); ok && len(a) == 0 {
+		unstructured.RemoveNestedField(c.Object, "metadata", "annotations")
+	}
+	return c
 }
 
 // load reads every object in a manifest. YAML and JSON documents may be mixed,
