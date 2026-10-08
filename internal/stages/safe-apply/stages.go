@@ -52,6 +52,7 @@ func init() {
 	register(Stage{Slug: "server-dry-run", Run: stageServerDryRun})
 	register(Stage{Slug: "admission-preview", Run: stageAdmissionPreview})
 	register(Stage{Slug: "managed-fields", Run: stageManagedFields})
+	register(Stage{Slug: "field-ownership", Run: stageFieldOwnership})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -649,6 +650,86 @@ func stageManagedFields(ctx context.Context, env *kube.Env, bin string) error {
 		".data.b other-tool Apply",
 		".data.e kubectl-edit Update",
 	)
+}
+
+// stageFieldOwnership — apply writes as byok8s, and dropping a field from the
+// manifest removes it only where byok8s was its sole owner.
+func stageFieldOwnership(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	res, err := w.run("apply", "-f", w.file("v1.yaml", cm("owned", map[string]string{"mine": "1", "shared": "s", "keep": "k"})))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if !strings.Contains(res.Stdout, "ConfigMap/owned applied") {
+		return fmt.Errorf("expected \"ConfigMap/owned applied\", got:\n%s", tail(res.Stdout))
+	}
+	got, err := env.ConfigMap(ctx, "owned")
+	if err != nil {
+		return fmt.Errorf("apply exited 0 but there is no ConfigMap: %w", err)
+	}
+	if !hasApply(got.ManagedFields, "byok8s") {
+		return fmt.Errorf("expected an Apply entry for field manager byok8s, managers seen: %v", managers(got.ManagedFields))
+	}
+	if err := w.applyAs("other-tool", cm("owned", map[string]string{"shared": "s", "theirs": "t"})); err != nil {
+		return err
+	}
+
+	v2 := w.file("v2.yaml", cm("owned", map[string]string{"keep": "k"}))
+	res, err = w.run("diff", "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	if err := hasLines(parseDiff(res.Stdout), "ConfigMap/owned", `- .data.mine: "1"`); err != nil {
+		return fmt.Errorf("%w\nstdout:\n%s", err, tail(res.Stdout))
+	}
+	if strings.Contains(res.Stdout, ".data.shared") {
+		return fmt.Errorf("data.shared is co-owned by other-tool, so dropping it from the manifest does not remove it; the diff says otherwise:\n%s", tail(res.Stdout))
+	}
+
+	res, err = w.run("apply", "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	got, err = env.ConfigMap(ctx, "owned")
+	if err != nil {
+		return err
+	}
+	want := map[string]string{"keep": "k", "shared": "s", "theirs": "t"}
+	if !reflect.DeepEqual(got.Data, want) {
+		return fmt.Errorf("after applying v2, expected data %v (mine was byok8s's alone and is gone; shared and theirs belong to other-tool too), got %v", want, got.Data)
+	}
+	return nil
+}
+
+func hasApply(fields []metav1.ManagedFieldsEntry, manager string) bool {
+	for _, f := range fields {
+		if f.Manager == manager && f.Operation == metav1.ManagedFieldsOperationApply {
+			return true
+		}
+	}
+	return false
+}
+
+func managers(fields []metav1.ManagedFieldsEntry) []string {
+	var out []string
+	for _, f := range fields {
+		out = append(out, f.Manager+"/"+string(f.Operation))
+	}
+	return out
 }
 
 // parseDiff groups diff output by object: an unindented line names an object,

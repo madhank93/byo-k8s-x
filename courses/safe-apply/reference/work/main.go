@@ -13,6 +13,7 @@
 // Stage 7: an object the server refuses is reported with its reason, and the
 // rest of the diff still runs.
 // Stage 8: `owners -f FILE` reads managedFields: who owns each field, and how.
+// Stage 9: `apply -f FILE` applies for real, letting go of fields it drops.
 
 package main
 
@@ -173,6 +174,18 @@ func run(cmd string, opt opts) (int, error) {
 			return 2, nil
 		case changed:
 			return 1, nil
+		}
+		return 0, nil
+	case "apply":
+		c, objs, err := setup(file)
+		if err != nil {
+			return 2, err
+		}
+		for _, o := range objs {
+			if _, err := c.apply(o, false); err != nil {
+				return 1, fmt.Errorf("%s: %w", ref(o), err)
+			}
+			fmt.Println(ref(o), "applied")
 		}
 		return 0, nil
 	case "owners":
