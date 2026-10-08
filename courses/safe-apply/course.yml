@@ -1,0 +1,59 @@
+slug: safe-apply
+name: Build your own diff and safe apply
+language: go
+entrypoint: main.go
+stages:
+  - slug: manifest-load
+    name: Read the manifests
+    difficulty: easy
+  - slug: live-fetch
+    name: Find what is already there
+    difficulty: medium
+  - slug: three-way-merge
+    name: Merge three ways
+    difficulty: hard
+  - slug: structured-diff
+    name: Say what changes, field by field
+    difficulty: hard
+  - slug: diff-render
+    name: Render it like diff(1)
+    difficulty: medium
+  - slug: server-dry-run
+    name: Let the server do the merge
+    difficulty: hard
+  - slug: admission-preview
+    name: Hear admission's verdict first
+    difficulty: medium
+  - slug: managed-fields
+    name: Read who owns what
+    difficulty: medium
+  - slug: field-ownership
+    name: Apply, and let go of what you drop
+    difficulty: medium
+  - slug: conflict-detect
+    name: Stop at someone else's field
+    difficulty: hard
+  - slug: force-conflicts
+    name: Take the field, deliberately
+    difficulty: medium
+  - slug: prune-plan
+    name: Find what you left behind
+    difficulty: hard
+  - slug: prune-guard
+    name: Never delete the wrong thing
+    difficulty: hard
+  - slug: drift-detect
+    name: Notice what changed behind your back
+    difficulty: hard
+  - slug: impact-report
+    name: Summarise what a change will do
+    difficulty: medium
+  - slug: plan-file
+    name: Write the plan down
+    difficulty: medium
+  - slug: apply-plan
+    name: Apply exactly the plan
+    difficulty: hard
+  - slug: kubectl-parity
+    name: Agree with kubectl
+    difficulty: hard
