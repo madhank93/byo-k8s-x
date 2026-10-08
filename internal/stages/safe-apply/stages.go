@@ -34,6 +34,7 @@ func Lookup(slug string) (Stage, bool) {
 
 func init() {
 	register(Stage{Slug: "manifest-load", Run: stageManifestLoad})
+	register(Stage{Slug: "live-fetch", Run: stageLiveFetch})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -87,6 +88,69 @@ metadata:
 		if res.ExitCode == 0 {
 			return fmt.Errorf("%s is not a usable manifest, but the program exited 0 with:\n%s", name, tail(res.Stdout))
 		}
+	}
+	return nil
+}
+
+// stageLiveFetch — each object is looked up where it would be applied: the
+// manifest's namespace if it names one, the context's if not, and none at all
+// for a cluster-scoped kind.
+func stageLiveFetch(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := env.SeedConfigMap(ctx, "exists"); err != nil {
+		return err
+	}
+
+	m := w.file("m.yaml", fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: exists
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: missing
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: %s
+`, env.Namespace))
+	res, err := w.run("get", "-f", m)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	want := []string{
+		"ConfigMap/exists present",
+		"ConfigMap/missing absent",
+		"ConfigMap/coredns present",
+		"Namespace/" + env.Namespace + " present",
+	}
+	if got := lines(res.Stdout); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		return fmt.Errorf("expected:\n  %s\ngot:\n%s\n(coredns lives in kube-system, which the manifest names; a Namespace has no namespace of its own)",
+			strings.Join(want, "\n  "), tail(res.Stdout))
+	}
+
+	unknown := w.file("unknown.yaml", "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w\n")
+	res, err = w.run("get", "-f", unknown)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return fmt.Errorf("the server serves no example.com/v1 Widget, so that is an error, not an absent object; got exit 0 and:\n%s", tail(res.Stdout))
 	}
 	return nil
 }
