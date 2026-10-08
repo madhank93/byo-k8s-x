@@ -2458,12 +2458,18 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 				metav1.DeleteOptions{GracePeriodSeconds: &zero})
 		}
 	}()
-	// The unimportant pods are created first, and so have waited longest.
-	for _, batch := range []struct {
+	// The unimportant pods are created first, and so have waited longest. A
+	// creation timestamp counts whole seconds, so the batches are a second
+	// apart: arrival order has to be visible for taking it instead of priority
+	// to show.
+	for b, batch := range []struct {
 		prefix string
 		class  string
 		count  int
 	}{{"low", low, 6}, {"high", high, 3}} {
+		if b > 0 {
+			time.Sleep(1100 * time.Millisecond)
+		}
 		for i := 1; i <= batch.count; i++ {
 			name := fmt.Sprintf("%s-%d", batch.prefix, i)
 			if err := seedPriorityPod(ctx, env, name, batch.class, seat); err != nil {
