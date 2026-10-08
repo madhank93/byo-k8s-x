@@ -10,6 +10,8 @@
 // Stage 5: `diff --unified` renders the same comparison as diff(1) over YAML.
 // Stage 6: the would-be object comes from a server-side apply dry-run, not a
 // local merge.
+// Stage 7: an object the server refuses is reported with its reason, and the
+// rest of the diff still runs.
 
 package main
 
@@ -128,19 +130,30 @@ func run(cmd string, opt opts) (int, error) {
 			return 2, err
 		}
 		var pairs [][2]*unstructured.Unstructured
+		refused := false
 		for _, o := range objs {
 			live, err := c.live(o)
 			if err != nil {
 				return 2, err
 			}
 			after, err := c.after(o)
+			if refusal(err) {
+				refused = true
+				fmt.Printf("%s: rejected: %s\n", ref(o), err)
+				pairs = append(pairs, [2]*unstructured.Unstructured{nil, nil})
+				continue
+			}
 			if err != nil {
 				return 2, fmt.Errorf("%s: %w", ref(o), err)
 			}
 			pairs = append(pairs, [2]*unstructured.Unstructured{live, after})
 		}
 		if opt.unified {
-			return unified(pairs)
+			code, err := unified(pairs)
+			if refused && err == nil {
+				code = 2
+			}
+			return code, err
 		}
 		changed := false
 		for i, o := range objs {
@@ -153,7 +166,10 @@ func run(cmd string, opt opts) (int, error) {
 				}
 			}
 		}
-		if changed {
+		switch {
+		case refused:
+			return 2, nil
+		case changed:
 			return 1, nil
 		}
 		return 0, nil
@@ -248,6 +264,13 @@ func (c *client) live(o *unstructured.Unstructured) (*unstructured.Unstructured,
 // defaulting, admission and the ownership merge, and stops before storage.
 func (c *client) after(o *unstructured.Unstructured) (*unstructured.Unstructured, error) {
 	return c.apply(o, true)
+}
+
+// refusal reports whether err is the server answering no — admission,
+// validation, a conflict — rather than failing to answer at all.
+func refusal(err error) bool {
+	var status apierrors.APIStatus
+	return errors.As(err, &status)
 }
 
 // apply server-side applies one object as this client's field manager.

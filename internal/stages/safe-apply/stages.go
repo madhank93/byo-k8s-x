@@ -16,6 +16,9 @@ import (
 	"reflect"
 	"strings"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -47,6 +50,7 @@ func init() {
 	register(Stage{Slug: "structured-diff", Run: stageStructuredDiff})
 	register(Stage{Slug: "diff-render", Run: stageDiffRender})
 	register(Stage{Slug: "server-dry-run", Run: stageServerDryRun})
+	register(Stage{Slug: "admission-preview", Run: stageAdmissionPreview})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -448,6 +452,139 @@ func stageServerDryRun(ctx context.Context, env *kube.Env, bin string) error {
 		return fmt.Errorf("diff created Deployment/fresh — a dry-run must never be stored")
 	}
 	return nil
+}
+
+// denyMessage is what the stage's admission policy says when it refuses.
+const denyMessage = "a ConfigMap here may not carry the key forbidden"
+
+// stageAdmissionPreview — admission runs on a dry-run, so the diff shows what
+// it would add and reports what it would refuse, without stopping the rest.
+func stageAdmissionPreview(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	_, err = env.Client.CoreV1().LimitRanges(env.Namespace).Create(ctx, &corev1.LimitRange{
+		ObjectMeta: metav1.ObjectMeta{Name: "defaults"},
+		Spec: corev1.LimitRangeSpec{Limits: []corev1.LimitRangeItem{{
+			Type:    corev1.LimitTypeContainer,
+			Default: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+		}}},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("seed LimitRange: %w", err)
+	}
+	cleanup, err := denyForbiddenKey(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	res, err := w.run("diff", "-f", w.file("m.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bad
+data:
+  forbidden: "yes"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+spec:
+  containers:
+  - name: app
+    image: `+pause+`
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: good
+data:
+  fine: "yes"
+`))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 2); err != nil {
+		return fmt.Errorf("the server refused one object, so the diff is incomplete and exits 2: %w", err)
+	}
+	var reported bool
+	for _, l := range lines(res.Stdout) {
+		if strings.HasPrefix(l, "ConfigMap/bad") && strings.Contains(l, "rejected") && strings.Contains(l, denyMessage) {
+			reported = true
+		}
+	}
+	if !reported {
+		return fmt.Errorf("expected a line starting \"ConfigMap/bad\" that says rejected and carries the policy's message %q, got:\n%s", denyMessage, tail(res.Stdout))
+	}
+	d := parseDiff(res.Stdout)
+	if err := hasLines(d, "ConfigMap/good", `+ .data.fine: "yes"`); err != nil {
+		return fmt.Errorf("one refusal must not hide the rest of the diff: %w", err)
+	}
+	if !strings.Contains(strings.Join(d["Pod/pod"], "\n"), "250m") {
+		return fmt.Errorf("the LimitRange defaults the container's cpu limit to 250m at admission, so the dry-run Pod carries it; got:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// denyForbiddenKey installs a ValidatingAdmissionPolicy, bound to the stage's
+// namespace only, and waits until the API server enforces it.
+func denyForbiddenKey(ctx context.Context, env *kube.Env) (func(), error) {
+	name := "byok8s-safe-apply-" + env.Namespace
+	adm := env.Client.AdmissionregistrationV1()
+	cleanup := func() {
+		bg := context.Background()
+		adm.ValidatingAdmissionPolicyBindings().Delete(bg, name, metav1.DeleteOptions{})
+		adm.ValidatingAdmissionPolicies().Delete(bg, name, metav1.DeleteOptions{})
+	}
+	cleanup()
+	fail := admissionv1.Fail
+	_, err := adm.ValidatingAdmissionPolicies().Create(ctx, &admissionv1.ValidatingAdmissionPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: admissionv1.ValidatingAdmissionPolicySpec{
+			FailurePolicy: &fail,
+			MatchConstraints: &admissionv1.MatchResources{ResourceRules: []admissionv1.NamedRuleWithOperations{{
+				RuleWithOperations: admissionv1.RuleWithOperations{
+					Operations: []admissionv1.OperationType{admissionv1.Create, admissionv1.Update},
+					Rule:       admissionv1.Rule{APIGroups: []string{""}, APIVersions: []string{"v1"}, Resources: []string{"configmaps"}},
+				},
+			}}},
+			Validations: []admissionv1.Validation{{
+				Expression: "!has(object.data) || !('forbidden' in object.data)",
+				Message:    denyMessage,
+			}},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("create admission policy: %w", err)
+	}
+	_, err = adm.ValidatingAdmissionPolicyBindings().Create(ctx, &admissionv1.ValidatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+			PolicyName:        name,
+			ValidationActions: []admissionv1.ValidationAction{admissionv1.Deny},
+			MatchResources: &admissionv1.MatchResources{NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"kubernetes.io/metadata.name": env.Namespace},
+			}},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("bind admission policy: %w", err)
+	}
+	probe := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "probe"}, Data: map[string]string{"forbidden": "x"}}
+	err = kube.WaitFor(ctx, "the admission policy to take effect", func(ctx context.Context) (bool, error) {
+		_, err := env.Client.CoreV1().ConfigMaps(env.Namespace).Create(ctx, probe, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+		return err != nil && strings.Contains(err.Error(), denyMessage), nil
+	})
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	return cleanup, nil
 }
 
 // parseDiff groups diff output by object: an unindented line names an object,
