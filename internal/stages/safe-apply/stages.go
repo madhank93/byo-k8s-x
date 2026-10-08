@@ -44,6 +44,7 @@ func init() {
 	register(Stage{Slug: "manifest-load", Run: stageManifestLoad})
 	register(Stage{Slug: "live-fetch", Run: stageLiveFetch})
 	register(Stage{Slug: "three-way-merge", Run: stageThreeWayMerge})
+	register(Stage{Slug: "structured-diff", Run: stageStructuredDiff})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -224,7 +225,7 @@ kind: ConfigMap
 metadata:
   name: new
 data:
-  n: "1"
+  added: "1"
 `)
 	res, err := w.run("patch", "-f", m)
 	if err != nil {
@@ -248,6 +249,116 @@ data:
 		if err := sameJSON(got[name], want); err != nil {
 			return fmt.Errorf("%s: expected the patch %s, got %q: %v\n(b was last applied and is gone from the manifest, so it is deleted; c was added by someone else, so it is kept)\nstdout:\n%s",
 				name, want, got[name], err, tail(res.Stdout))
+		}
+	}
+	return nil
+}
+
+// stageStructuredDiff — one line per changed field, nothing for an unchanged
+// object, and kubectl diff's exit codes.
+func stageStructuredDiff(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := seedLastApplied(w, "web", map[string]string{"a": "1", "b": "2"}, map[string]string{"c": "3"}); err != nil {
+		return err
+	}
+	if err := seedLastApplied(w, "same", map[string]string{"x": "1"}, nil); err != nil {
+		return err
+	}
+	same := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: same
+data:
+  x: "1"
+`
+	m := w.file("m.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web
+data:
+  a: 1x
+  d: "4"
+---
+`+same+`---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: new
+data:
+  added: "1"
+`)
+	res, err := w.run("diff", "-f", m)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return fmt.Errorf("something would change, so diff exits 1: %w", err)
+	}
+	d := parseDiff(res.Stdout)
+	if err := hasLines(d, "ConfigMap/web", `~ .data.a: "1" -> "1x"`, `- .data.b: "2"`, `+ .data.d: "4"`); err != nil {
+		return fmt.Errorf("%w\nstdout:\n%s", err, tail(res.Stdout))
+	}
+	for _, l := range d["ConfigMap/web"] {
+		if strings.Contains(l, ".data.c") {
+			return fmt.Errorf("data.c was set by another manager and is not this manifest's to remove, but the diff says %q", l)
+		}
+	}
+	if err := hasLines(d, "ConfigMap/new", `+ .data.added: "1"`); err != nil {
+		return fmt.Errorf("%w\nstdout:\n%s", err, tail(res.Stdout))
+	}
+	if _, ok := d["ConfigMap/same"]; ok {
+		return fmt.Errorf("ConfigMap/same would not change and should not be listed, got:\n%s", tail(res.Stdout))
+	}
+
+	res, err = w.run("diff", "-f", w.file("same.yaml", same))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("nothing would change, so diff exits 0: %w", err)
+	}
+	if strings.TrimSpace(res.Stdout) != "" {
+		return fmt.Errorf("nothing would change, so diff prints nothing, got:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// parseDiff groups diff output by object: an unindented line names an object,
+// and the indented lines after it are its changes.
+func parseDiff(out string) map[string][]string {
+	d := map[string][]string{}
+	cur := ""
+	for _, l := range strings.Split(out, "\n") {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		if l[0] != ' ' && l[0] != '\t' {
+			cur = strings.TrimSpace(l)
+			d[cur] = d[cur]
+			continue
+		}
+		d[cur] = append(d[cur], strings.TrimSpace(l))
+	}
+	return d
+}
+
+// hasLines checks an object is in the diff with each of the given changes.
+func hasLines(d map[string][]string, obj string, want ...string) error {
+	got, ok := d[obj]
+	if !ok {
+		return fmt.Errorf("expected %s in the diff, and it is not there", obj)
+	}
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			found = found || g == w
+		}
+		if !found {
+			return fmt.Errorf("expected the line %q under %s, got:\n  %s", w, obj, strings.Join(got, "\n  "))
 		}
 	}
 	return nil

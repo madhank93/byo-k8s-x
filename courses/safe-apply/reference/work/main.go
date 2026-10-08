@@ -5,6 +5,8 @@
 // Stage 2: `get -f FILE` says which of those objects the cluster already has.
 // Stage 3: `patch -f FILE` computes the three-way merge patch client-side
 // apply would send.
+// Stage 4: `diff -f FILE` lists the field-level changes, and exits 0 for none,
+// 1 for some, 2 when it cannot tell.
 
 package main
 
@@ -17,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -29,6 +32,8 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
+
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 )
 
 func main() {
@@ -98,6 +103,33 @@ func run(cmd, file string) (int, error) {
 				return 2, fmt.Errorf("%s: %w", ref(o), err)
 			}
 			fmt.Println(ref(o), string(p))
+		}
+		return 0, nil
+	case "diff":
+		c, objs, err := setup(file)
+		if err != nil {
+			return 2, err
+		}
+		changed := false
+		for _, o := range objs {
+			live, err := c.live(o)
+			if err != nil {
+				return 2, err
+			}
+			after, err := c.after(o, live)
+			if err != nil {
+				return 2, fmt.Errorf("%s: %w", ref(o), err)
+			}
+			if d := fieldDiff(live, after); len(d) > 0 {
+				changed = true
+				fmt.Println(ref(o))
+				for _, l := range d {
+					fmt.Println("  " + l)
+				}
+			}
+		}
+		if changed {
+			return 1, nil
 		}
 		return 0, nil
 	}
@@ -181,6 +213,84 @@ func (c *client) live(o *unstructured.Unstructured) (*unstructured.Unstructured,
 		return nil, fmt.Errorf("%s: %w", ref(o), err)
 	}
 	return l, nil
+}
+
+// after is the object as it would be once the manifest is applied: the
+// manifest itself for a create, live with the three-way patch for an update.
+func (c *client) after(o, live *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+	if live == nil {
+		return o, nil
+	}
+	p, err := threeWay(o, live)
+	if err != nil {
+		return nil, err
+	}
+	cur, err := json.Marshal(live.Object)
+	if err != nil {
+		return nil, err
+	}
+	merged, err := jsonpatch.MergePatch(cur, p)
+	if err != nil {
+		return nil, err
+	}
+	out := &unstructured.Unstructured{}
+	return out, json.Unmarshal(merged, &out.Object)
+}
+
+// fieldDiff lists what changes between two versions of an object, one line per
+// leaf field, sorted by path. Lists are compared whole: telling which element
+// moved needs the list's merge key, and a whole-list line is never wrong.
+func fieldDiff(before, after *unstructured.Unstructured) []string {
+	b, a := leaves(before), leaves(after)
+	var out []string
+	for p, av := range a {
+		bv, ok := b[p]
+		switch {
+		case !ok:
+			out = append(out, fmt.Sprintf("+ %s: %s", p, av))
+		case bv != av:
+			out = append(out, fmt.Sprintf("~ %s: %s -> %s", p, bv, av))
+		}
+	}
+	for p, bv := range b {
+		if _, ok := a[p]; !ok {
+			out = append(out, fmt.Sprintf("- %s: %s", p, bv))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][2:] < out[j][2:] })
+	return out
+}
+
+// noise is server bookkeeping that changes on every write and says nothing
+// about what the write meant.
+var noise = [][]string{
+	{"metadata", "managedFields"},
+	{"metadata", "resourceVersion"},
+}
+
+// leaves flattens an object into path → JSON value. A nil object has none.
+func leaves(o *unstructured.Unstructured) map[string]string {
+	out := map[string]string{}
+	if o == nil {
+		return out
+	}
+	c := o.DeepCopy()
+	for _, n := range noise {
+		unstructured.RemoveNestedField(c.Object, n...)
+	}
+	var walk func(path string, v any)
+	walk = func(path string, v any) {
+		if m, ok := v.(map[string]any); ok && len(m) > 0 {
+			for k, child := range m {
+				walk(path+"."+k, child)
+			}
+			return
+		}
+		js, _ := json.Marshal(v)
+		out[path] = string(js)
+	}
+	walk("", c.Object)
+	return out
 }
 
 // lastApplied is where client-side apply keeps what it sent last time.
