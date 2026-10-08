@@ -86,6 +86,15 @@ func init() {
 // already existed, so one pod is created before the program starts and one
 // while it runs. A pod naming another scheduler is not this program's.
 func stageWatchUnscheduled(ctx context.Context, env *kube.Env, bin string) error {
+	zero := int64(0)
+	seeded := []string{"before", "elsewhere", "after"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+
 	if err := seedPod(ctx, env, "before", schedulerName); err != nil {
 		return err
 	}
@@ -168,7 +177,14 @@ func stageScoreLeastAllocated(ctx context.Context, env *kube.Env, bin string) er
 
 	// One pod per worker and one more: a program that ignores the scores and
 	// takes nodes in turn has to land on the loaded one within this many.
-	for _, name := range []string{"small-1", "small-2", "small-3", "small-4"} {
+	small := []string{"small-1", "small-2", "small-3", "small-4"}
+	defer func() {
+		for _, name := range small {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+	for _, name := range small {
 		if err := seedPod(ctx, env, name, schedulerName); err != nil {
 			return err
 		}
@@ -1064,6 +1080,12 @@ func stageRequeue(ctx context.Context, env *kube.Env, bin string) error {
 		}
 	}()
 
+	zero := int64(0)
+	defer func() {
+		_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), "later",
+			metav1.DeleteOptions{GracePeriodSeconds: &zero})
+	}()
+
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
 		return err
@@ -1094,6 +1116,15 @@ func stageRequeue(ctx context.Context, env *kube.Env, bin string) error {
 // they expected, so both answers belong there: a Normal event naming the node
 // when the pod is placed, and a Warning when nothing fits.
 func stageEvents(ctx context.Context, env *kube.Env, bin string) error {
+	zero := int64(0)
+	seeded := []string{"placed", "nowhere"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
 		return err
@@ -1167,6 +1198,15 @@ func stageBind(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	target := workers[len(workers)-1]
+
+	zero := int64(0)
+	seeded := []string{"before", "after"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
 
 	if err := seedPod(ctx, env, "before", schedulerName); err != nil {
 		return err
@@ -1309,6 +1349,13 @@ func stageNodeList(ctx context.Context, env *kube.Env, bin string) error {
 	defer cleanup()
 
 	var names []string
+	zero := int64(0)
+	defer func() {
+		for _, name := range names {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
 	for i := 1; i <= 10; i++ {
 		name := fmt.Sprintf("pod-%02d", i)
 		names = append(names, name)
@@ -1494,6 +1541,11 @@ func stageFitPorts(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 
+	zero := int64(0)
+	defer func() {
+		_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), "other-port",
+			metav1.DeleteOptions{GracePeriodSeconds: &zero})
+	}()
 	if err := seedPortPod(ctx, env, "other-port", 8081); err != nil {
 		return err
 	}
@@ -1547,6 +1599,15 @@ func stageTaints(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	defer taintNode(context.WithoutCancel(ctx), env, tainted, key, "", "")
 
+	zero := int64(0)
+	seeded := []string{"tolerating"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
 		return err
@@ -1557,6 +1618,7 @@ func stageTaints(ctx context.Context, env *kube.Env, bin string) error {
 	// on the control plane, which carries a NoSchedule taint of its own.
 	for i := 1; i <= 4; i++ {
 		name := fmt.Sprintf("plain-%d", i)
+		seeded = append(seeded, name)
 		if err := seedPod(ctx, env, name, schedulerName); err != nil {
 			return err
 		}
@@ -1614,6 +1676,15 @@ func stageUnschedulable(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	defer cordonNode(context.WithoutCancel(ctx), env, closed, false)
 
+	zero := int64(0)
+	seeded := []string{"tolerating"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
+
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
 		return err
@@ -1622,6 +1693,7 @@ func stageUnschedulable(ctx context.Context, env *kube.Env, bin string) error {
 
 	for i := 1; i <= 3; i++ {
 		name := fmt.Sprintf("plain-%d", i)
+		seeded = append(seeded, name)
 		if err := seedPod(ctx, env, name, schedulerName); err != nil {
 			return err
 		}
@@ -1678,6 +1750,15 @@ func stageNodeAffinity(ctx context.Context, env *kube.Env, bin string) error {
 		}
 		defer labelNode(context.WithoutCancel(ctx), env, l.node, l.key, "")
 	}
+
+	zero := int64(0)
+	seeded := []string{"nowhere", "or-terms", "and-expressions", "not-in-west"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
 
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
@@ -1769,6 +1850,15 @@ func stageNodeSelector(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	defer labelNode(context.WithoutCancel(ctx), env, chosen, key, "")
+
+	zero := int64(0)
+	seeded := []string{"nowhere", "selecting-1", "selecting-2", "selecting-3"}
+	defer func() {
+		for _, name := range seeded {
+			_ = env.Client.CoreV1().Pods(env.Namespace).Delete(context.WithoutCancel(ctx), name,
+				metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		}
+	}()
 
 	p, cleanup, err := launch(ctx, env, bin)
 	if err != nil {
@@ -2368,12 +2458,18 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 				metav1.DeleteOptions{GracePeriodSeconds: &zero})
 		}
 	}()
-	// The unimportant pods are created first, and so have waited longest.
-	for _, batch := range []struct {
+	// The unimportant pods are created first, and so have waited longest. A
+	// creation timestamp counts whole seconds, so the batches are a second
+	// apart: arrival order has to be visible for taking it instead of priority
+	// to show.
+	for b, batch := range []struct {
 		prefix string
 		class  string
 		count  int
 	}{{"low", low, 6}, {"high", high, 3}} {
+		if b > 0 {
+			time.Sleep(1100 * time.Millisecond)
+		}
 		for i := 1; i <= batch.count; i++ {
 			name := fmt.Sprintf("%s-%d", batch.prefix, i)
 			if err := seedPriorityPod(ctx, env, name, batch.class, seat); err != nil {
@@ -2401,7 +2497,7 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 			return fmt.Errorf("every worker is cordoned, so pod %s can go nowhere, and no FailedScheduling event says so: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
 		}
 	}
-	placed, err := placements(ctx, env)
+	placed, err := settledPlacements(ctx, env, 0, 60*time.Second)
 	if err != nil {
 		return err
 	}
@@ -2431,6 +2527,15 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 			return fmt.Errorf("%d workers are open and %d pods are placed: each of these pods asks for %s, three fifths of a worker, so a worker can hold one\nthe program said:\n%s",
 				i+1, len(placed), seat, tail(p.Stdout()))
 		}
+		// A low pod is only ever evicted if it was placed first, which a
+		// program that compares priorities never does. One that went and was
+		// preempted back out leaves no placement behind, but leaves this.
+		if left, err := survivors(ctx, env, "low-"); err != nil {
+			return err
+		} else if len(left) != 6 {
+			return fmt.Errorf("%d of the six low pods are gone after worker %s opened: they were placed ahead of a pod of class %s (value %d) and then evicted for it, but the pods waiting for room are compared by priority, so they should never have been placed\nthe program said:\n%s",
+				6-len(left), w, high, highPriority, tail(p.Stdout()))
+		}
 	}
 	return nil
 }
@@ -2449,8 +2554,18 @@ func settledPlacements(ctx context.Context, env *kube.Env, want int, within time
 	if err != nil {
 		return placed, err
 	}
-	const quiet = 3 * time.Second
-	for deadline := time.Now().Add(quiet); time.Now().Before(deadline); {
+	// Settled means the program has stopped trying, not only stopped placing:
+	// a pod that keeps failing changes no placement, and an attempt still in
+	// flight when the next room appears takes it. Every failed attempt records a
+	// FailedScheduling event, so quiet events are the signal. A program that
+	// never goes quiet is given up on after settleCap and graded as it stands;
+	// the cap is small because a stage may settle several times in its budget.
+	const quiet, settleCap = 3 * time.Second, 10 * time.Second
+	activity, err := schedulingActivity(ctx, env)
+	if err != nil {
+		return placed, err
+	}
+	for deadline, limit := time.Now().Add(quiet), time.Now().Add(settleCap); time.Now().Before(deadline) && time.Now().Before(limit); {
 		select {
 		case <-ctx.Done():
 			return placed, ctx.Err()
@@ -2460,11 +2575,34 @@ func settledPlacements(ctx context.Context, env *kube.Env, want int, within time
 		if err != nil {
 			return placed, err
 		}
-		if len(next) != len(placed) {
-			placed, deadline = next, time.Now().Add(quiet)
+		now, err := schedulingActivity(ctx, env)
+		if err != nil {
+			return placed, err
+		}
+		if len(next) != len(placed) || now != activity {
+			placed, activity, deadline = next, now, time.Now().Add(quiet)
 		}
 	}
 	return placed, nil
+}
+
+// schedulingActivity fingerprints the FailedScheduling events in the stage's
+// namespace. It changes whenever a failed attempt is recorded, whether the
+// program writes a new event per attempt or counts them on one; events from
+// anything else in the namespace are not the program trying.
+func schedulingActivity(ctx context.Context, env *kube.Env) (string, error) {
+	list, err := env.Client.EventsV1().Events(env.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return "", fmt.Errorf("list events: %w", err)
+	}
+	var b strings.Builder
+	for _, e := range list.Items {
+		if e.Reason != "FailedScheduling" {
+			continue
+		}
+		b.WriteString(e.Name + "@" + e.ResourceVersion + ";")
+	}
+	return b.String(), nil
 }
 
 // awaitFailedScheduling waits for the program to say, where kubectl describe
