@@ -51,6 +51,7 @@ func init() {
 	register(Stage{Slug: "diff-render", Run: stageDiffRender})
 	register(Stage{Slug: "server-dry-run", Run: stageServerDryRun})
 	register(Stage{Slug: "admission-preview", Run: stageAdmissionPreview})
+	register(Stage{Slug: "managed-fields", Run: stageManagedFields})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -585,6 +586,69 @@ func denyForbiddenKey(ctx context.Context, env *kube.Env) (func(), error) {
 		return nil, err
 	}
 	return cleanup, nil
+}
+
+// cm is a ConfigMap manifest carrying the given data.
+func cm(name string, data map[string]string) string {
+	b, _ := json.Marshal(map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap",
+		"metadata": map[string]any{"name": name}, "data": data,
+	})
+	return string(b) + "\n"
+}
+
+// updateAs sets one key of a ConfigMap with a plain update, the way kubectl
+// edit or a controller would, under the given field manager.
+func (w *work) updateAs(manager, name, key, value string) error {
+	c, err := w.env.ConfigMap(w.ctx, name)
+	if err != nil {
+		return err
+	}
+	if c.Data == nil {
+		c.Data = map[string]string{}
+	}
+	c.Data[key] = value
+	_, err = w.env.Client.CoreV1().ConfigMaps(w.env.Namespace).Update(w.ctx, c, metav1.UpdateOptions{FieldManager: manager})
+	if err != nil {
+		return fmt.Errorf("update %s as %s: %w", name, manager, err)
+	}
+	return nil
+}
+
+// stageManagedFields — every leaf field each manager claims, shared fields
+// listed once per owner, and an update's ownership as well as an apply's.
+func stageManagedFields(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.applyAs("byok8s", cm("owned", map[string]string{"a": "1", "shared": "s"})); err != nil {
+		return err
+	}
+	if err := w.applyAs("other-tool", cm("owned", map[string]string{"shared": "s", "b": "2"})); err != nil {
+		return err
+	}
+	if err := w.updateAs("kubectl-edit", "owned", "e", "x"); err != nil {
+		return err
+	}
+	res, err := w.run("owners", "-f", w.file("m.yaml", cm("owned", nil)+"---\n"+cm("none", nil)))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if !strings.Contains(res.Stdout, "ConfigMap/none absent") {
+		return fmt.Errorf("expected \"ConfigMap/none absent\", got:\n%s", tail(res.Stdout))
+	}
+	return hasLines(parseDiff(res.Stdout), "ConfigMap/owned",
+		".data.a byok8s Apply",
+		".data.shared byok8s Apply",
+		".data.shared other-tool Apply",
+		".data.b other-tool Apply",
+		".data.e kubectl-edit Update",
+	)
 }
 
 // parseDiff groups diff output by object: an unindented line names an object,

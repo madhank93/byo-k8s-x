@@ -12,6 +12,7 @@
 // local merge.
 // Stage 7: an object the server refuses is reported with its reason, and the
 // rest of the diff still runs.
+// Stage 8: `owners -f FILE` reads managedFields: who owns each field, and how.
 
 package main
 
@@ -42,6 +43,7 @@ import (
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 	"sigs.k8s.io/yaml"
 )
 
@@ -173,8 +175,61 @@ func run(cmd string, opt opts) (int, error) {
 			return 1, nil
 		}
 		return 0, nil
+	case "owners":
+		c, objs, err := setup(file)
+		if err != nil {
+			return 2, err
+		}
+		for _, o := range objs {
+			live, err := c.live(o)
+			if err != nil {
+				return 2, err
+			}
+			if live == nil {
+				fmt.Println(ref(o), "absent")
+				continue
+			}
+			owners, err := ownership(live)
+			if err != nil {
+				return 2, fmt.Errorf("%s: %w", ref(o), err)
+			}
+			fmt.Println(ref(o))
+			for _, w := range owners {
+				fmt.Printf("  %s %s %s\n", w.path, w.manager, w.operation)
+			}
+		}
+		return 0, nil
 	}
 	return 2, fmt.Errorf("unknown command %q", cmd)
+}
+
+// owner is one field one manager claims.
+type owner struct{ path, manager, operation string }
+
+// ownership decodes managedFields into one entry per leaf field per manager,
+// sorted by path. Each entry's fieldsV1 is a set of paths encoded as a tree:
+// "f:data" is a map key, "k:{...}" a list item by its key, "." the node itself.
+func ownership(live *unstructured.Unstructured) ([]owner, error) {
+	var out []owner
+	for _, mf := range live.GetManagedFields() {
+		if mf.FieldsV1 == nil {
+			continue
+		}
+		set := &fieldpath.Set{}
+		if err := set.FromJSON(bytes.NewReader(mf.FieldsV1.Raw)); err != nil {
+			return nil, fmt.Errorf("managedFields of %s: %w", mf.Manager, err)
+		}
+		set.Leaves().Iterate(func(p fieldpath.Path) {
+			out = append(out, owner{p.String(), mf.Manager, string(mf.Operation)})
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].path != out[j].path {
+			return out[i].path < out[j].path
+		}
+		return out[i].manager < out[j].manager
+	})
+	return out, nil
 }
 
 // client is everything a command needs to address an arbitrary object: a
