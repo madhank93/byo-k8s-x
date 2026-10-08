@@ -2451,10 +2451,11 @@ func settledPlacements(ctx context.Context, env *kube.Env, want int, within time
 	}
 	// Settled means the program has stopped trying, not only stopped placing:
 	// a pod that keeps failing changes no placement, and an attempt still in
-	// flight when the next room appears takes it. Every attempt records an
-	// event, so quiet events are the signal. A program that never goes quiet
-	// is given up on after settleCap and graded as it stands.
-	const quiet, settleCap = 3 * time.Second, 30 * time.Second
+	// flight when the next room appears takes it. Every failed attempt records a
+	// FailedScheduling event, so quiet events are the signal. A program that
+	// never goes quiet is given up on after settleCap and graded as it stands;
+	// the cap is small because a stage may settle several times in its budget.
+	const quiet, settleCap = 3 * time.Second, 10 * time.Second
 	activity, err := schedulingActivity(ctx, env)
 	if err != nil {
 		return placed, err
@@ -2480,9 +2481,10 @@ func settledPlacements(ctx context.Context, env *kube.Env, want int, within time
 	return placed, nil
 }
 
-// schedulingActivity fingerprints the events the program has recorded in the
-// stage's namespace. It changes whenever an attempt is recorded, whether the
-// program writes a new event per attempt or counts them on one.
+// schedulingActivity fingerprints the FailedScheduling events in the stage's
+// namespace. It changes whenever a failed attempt is recorded, whether the
+// program writes a new event per attempt or counts them on one; events from
+// anything else in the namespace are not the program trying.
 func schedulingActivity(ctx context.Context, env *kube.Env) (string, error) {
 	list, err := env.Client.EventsV1().Events(env.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -2490,7 +2492,7 @@ func schedulingActivity(ctx context.Context, env *kube.Env) (string, error) {
 	}
 	var b strings.Builder
 	for _, e := range list.Items {
-		if e.ReportingController == "kubelet" {
+		if e.Reason != "FailedScheduling" {
 			continue
 		}
 		b.WriteString(e.Name + "@" + e.ResourceVersion + ";")
