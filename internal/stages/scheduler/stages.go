@@ -2527,6 +2527,15 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 			return fmt.Errorf("%d workers are open and %d pods are placed: each of these pods asks for %s, three fifths of a worker, so a worker can hold one\nthe program said:\n%s",
 				i+1, len(placed), seat, tail(p.Stdout()))
 		}
+		// A low pod is only ever evicted if it was placed first, which a
+		// program that compares priorities never does. One that went and was
+		// preempted back out leaves no placement behind, but leaves this.
+		if left, err := survivors(ctx, env, "low-"); err != nil {
+			return err
+		} else if len(left) != 6 {
+			return fmt.Errorf("%d of the six low pods are gone after worker %s opened: they were placed ahead of a pod of class %s (value %d) and then evicted for it, but the pods waiting for room are compared by priority, so they should never have been placed\nthe program said:\n%s",
+				6-len(left), w, high, highPriority, tail(p.Stdout()))
+		}
 	}
 	return nil
 }
