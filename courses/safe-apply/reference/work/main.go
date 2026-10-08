@@ -7,6 +7,7 @@
 // apply would send.
 // Stage 4: `diff -f FILE` lists the field-level changes, and exits 0 for none,
 // 1 for some, 2 when it cannot tell.
+// Stage 5: `diff --unified` renders the same comparison as diff(1) over YAML.
 
 package main
 
@@ -19,7 +20,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
+	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -34,7 +38,15 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	jsonpatch "gopkg.in/evanphx/json-patch.v4"
+	"sigs.k8s.io/yaml"
 )
+
+// opts are the flags every command accepts; each command reads the ones it
+// needs.
+type opts struct {
+	file    string
+	unified bool
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -43,10 +55,12 @@ func main() {
 	}
 	cmd := os.Args[1]
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
-	file := fs.String("f", "", "manifest file")
+	var o opts
+	fs.StringVar(&o.file, "f", "", "manifest file")
+	fs.BoolVar(&o.unified, "unified", false, "diff: render as a unified diff of YAML")
 	fs.Parse(os.Args[2:])
 
-	code, err := run(cmd, *file)
+	code, err := run(cmd, o)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		if code == 0 {
@@ -56,7 +70,8 @@ func main() {
 	os.Exit(code)
 }
 
-func run(cmd, file string) (int, error) {
+func run(cmd string, opt opts) (int, error) {
+	file := opt.file
 	switch cmd {
 	case "objects":
 		objs, err := load(file)
@@ -110,7 +125,7 @@ func run(cmd, file string) (int, error) {
 		if err != nil {
 			return 2, err
 		}
-		changed := false
+		var pairs [][2]*unstructured.Unstructured
 		for _, o := range objs {
 			live, err := c.live(o)
 			if err != nil {
@@ -120,6 +135,14 @@ func run(cmd, file string) (int, error) {
 			if err != nil {
 				return 2, fmt.Errorf("%s: %w", ref(o), err)
 			}
+			pairs = append(pairs, [2]*unstructured.Unstructured{live, after})
+		}
+		if opt.unified {
+			return unified(pairs)
+		}
+		changed := false
+		for i, o := range objs {
+			live, after := pairs[i][0], pairs[i][1]
 			if d := fieldDiff(live, after); len(d) > 0 {
 				changed = true
 				fmt.Println(ref(o))
@@ -261,6 +284,59 @@ func fieldDiff(before, after *unstructured.Unstructured) []string {
 	return out
 }
 
+// unified writes each side's objects as YAML into two directories and lets
+// diff(1) compare them, as kubectl diff does. A missing object has no file, and
+// -N treats it as empty.
+func unified(pairs [][2]*unstructured.Unstructured) (int, error) {
+	dir, err := os.MkdirTemp("", "byok8s-diff-")
+	if err != nil {
+		return 2, err
+	}
+	defer os.RemoveAll(dir)
+	for side, name := range []string{"live", "merged"} {
+		if err := os.Mkdir(filepath.Join(dir, name), 0o755); err != nil {
+			return 2, err
+		}
+		for _, p := range pairs {
+			o := p[side]
+			if o == nil {
+				continue
+			}
+			o = quiet(o)
+			y, err := yaml.Marshal(o.Object)
+			if err != nil {
+				return 2, err
+			}
+			f := strings.Join([]string{strings.ReplaceAll(o.GetAPIVersion(), "/", "."), o.GetKind(), o.GetNamespace(), o.GetName()}, ".")
+			if err := os.WriteFile(filepath.Join(dir, name, f), y, 0o644); err != nil {
+				return 2, err
+			}
+		}
+	}
+	cmd := exec.Command("diff", "-u", "-N", "live", "merged")
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	var exit *exec.ExitError
+	switch {
+	case err == nil:
+		return 0, nil
+	case errors.As(err, &exit) && exit.ExitCode() == 1:
+		return 1, nil
+	}
+	return 2, fmt.Errorf("diff: %w", err)
+}
+
+// quiet is a copy without the noise fields.
+func quiet(o *unstructured.Unstructured) *unstructured.Unstructured {
+	c := o.DeepCopy()
+	for _, n := range noise {
+		unstructured.RemoveNestedField(c.Object, n...)
+	}
+	return c
+}
+
 // noise is server bookkeeping that changes on every write and says nothing
 // about what the write meant.
 var noise = [][]string{
@@ -274,10 +350,7 @@ func leaves(o *unstructured.Unstructured) map[string]string {
 	if o == nil {
 		return out
 	}
-	c := o.DeepCopy()
-	for _, n := range noise {
-		unstructured.RemoveNestedField(c.Object, n...)
-	}
+	c := quiet(o)
 	var walk func(path string, v any)
 	walk = func(path string, v any) {
 		if m, ok := v.(map[string]any); ok && len(m) > 0 {

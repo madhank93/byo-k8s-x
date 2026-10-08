@@ -45,6 +45,7 @@ func init() {
 	register(Stage{Slug: "live-fetch", Run: stageLiveFetch})
 	register(Stage{Slug: "three-way-merge", Run: stageThreeWayMerge})
 	register(Stage{Slug: "structured-diff", Run: stageStructuredDiff})
+	register(Stage{Slug: "diff-render", Run: stageDiffRender})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -323,6 +324,63 @@ data:
 	}
 	if strings.TrimSpace(res.Stdout) != "" {
 		return fmt.Errorf("nothing would change, so diff prints nothing, got:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// stageDiffRender — the same comparison as a unified diff of YAML, the way
+// kubectl diff hands it to diff(1).
+func stageDiffRender(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := seedLastApplied(w, "web", map[string]string{"a": "1", "b": "2"}, map[string]string{"c": "3"}); err != nil {
+		return err
+	}
+	if err := seedLastApplied(w, "same", map[string]string{"x": "1"}, nil); err != nil {
+		return err
+	}
+	res, err := w.run("diff", "--unified", "-f", w.file("m.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web
+data:
+  a: 1x
+`))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	var headers, minusB, plusA int
+	for _, l := range strings.Split(res.Stdout, "\n") {
+		switch {
+		case strings.HasPrefix(l, "---") || strings.HasPrefix(l, "+++"):
+			headers++
+		case (strings.HasPrefix(l, "-") || strings.HasPrefix(l, "+")) && strings.Contains(l, " c: "):
+			return fmt.Errorf("data.c belongs to someone else and must not change, but the diff has %q", l)
+		case strings.HasPrefix(l, "-") && strings.Contains(l, `b: "2"`):
+			minusB++
+		case strings.HasPrefix(l, "+") && strings.Contains(l, "a: 1x"):
+			plusA++
+		}
+	}
+	if headers < 2 || minusB != 1 || plusA != 1 {
+		return fmt.Errorf("expected a unified diff with ---/+++ headers, a removed line for b: \"2\" and an added line for a: 1x, got:\n%s", tail(res.Stdout))
+	}
+
+	res, err = w.run("diff", "--unified", "-f", w.file("same.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: same\ndata:\n  x: \"1\"\n"))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if strings.TrimSpace(res.Stdout) != "" {
+		return fmt.Errorf("nothing would change, so the unified diff is empty, got:\n%s", tail(res.Stdout))
 	}
 	return nil
 }
