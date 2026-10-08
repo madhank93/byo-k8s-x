@@ -210,11 +210,18 @@ func stageTopologySpread(ctx context.Context, env *kube.Env, bin string) error {
 		defer func() { _ = labelNode(context.WithoutCancel(ctx), env, node, zoneKey, "") }()
 	}
 
-	node, err := env.Client.CoreV1().Nodes().Get(ctx, far, metav1.GetOptions{})
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
-		return fmt.Errorf("get node %s: %w", far, err)
+		return err
 	}
-	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
 
 	zero := int64(0)
 	seeded := []string{"ballast-far", "held-1", "held-2"}
@@ -304,11 +311,18 @@ func stagePodAffinity(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	empty, crowded := workers[:2], workers[2]
 
-	node, err := env.Client.CoreV1().Nodes().Get(ctx, crowded, metav1.GetOptions{})
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
-		return fmt.Errorf("get node %s: %w", crowded, err)
+		return err
 	}
-	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
 
 	zero := int64(0)
 	seeded := []string{"ballast-crowded", "cache", "web-1", "web-2"}
@@ -2084,11 +2098,18 @@ func stageVolumeBinding(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	spare, crowded := workers[0], workers[len(workers)-1]
 
-	node, err := env.Client.CoreV1().Nodes().Get(ctx, crowded, metav1.GetOptions{})
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
 	if err != nil {
-		return fmt.Errorf("get node %s: %w", crowded, err)
+		return err
 	}
-	cpu := node.Status.Allocatable[corev1.ResourceCPU]
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
 
 	// PersistentVolumes are cluster scoped, so deleting the namespace does not
 	// take them with it and a name reused across runs would meet the leftover.
@@ -2947,6 +2968,19 @@ func stagePercentageOfNodes(ctx context.Context, env *kube.Env, bin string) erro
 	}
 	total := len(all.Items)
 
+	// Leftover pods from earlier stages and courses are levelled out, and the
+	// shares below are of the room that is left, so they decide nothing here.
+	unlevel, err := levelWorkers(ctx, env)
+	defer unlevel()
+	if err != nil {
+		return err
+	}
+	room, err := workerRoom(ctx, env)
+	if err != nil {
+		return err
+	}
+	cpu := room[corev1.ResourceCPU]
+
 	zero := int64(0)
 	var seeded []string
 	defer func() {
@@ -2958,11 +2992,6 @@ func stagePercentageOfNodes(ctx context.Context, env *kube.Env, bin string) erro
 	for _, w := range workers[1:] {
 		name := "ballast-" + w
 		seeded = append(seeded, name)
-		node, err := env.Client.CoreV1().Nodes().Get(ctx, w, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("get node %s: %w", w, err)
-		}
-		cpu := node.Status.Allocatable[corev1.ResourceCPU]
 		if err := seedBallast(ctx, env, name, w, milliCPU(cpu.MilliValue()*50/100)); err != nil {
 			return err
 		}
