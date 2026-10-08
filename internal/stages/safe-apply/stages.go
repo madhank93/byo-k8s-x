@@ -46,6 +46,7 @@ func init() {
 	register(Stage{Slug: "three-way-merge", Run: stageThreeWayMerge})
 	register(Stage{Slug: "structured-diff", Run: stageStructuredDiff})
 	register(Stage{Slug: "diff-render", Run: stageDiffRender})
+	register(Stage{Slug: "server-dry-run", Run: stageServerDryRun})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -381,6 +382,70 @@ data:
 	}
 	if strings.TrimSpace(res.Stdout) != "" {
 		return fmt.Errorf("nothing would change, so the unified diff is empty, got:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// deployment is a manifest for a Deployment of pause containers. Replicas are
+// kept at zero wherever the stage allows, so the cluster runs no pods for it.
+func deployment(name string, replicas int, image string) string {
+	return fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %[1]s
+spec:
+  replicas: %[2]d
+  selector:
+    matchLabels:
+      app: %[1]s
+  template:
+    metadata:
+      labels:
+        app: %[1]s
+    spec:
+      containers:
+      - name: app
+        image: %[3]s
+`, name, replicas, image)
+}
+
+const pause = "registry.k8s.io/pause:3.9"
+
+// stageServerDryRun — the would-be object is the server's answer, so it carries
+// the defaults only the server knows, and nothing is written.
+func stageServerDryRun(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.applyAs("byok8s", deployment("old", 0, pause)); err != nil {
+		return err
+	}
+	res, err := w.run("diff", "-f", w.file("m.yaml", deployment("old", 2, pause)+"---\n"+deployment("fresh", 0, pause)))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	d := parseDiff(res.Stdout)
+	if err := hasLines(d, "Deployment/old", "~ .spec.replicas: 0 -> 2"); err != nil {
+		return fmt.Errorf("%w\nstdout:\n%s", err, tail(res.Stdout))
+	}
+	if err := hasLines(d, "Deployment/fresh", "+ .spec.revisionHistoryLimit: 10", "+ .spec.progressDeadlineSeconds: 600"); err != nil {
+		return fmt.Errorf("%w\nthe manifest sets neither field; the server defaults them, so only a server-side dry-run shows them\nstdout:\n%s", err, tail(res.Stdout))
+	}
+
+	dep, err := env.Deployment(ctx, "old")
+	if err != nil {
+		return err
+	}
+	if *dep.Spec.Replicas != 0 {
+		return fmt.Errorf("diff changed the cluster: Deployment/old now has %d replicas — a dry-run must never be stored", *dep.Spec.Replicas)
+	}
+	if _, err := env.Deployment(ctx, "fresh"); err == nil {
+		return fmt.Errorf("diff created Deployment/fresh — a dry-run must never be stored")
 	}
 	return nil
 }

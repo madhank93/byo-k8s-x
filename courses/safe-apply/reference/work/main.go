@@ -8,6 +8,8 @@
 // Stage 4: `diff -f FILE` lists the field-level changes, and exits 0 for none,
 // 1 for some, 2 when it cannot tell.
 // Stage 5: `diff --unified` renders the same comparison as diff(1) over YAML.
+// Stage 6: the would-be object comes from a server-side apply dry-run, not a
+// local merge.
 
 package main
 
@@ -29,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/jsonmergepatch"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/discovery"
@@ -37,7 +40,6 @@ import (
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 
-	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	"sigs.k8s.io/yaml"
 )
 
@@ -131,7 +133,7 @@ func run(cmd string, opt opts) (int, error) {
 			if err != nil {
 				return 2, err
 			}
-			after, err := c.after(o, live)
+			after, err := c.after(o)
 			if err != nil {
 				return 2, fmt.Errorf("%s: %w", ref(o), err)
 			}
@@ -167,6 +169,9 @@ type client struct {
 	dyn    dynamic.Interface
 	mapper meta.RESTMapper
 	ns     string
+
+	// manager is the field manager every apply, real or dry-run, is made as.
+	manager string
 }
 
 // setup loads the manifest and connects, the way every cluster command starts.
@@ -194,7 +199,7 @@ func setup(file string) (*client, []*unstructured.Unstructured, error) {
 		return nil, nil, err
 	}
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))
-	c := &client{ctx: context.Background(), dyn: dyn, mapper: mapper, ns: ns}
+	c := &client{ctx: context.Background(), dyn: dyn, mapper: mapper, ns: ns, manager: "byok8s"}
 	for _, o := range objs {
 		if _, err := c.resource(o); err != nil {
 			return nil, nil, err
@@ -238,26 +243,28 @@ func (c *client) live(o *unstructured.Unstructured) (*unstructured.Unstructured,
 	return l, nil
 }
 
-// after is the object as it would be once the manifest is applied: the
-// manifest itself for a create, live with the three-way patch for an update.
-func (c *client) after(o, live *unstructured.Unstructured) (*unstructured.Unstructured, error) {
-	if live == nil {
-		return o, nil
-	}
-	p, err := threeWay(o, live)
+// after is the object as it would be once the manifest is applied, as the
+// server itself computes it: a server-side apply with dryRun=All runs
+// defaulting, admission and the ownership merge, and stops before storage.
+func (c *client) after(o *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+	return c.apply(o, true)
+}
+
+// apply server-side applies one object as this client's field manager.
+func (c *client) apply(o *unstructured.Unstructured, dryRun bool) (*unstructured.Unstructured, error) {
+	r, err := c.resource(o)
 	if err != nil {
 		return nil, err
 	}
-	cur, err := json.Marshal(live.Object)
+	body, err := json.Marshal(o.Object)
 	if err != nil {
 		return nil, err
 	}
-	merged, err := jsonpatch.MergePatch(cur, p)
-	if err != nil {
-		return nil, err
+	po := metav1.PatchOptions{FieldManager: c.manager}
+	if dryRun {
+		po.DryRun = []string{metav1.DryRunAll}
 	}
-	out := &unstructured.Unstructured{}
-	return out, json.Unmarshal(merged, &out.Object)
+	return r.Patch(c.ctx, o.GetName(), types.ApplyPatchType, body, po)
 }
 
 // fieldDiff lists what changes between two versions of an object, one line per
