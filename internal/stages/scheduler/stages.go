@@ -2401,7 +2401,7 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 			return fmt.Errorf("every worker is cordoned, so pod %s can go nowhere, and no FailedScheduling event says so: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
 		}
 	}
-	placed, err := placements(ctx, env)
+	placed, err := settledPlacements(ctx, env, 0, 60*time.Second)
 	if err != nil {
 		return err
 	}
@@ -2449,8 +2449,17 @@ func settledPlacements(ctx context.Context, env *kube.Env, want int, within time
 	if err != nil {
 		return placed, err
 	}
-	const quiet = 3 * time.Second
-	for deadline := time.Now().Add(quiet); time.Now().Before(deadline); {
+	// Settled means the program has stopped trying, not only stopped placing:
+	// a pod that keeps failing changes no placement, and an attempt still in
+	// flight when the next room appears takes it. Every attempt records an
+	// event, so quiet events are the signal. A program that never goes quiet
+	// is given up on after settleCap and graded as it stands.
+	const quiet, settleCap = 3 * time.Second, 30 * time.Second
+	activity, err := schedulingActivity(ctx, env)
+	if err != nil {
+		return placed, err
+	}
+	for deadline, limit := time.Now().Add(quiet), time.Now().Add(settleCap); time.Now().Before(deadline) && time.Now().Before(limit); {
 		select {
 		case <-ctx.Done():
 			return placed, ctx.Err()
@@ -2460,11 +2469,33 @@ func settledPlacements(ctx context.Context, env *kube.Env, want int, within time
 		if err != nil {
 			return placed, err
 		}
-		if len(next) != len(placed) {
-			placed, deadline = next, time.Now().Add(quiet)
+		now, err := schedulingActivity(ctx, env)
+		if err != nil {
+			return placed, err
+		}
+		if len(next) != len(placed) || now != activity {
+			placed, activity, deadline = next, now, time.Now().Add(quiet)
 		}
 	}
 	return placed, nil
+}
+
+// schedulingActivity fingerprints the events the program has recorded in the
+// stage's namespace. It changes whenever an attempt is recorded, whether the
+// program writes a new event per attempt or counts them on one.
+func schedulingActivity(ctx context.Context, env *kube.Env) (string, error) {
+	list, err := env.Client.EventsV1().Events(env.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return "", fmt.Errorf("list events: %w", err)
+	}
+	var b strings.Builder
+	for _, e := range list.Items {
+		if e.ReportingController == "kubelet" {
+			continue
+		}
+		b.WriteString(e.Name + "@" + e.ResourceVersion + ";")
+	}
+	return b.String(), nil
 }
 
 // awaitFailedScheduling waits for the program to say, where kubectl describe
