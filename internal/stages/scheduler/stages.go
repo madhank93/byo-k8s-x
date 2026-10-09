@@ -2412,10 +2412,13 @@ func seedClaimingPod(ctx context.Context, env *kube.Env, name, claim string) err
 // stagePriority checks the pods waiting for room are tried in the order of
 // their priority, not the order they arrived in.
 //
-// Every worker is cordoned before the pods exist, so all of them are waiting
+// Every worker is closed before the pods exist, so all of them are waiting
 // on the same thing and none has been placed by arriving first. Each pod asks
-// for most of a node, so uncordoning one worker frees exactly one seat: who
-// takes it is the whole assertion. The low-priority pods are created first, so
+// for most of a node, so opening one worker frees exactly one seat: who takes
+// it is the whole assertion. Workers are closed with a taint this stage owns
+// rather than a cordon: uncordoning is two changes (the field, then the node
+// controller lifting its taint), and a pass between them parks every high pod
+// and then hands the seat to a low one already being tried. The low-priority pods are created first, so
 // a program that retries in arrival order — or in whatever order its map hands
 // back — gives the seat away.
 func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
@@ -2444,11 +2447,12 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 
+	const closedKey = "byok8s.io/priority-closed"
 	for _, w := range workers {
-		if err := cordonNode(ctx, env, w, true); err != nil {
+		if err := taintNode(ctx, env, w, closedKey, "", corev1.TaintEffectNoSchedule); err != nil {
 			return err
 		}
-		defer cordonNode(context.WithoutCancel(ctx), env, w, false)
+		defer taintNode(context.WithoutCancel(ctx), env, w, closedKey, "", "")
 	}
 
 	unlevel, err := levelWorkers(ctx, env)
@@ -2510,7 +2514,7 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 			return fmt.Errorf("pod %s was never reported: %w", name, err)
 		}
 		if err := awaitFailedScheduling(ctx, env, name, 60*time.Second); err != nil {
-			return fmt.Errorf("every worker is cordoned, so pod %s can go nowhere, and no FailedScheduling event says so: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
+			return fmt.Errorf("every worker is tainted closed, so pod %s can go nowhere, and no FailedScheduling event says so: %w\nthe program said:\n%s", name, err, tail(p.Stdout()))
 		}
 	}
 	placed, err := settledPlacements(ctx, env, 0, 60*time.Second)
@@ -2518,19 +2522,19 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	if len(placed) > 0 {
-		return fmt.Errorf("every worker is cordoned and %d pod(s) were placed anyway: %v", len(placed), placed)
+		return fmt.Errorf("every worker is tainted closed and %d pod(s) were placed anyway: %v", len(placed), placed)
 	}
 
 	// One worker opens at a time, and a worker holds one of these pods. Who
 	// takes the seat is the whole assertion, and it is asked three times so
 	// that picking without comparing is unlikely to be lucky throughout.
 	for i, w := range workers {
-		if err := cordonNode(ctx, env, w, false); err != nil {
+		if err := taintNode(ctx, env, w, closedKey, "", ""); err != nil {
 			return err
 		}
 		placed, err = settledPlacements(ctx, env, i+1, 60*time.Second)
 		if err != nil {
-			return fmt.Errorf("worker %s was uncordoned, leaving room for one more pod, and %d of the nine waiting pods are placed: %w\nthe program said:\n%s",
+			return fmt.Errorf("worker %s was opened, leaving room for one more pod, and %d of the nine waiting pods are placed: %w\nthe program said:\n%s",
 				w, len(placed), err, tail(p.Stdout()))
 		}
 		for name, node := range placed {
