@@ -54,8 +54,10 @@ pod comes back to you through the watch, so a scheduler that binds
 asynchronously scores its next pod against a node that still looks empty. The
 real scheduler keeps what it has bound in an *assume cache* and counts it until
 the informer catches up. Binding on the same goroutine that decides, as you do
-here, closes that window — each bind has returned before the next node is
-scored — which is why the arithmetic above is enough.
+here, narrows that window without closing it: `Bind` returning means the API
+server has the change, not that your informer does. Keep each pod you bind in
+a small assume cache, counted on its node until the informer shows it bound or
+deleted.
 
 ## Go APIs
 
