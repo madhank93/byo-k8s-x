@@ -2171,6 +2171,22 @@ func tail(s string) string {
 	return "  " + strings.Join(lines, "\n  ")
 }
 
+// mentioning is the program's output lines that name any of the given pods,
+// leaving out the repeated reports of a pod still waiting: what was placed and
+// evicted, in order, which the last few lines of output would not show.
+func mentioning(stdout string, names []string) string {
+	var keep []string
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		if strings.Contains(line, "waiting") {
+			continue
+		}
+		if slices.ContainsFunc(names, func(n string) bool { return strings.Contains(line, n) }) {
+			keep = append(keep, line)
+		}
+	}
+	return tail(strings.Join(keep, "\n"))
+}
+
 // stageVolumeBinding checks a pod goes where its volume already is.
 //
 // Two local volumes are pinned to different workers, each with a claim bound to
@@ -2533,8 +2549,15 @@ func stagePriority(ctx context.Context, env *kube.Env, bin string) error {
 		if left, err := survivors(ctx, env, "low-"); err != nil {
 			return err
 		} else if len(left) != 6 {
-			return fmt.Errorf("%d of the six low pods are gone after worker %s opened: they were placed ahead of a pod of class %s (value %d) and then evicted for it, but the pods waiting for room are compared by priority, so they should never have been placed\nthe program said:\n%s",
-				6-len(left), w, high, highPriority, tail(p.Stdout()))
+			var gone []string
+			for n := 1; n <= 6; n++ {
+				if name := fmt.Sprintf("low-%d", n); !slices.Contains(left, name) {
+					gone = append(gone, env.Namespace+"/"+name)
+				}
+			}
+			return fmt.Errorf("%s gone after worker %s opened: placed ahead of a pod of class %s (value %d) and then evicted for it, but the pods waiting for room are compared by priority, so a low pod should never have been placed\nthe program said about them:\n%s",
+				strings.Join(gone, ", "), w, high, highPriority,
+				mentioning(p.Stdout(), append(gone, env.Namespace+"/high-")))
 		}
 	}
 	return nil
