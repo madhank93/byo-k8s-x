@@ -1,0 +1,77 @@
+slug: scheduler
+name: Build your own scheduler
+language: go
+entrypoint: main.go
+# Stages assert which node a pod lands on, so the cluster needs nodes to choose
+# between: three workers beside the control plane.
+workers: 3
+stages:
+  - slug: watch-unscheduled
+    name: Find the pods waiting for you
+    difficulty: easy
+  - slug: bind
+    name: Place a pod
+    difficulty: easy
+  - slug: node-list
+    name: Choose a node that is there
+    difficulty: medium
+  - slug: fit-resources
+    name: Only where it fits
+    difficulty: medium
+  - slug: fit-ports
+    name: A port only one pod can hold
+    difficulty: medium
+  - slug: node-selector
+    name: Only the nodes a pod asks for
+    difficulty: medium
+  - slug: node-affinity
+    name: Rules richer than equality
+    difficulty: medium
+  - slug: taints
+    name: Nodes that say keep off
+    difficulty: medium
+  - slug: unschedulable
+    name: A node closed for new work
+    difficulty: easy
+  - slug: events
+    name: Say why, where people look
+    difficulty: easy
+  - slug: requeue
+    name: Try again when the cluster changes
+    difficulty: medium
+  - slug: score-least-allocated
+    name: Not just anywhere it fits
+    difficulty: medium
+  - slug: score-balanced
+    name: Even, not only empty
+    difficulty: medium
+  - slug: score-image-locality
+    name: Where it can start now
+    difficulty: easy
+  - slug: spread-by-owner
+    name: Replicas that do not fail together
+    difficulty: medium
+  - slug: topology-spread
+    name: Spread the pod asked for
+    difficulty: hard
+  - slug: pod-affinity
+    name: Beside, or away from, other pods
+    difficulty: hard
+  - slug: volume-binding
+    name: Where the data already is
+    difficulty: medium
+  - slug: priority
+    name: Who gets the room first
+    difficulty: medium
+  - slug: preemption
+    name: Making room, not waiting for it
+    difficulty: hard
+  - slug: framework-plugins
+    name: Every check with a name on it
+    difficulty: medium
+  - slug: multi-profile
+    name: Two schedulers, one program
+    difficulty: medium
+  - slug: percentage-of-nodes
+    name: Good enough, and moving on
+    difficulty: medium
