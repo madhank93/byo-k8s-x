@@ -95,6 +95,10 @@ type Course struct {
 	Language   string `yaml:"language"`
 	Entrypoint string `yaml:"entrypoint"`
 
+	// Workers is how many worker nodes the course needs beside the control
+	// plane: zero unless its stages depend on which node a pod lands on.
+	Workers int `yaml:"workers"`
+
 	root string
 }
 
@@ -111,6 +115,9 @@ func Load(repoRoot, slug string) (*Course, error) {
 	}
 	if len(c.Stages) == 0 {
 		return nil, fmt.Errorf("course %s has no stages", slug)
+	}
+	if c.Workers < 0 {
+		return nil, fmt.Errorf("course %s: workers must not be negative", slug)
 	}
 	// Slugs name directories and appear in test-case JSON; check them once
 	// here so no caller has to.

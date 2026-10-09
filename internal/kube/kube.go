@@ -191,6 +191,13 @@ func clearFinalizers(ctx context.Context, cs kubernetes.Interface, cfg *rest.Con
 // enough to be slow, and one that is fast is flaky.
 func WaitFor(ctx context.Context, what string, cond wait.ConditionWithContextFunc) error {
 	if err := wait.PollUntilContextCancel(ctx, 500*time.Millisecond, true, cond); err != nil {
+		// A deadline that simply passed surfaces as whatever the client's rate
+		// limiter happened to be doing — "rate: Wait(n=1) would exceed context
+		// deadline" — which reads like a client bug rather than a wait that ran
+		// out. The wait is the story; say that instead.
+		if s := err.Error(); strings.Contains(s, "context deadline exceeded") || strings.Contains(s, "rate: Wait") {
+			return fmt.Errorf("timed out waiting for %s", what)
+		}
 		return fmt.Errorf("timed out waiting for %s: %w", what, err)
 	}
 	return nil

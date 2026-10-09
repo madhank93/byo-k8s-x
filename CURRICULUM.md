@@ -119,18 +119,18 @@ operational traps that take clusters down.
 with `kubectl` — the verdict is whether the API server accepted or rejected
 them, and what came back changed.
 
-### `scheduler` — Build your own scheduler · 24 stages
+### [x] `scheduler` — Build your own scheduler · 23 stages
 
-Filter, score, bind. Then the parts that make it a real scheduler: assumed
-pods, spreading, priority and preemption.
+Shipped. Filter, score, bind — then the parts that make it a real scheduler:
+spreading, topology, volumes, priority, preemption, and the framework the last
+three stages rebuild the whole program into.
 
 `watch-unscheduled` · `bind` · `node-list` · `fit-resources` · `fit-ports` ·
 `node-selector` · `node-affinity` · `taints` · `unschedulable` · `events` ·
-`informer-cache` · `assumed-pods` · `score-least-allocated` ·
-`score-balanced` · `score-image-locality` · `spread-by-owner` ·
-`topology-spread` · `pod-affinity` · `volume-binding` · `priority` ·
-`preemption` · `framework-plugins` · `multi-profile` ·
-`percentage-of-nodes`
+`requeue` · `score-least-allocated` · `score-balanced` ·
+`score-image-locality` · `spread-by-owner` · `topology-spread` ·
+`pod-affinity` · `volume-binding` · `priority` · `preemption` ·
+`framework-plugins` · `multi-profile` · `percentage-of-nodes`
 
 **Verified by** pods carrying `spec.schedulerName: byok8s` — the default
 scheduler ignores them, so your program is the only thing that can place them,

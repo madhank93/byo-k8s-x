@@ -5,8 +5,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,7 +93,11 @@ func dispatch(cmd string, args []string) error {
 
 	switch cmd {
 	case "up":
-		return cluster.Up(ctx, say)
+		workers, err := workersNeeded()
+		if err != nil {
+			return err
+		}
+		return cluster.Up(ctx, workers, say)
 	case "down":
 		return cluster.Down(ctx, say)
 	case "doctor":
@@ -155,8 +161,45 @@ func doctor(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("the cluster is not ready: %s\n  fix: byok8s down && byok8s up", out)
 	}
+	need, err := workersNeeded()
+	if err != nil {
+		return err
+	}
+	have, err := cluster.Workers(ctx)
+	if err != nil {
+		return err
+	}
+	if have < need {
+		return fmt.Errorf("the %s cluster has %d worker node(s) and the courses here need %d\n  fix: byok8s down && byok8s up", cluster.Name, have, need)
+	}
 	fmt.Println("everything checks out: cluster " + cluster.Name + " is ready")
 	return nil
+}
+
+// workersNeeded is the most worker nodes any course in this checkout asks for.
+// One cluster serves every course, so it is sized for the largest; a planned
+// course has no directory yet and asks for nothing.
+func workersNeeded() (int, error) {
+	root, err := repoRoot()
+	if err != nil {
+		return 0, err
+	}
+	reg, err := course.LoadRegistry(root)
+	if err != nil {
+		return 0, err
+	}
+	need := 0
+	for _, e := range reg.Entries {
+		c, err := course.Load(root, e.Slug)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		need = max(need, c.Workers)
+	}
+	return need, nil
 }
 
 func loadCourse() (*course.Course, error) {

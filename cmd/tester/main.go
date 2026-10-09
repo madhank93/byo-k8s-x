@@ -27,6 +27,7 @@ import (
 	"github.com/madhank93/byo-k8s-x/internal/stages"
 	controllerstages "github.com/madhank93/byo-k8s-x/internal/stages/controller"
 	kubectlstages "github.com/madhank93/byo-k8s-x/internal/stages/kubectl"
+	schedulerstages "github.com/madhank93/byo-k8s-x/internal/stages/scheduler"
 	webhookstages "github.com/madhank93/byo-k8s-x/internal/stages/webhook"
 )
 
@@ -36,6 +37,7 @@ var courses = map[string]stages.Lookup{
 	"kubectl":    kubectlstages.Lookup,
 	"controller": controllerstages.Lookup,
 	"webhook":    webhookstages.Lookup,
+	"scheduler":  schedulerstages.Lookup,
 }
 
 type testCase struct {
