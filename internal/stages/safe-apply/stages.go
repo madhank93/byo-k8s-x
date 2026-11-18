@@ -54,6 +54,7 @@ func init() {
 	register(Stage{Slug: "managed-fields", Run: stageManagedFields})
 	register(Stage{Slug: "field-ownership", Run: stageFieldOwnership})
 	register(Stage{Slug: "conflict-detect", Run: stageConflictDetect})
+	register(Stage{Slug: "force-conflicts", Run: stageForceConflicts})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -776,6 +777,100 @@ func stageConflictDetect(ctx context.Context, env *kube.Env, bin string) error {
 		return fmt.Errorf("the contested value changed to %q without --force-conflicts", got.Data["greeting"])
 	}
 	return nil
+}
+
+// stageForceConflicts — --force-conflicts takes exactly the contested fields,
+// says which it took and from whom, and leaves the other manager everything
+// else it owned. Without the flag the change is still refused.
+func stageForceConflicts(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.applyAs("other-tool", cm("contested", map[string]string{"greeting": "theirs", "color": "blue"})); err != nil {
+		return err
+	}
+	m := w.file("m.yaml", cm("contested", map[string]string{"greeting": "ours"}))
+
+	res, err := w.run("apply", "-f", m)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return fmt.Errorf("without --force-conflicts, apply over another manager's field must still fail, got exit 0:\n%s", tail(res.Stdout))
+	}
+
+	res, err = w.run("diff", "--force-conflicts", "-f", m)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	if err := hasLines(parseDiff(res.Stdout), "ConfigMap/contested", `~ .data.greeting: "theirs" -> "ours"`); err != nil {
+		return fmt.Errorf("with --force-conflicts the diff shows the field changing hands: %w\nstdout:\n%s", err, tail(res.Stdout))
+	}
+	if strings.Contains(res.Stdout, ".data.color") {
+		return fmt.Errorf("data.color is other-tool's and this manifest never mentions it, so forcing does not touch it; the diff says otherwise:\n%s", tail(res.Stdout))
+	}
+
+	res, err = w.run("apply", "--force-conflicts", "-f", m)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	took := false
+	for _, l := range lines(res.Stdout) {
+		if strings.HasPrefix(l, "ConfigMap/contested") && strings.Contains(l, "took") &&
+			strings.Contains(l, ".data.greeting") && strings.Contains(l, "other-tool") {
+			took = true
+		}
+	}
+	if !took {
+		return fmt.Errorf("a forced apply should say what it took and from whom, e.g.\n  ConfigMap/contested: took .data.greeting from \"other-tool\"\ngot:\n%s", tail(res.Stdout))
+	}
+	got, err := env.ConfigMap(ctx, "contested")
+	if err != nil {
+		return err
+	}
+	want := map[string]string{"greeting": "ours", "color": "blue"}
+	if !reflect.DeepEqual(got.Data, want) {
+		return fmt.Errorf("after the forced apply, expected data %v, got %v", want, got.Data)
+	}
+	for _, c := range []struct {
+		manager, key string
+		owns         bool
+	}{
+		{"byok8s", "greeting", true},
+		{"other-tool", "greeting", false},
+		{"other-tool", "color", true},
+	} {
+		if ownsKey(got.ManagedFields, c.manager, c.key) != c.owns {
+			return fmt.Errorf("after the forced apply, %s owning data.%s should be %t; managedFields say otherwise (managers: %v)", c.manager, c.key, c.owns, managers(got.ManagedFields))
+		}
+	}
+	return nil
+}
+
+// ownsKey reports whether manager's managedFields entry claims data.key.
+func ownsKey(fields []metav1.ManagedFieldsEntry, manager, key string) bool {
+	for _, f := range fields {
+		if f.Manager != manager || f.FieldsV1 == nil {
+			continue
+		}
+		var set struct {
+			Data map[string]any `json:"f:data"`
+		}
+		if json.Unmarshal(f.FieldsV1.Raw, &set) == nil {
+			if _, ok := set.Data["f:"+key]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hasApply(fields []metav1.ManagedFieldsEntry, manager string) bool {

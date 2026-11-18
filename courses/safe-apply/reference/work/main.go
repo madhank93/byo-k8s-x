@@ -16,6 +16,7 @@
 // Stage 9: `apply -f FILE` applies for real, letting go of fields it drops.
 // Stage 10: a field another manager owns is a conflict, named with its owner;
 // apply dry-runs everything first and writes nothing if anything is refused.
+// Stage 11: --force-conflicts takes the contested fields, and says which.
 
 package main
 
@@ -55,6 +56,7 @@ import (
 type opts struct {
 	file    string
 	unified bool
+	force   bool
 }
 
 func main() {
@@ -67,6 +69,7 @@ func main() {
 	var o opts
 	fs.StringVar(&o.file, "f", "", "manifest file")
 	fs.BoolVar(&o.unified, "unified", false, "diff: render as a unified diff of YAML")
+	fs.BoolVar(&o.force, "force-conflicts", false, "take fields other managers own")
 	fs.Parse(os.Args[2:])
 
 	code, err := run(cmd, o)
@@ -134,6 +137,7 @@ func run(cmd string, opt opts) (int, error) {
 		if err != nil {
 			return 2, err
 		}
+		c.force = opt.force
 		var pairs [][2]*unstructured.Unstructured
 		refused := false
 		for _, o := range objs {
@@ -183,8 +187,18 @@ func run(cmd string, opt opts) (int, error) {
 		if err != nil {
 			return 2, err
 		}
+		var taken []string
+		if opt.force {
+			if taken, err = c.takes(objs); err != nil {
+				return 2, err
+			}
+			c.force = true
+		}
 		if !c.preflight(objs) {
 			return 1, fmt.Errorf("nothing applied: the server refused part of this change")
+		}
+		for _, t := range taken {
+			fmt.Println(t)
 		}
 		for _, o := range objs {
 			if _, err := c.apply(o, false); err != nil {
@@ -261,6 +275,8 @@ type client struct {
 
 	// manager is the field manager every apply, real or dry-run, is made as.
 	manager string
+	// force takes fields other managers own instead of stopping at them.
+	force bool
 }
 
 // setup loads the manifest and connects, the way every cluster command starts.
@@ -357,20 +373,52 @@ func (c *client) preflight(objs []*unstructured.Unstructured) bool {
 // field with the manager that owns it, because that is the question the user
 // has to answer: take the field, or leave it to them.
 func report(o *unstructured.Unstructured, err error) {
-	var status apierrors.APIStatus
-	if apierrors.IsConflict(err) && errors.As(err, &status) && status.Status().Details != nil {
-		for _, cause := range status.Status().Details.Causes {
-			if cause.Type != metav1.CauseTypeFieldManagerConflict {
-				continue
-			}
-			// The message reads: conflict with "manager" [using v1]: .path
-			_, rest, _ := strings.Cut(cause.Message, `"`)
-			manager, _, _ := strings.Cut(rest, `"`)
-			fmt.Printf("%s: conflict: %s owned by %q\n", ref(o), cause.Field, manager)
+	if cs := conflicts(err); cs != nil {
+		for _, c := range cs {
+			fmt.Printf("%s: conflict: %s owned by %q\n", ref(o), c.field, c.manager)
 		}
 		return
 	}
 	fmt.Printf("%s: rejected: %s\n", ref(o), err)
+}
+
+// conflict is one field another manager owns.
+type conflict struct{ field, manager string }
+
+// conflicts lists the fields a 409 from server-side apply names, or nil when err
+// is not such a conflict.
+func conflicts(err error) []conflict {
+	var status apierrors.APIStatus
+	if !apierrors.IsConflict(err) || !errors.As(err, &status) || status.Status().Details == nil {
+		return nil
+	}
+	var out []conflict
+	for _, cause := range status.Status().Details.Causes {
+		if cause.Type != metav1.CauseTypeFieldManagerConflict {
+			continue
+		}
+		// The message reads: conflict with "manager" [using v1]: .path
+		_, rest, _ := strings.Cut(cause.Message, `"`)
+		manager, _, _ := strings.Cut(rest, `"`)
+		out = append(out, conflict{cause.Field, manager})
+	}
+	return out
+}
+
+// takes dry-runs each object unforced and names every field a forced apply
+// will take from another manager, so taking one is never silent.
+func (c *client) takes(objs []*unstructured.Unstructured) ([]string, error) {
+	var out []string
+	for _, o := range objs {
+		_, err := c.apply(o, true)
+		for _, cf := range conflicts(err) {
+			out = append(out, fmt.Sprintf("%s: took %s from %q", ref(o), cf.field, cf.manager))
+		}
+		if err != nil && !refusal(err) {
+			return nil, fmt.Errorf("%s: %w", ref(o), err)
+		}
+	}
+	return out, nil
 }
 
 // refusal reports whether err is the server answering no — admission,
@@ -390,7 +438,7 @@ func (c *client) apply(o *unstructured.Unstructured, dryRun bool) (*unstructured
 	if err != nil {
 		return nil, err
 	}
-	po := metav1.PatchOptions{FieldManager: c.manager}
+	po := metav1.PatchOptions{FieldManager: c.manager, Force: &c.force}
 	if dryRun {
 		po.DryRun = []string{metav1.DryRunAll}
 	}
