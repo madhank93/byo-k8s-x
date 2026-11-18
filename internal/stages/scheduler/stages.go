@@ -2651,7 +2651,7 @@ func awaitFailedScheduling(ctx context.Context, env *kube.Env, name string, with
 // The priority stages' classes sit below zero, the priority of every pod that
 // names no class, so a scheduler that preempts never makes room out of pods
 // that earlier stages or courses left on the workers.
-const lowPriority, highPriority = -1000, -100
+const lowPriority, midPriority, highPriority = -1000, -500, -100
 
 func seedPriorityClass(ctx context.Context, env *kube.Env, name string, value int32) error {
 	pc := &schedulingv1.PriorityClass{
@@ -2711,7 +2711,8 @@ func placements(ctx context.Context, env *kube.Env) (map[string]string, error) {
 // that follows fits nowhere, and the only way it runs is if one of them stops:
 // one, not three, and the pod has to land where the room was made. A fourth
 // low-priority pod then asks for the same thing and must wait, because equals
-// are not victims.
+// are not victims. Last, a worker holding pods of two lower classes must give
+// up the least important ones.
 func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 	workers, err := workerNodes(ctx, env)
 	if err != nil {
@@ -2722,10 +2723,10 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 	}
 
 	run := strconv.FormatInt(time.Now().UnixNano(), 36)
-	low, high := "bko-sched-low-"+run, "bko-sched-high-"+run
+	low, mid, high := "bko-sched-low-"+run, "bko-sched-mid-"+run, "bko-sched-high-"+run
 	defer func() {
 		back := context.WithoutCancel(ctx)
-		for _, name := range []string{low, high} {
+		for _, name := range []string{low, mid, high} {
 			_ = env.Client.SchedulingV1().PriorityClasses().Delete(back, name, metav1.DeleteOptions{})
 		}
 	}()
@@ -2733,6 +2734,9 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	if err := seedPriorityClass(ctx, env, high, highPriority); err != nil {
+		return err
+	}
+	if err := seedPriorityClass(ctx, env, mid, midPriority); err != nil {
 		return err
 	}
 
@@ -2844,6 +2848,71 @@ func stagePreemption(ctx context.Context, env *kube.Env, bin string) error {
 	} else if len(after) != len(left) {
 		return fmt.Errorf("pod another is of class %s, as are the pods on every worker, and %d of them were evicted for it: equals are never victims, or two replicas of one thing would take turns evicting each other\nthe program said:\n%s",
 			low, len(left)-len(after), tail(p.Stdout()))
+	}
+
+	// Victim order: the first worker alone has room, holding one mid pod and
+	// three low. Evicting two low makes room for urgent, and so does evicting
+	// mid and one low; only the first takes the least important pods.
+	for _, name := range seeded {
+		if err := env.Client.CoreV1().Pods(env.Namespace).Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &zero}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete pod %s: %w", name, err)
+		}
+	}
+	if err := waitFor(ctx, "this stage's pods to be gone", 60*time.Second, func(ctx context.Context) (bool, error) {
+		for _, name := range seeded {
+			if _, err := env.Client.CoreV1().Pods(env.Namespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
+				return false, nil
+			} else if !apierrors.IsNotFound(err) {
+				return false, err
+			}
+		}
+		return true, nil
+	}); err != nil {
+		return err
+	}
+	for _, w := range workers[1:] {
+		name := "full-" + w
+		seeded = append(seeded, name)
+		if err := seedBallast(ctx, env, name, w, corev1.ResourceList{corev1.ResourceCPU: room[corev1.ResourceCPU]}); err != nil {
+			return err
+		}
+	}
+	for _, pod := range []struct{ name, class, cpu string }{
+		{"middling", mid, shareOfCPU(room[corev1.ResourceCPU], 30)},
+		{"spare-1", low, shareOfCPU(room[corev1.ResourceCPU], 20)},
+		{"spare-2", low, shareOfCPU(room[corev1.ResourceCPU], 20)},
+		{"spare-3", low, shareOfCPU(room[corev1.ResourceCPU], 20)},
+	} {
+		seeded = append(seeded, pod.name)
+		if err := seedPriorityPod(ctx, env, pod.name, pod.class, pod.cpu); err != nil {
+			return err
+		}
+		if node, err := boundNode(ctx, env, pod.name, 60*time.Second); err != nil {
+			return fmt.Errorf("pod %s asks for %s and %s has room for it: %w\nthe program said:\n%s", pod.name, pod.cpu, workers[0], err, tail(p.Stdout()))
+		} else if node != workers[0] {
+			return fmt.Errorf("pod %s was placed on %s, which ballast fills: only %s has room\nthe program said:\n%s", pod.name, node, workers[0], tail(p.Stdout()))
+		}
+	}
+	urgentCPU := shareOfCPU(room[corev1.ResourceCPU], 45)
+	seeded = append(seeded, "urgent")
+	if err := seedPriorityPod(ctx, env, "urgent", high, urgentCPU); err != nil {
+		return err
+	}
+	if _, err := boundNode(ctx, env, "urgent", 75*time.Second); err != nil {
+		return fmt.Errorf("pod urgent is of class %s (value %d) and %s is full of pods that matter less: room is made by evicting them: %w\nthe program said:\n%s",
+			high, highPriority, workers[0], err, tail(p.Stdout()))
+	}
+	spares, err := survivors(ctx, env, "spare-")
+	if err != nil {
+		return err
+	}
+	kept, err := survivors(ctx, env, "middling")
+	if err != nil {
+		return err
+	}
+	if len(kept) != 1 || len(spares) != 1 {
+		return fmt.Errorf("pod urgent asks for %s on %s, which holds pod middling of class %s (value %d) and three pods of class %s (value %d): victims are taken lowest priority first, so two of the %s pods go and middling stays; instead middling survived: %t, and %d of the three %s pods survived\nthe program said:\n%s",
+			urgentCPU, workers[0], mid, midPriority, low, lowPriority, low, len(kept) == 1, len(spares), low, tail(p.Stdout()))
 	}
 	return nil
 }
