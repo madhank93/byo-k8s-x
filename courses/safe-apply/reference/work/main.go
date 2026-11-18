@@ -17,6 +17,8 @@
 // Stage 10: a field another manager owns is a conflict, named with its owner;
 // apply dry-runs everything first and writes nothing if anything is refused.
 // Stage 11: --force-conflicts takes the contested fields, and says which.
+// Stage 12: apply --set labels what it writes; `prune` lists the set's members
+// the manifest no longer names.
 
 package main
 
@@ -38,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/jsonmergepatch"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
@@ -57,6 +60,7 @@ type opts struct {
 	file    string
 	unified bool
 	force   bool
+	set     string
 }
 
 func main() {
@@ -70,6 +74,7 @@ func main() {
 	fs.StringVar(&o.file, "f", "", "manifest file")
 	fs.BoolVar(&o.unified, "unified", false, "diff: render as a unified diff of YAML")
 	fs.BoolVar(&o.force, "force-conflicts", false, "take fields other managers own")
+	fs.StringVar(&o.set, "set", "", "apply set: label applied objects as members, prune within it")
 	fs.Parse(os.Args[2:])
 
 	code, err := run(cmd, o)
@@ -84,6 +89,9 @@ func main() {
 
 func run(cmd string, opt opts) (int, error) {
 	file := opt.file
+	if cmd == "prune" && opt.set == "" {
+		return 2, fmt.Errorf("prune needs --set: without it nothing marks which objects are this manifest's")
+	}
 	switch cmd {
 	case "objects":
 		objs, err := load(file)
@@ -95,7 +103,7 @@ func run(cmd string, opt opts) (int, error) {
 		}
 		return 0, nil
 	case "get":
-		c, objs, err := setup(file)
+		c, objs, err := setup(file, opt.set)
 		if err != nil {
 			return 2, err
 		}
@@ -112,7 +120,7 @@ func run(cmd string, opt opts) (int, error) {
 		}
 		return 0, nil
 	case "patch":
-		c, objs, err := setup(file)
+		c, objs, err := setup(file, opt.set)
 		if err != nil {
 			return 2, err
 		}
@@ -133,7 +141,7 @@ func run(cmd string, opt opts) (int, error) {
 		}
 		return 0, nil
 	case "diff":
-		c, objs, err := setup(file)
+		c, objs, err := setup(file, opt.set)
 		if err != nil {
 			return 2, err
 		}
@@ -183,7 +191,7 @@ func run(cmd string, opt opts) (int, error) {
 		}
 		return 0, nil
 	case "apply":
-		c, objs, err := setup(file)
+		c, objs, err := setup(file, opt.set)
 		if err != nil {
 			return 2, err
 		}
@@ -207,8 +215,21 @@ func run(cmd string, opt opts) (int, error) {
 			fmt.Println(ref(o), "applied")
 		}
 		return 0, nil
+	case "prune":
+		c, objs, err := setup(file, opt.set)
+		if err != nil {
+			return 2, err
+		}
+		left, err := c.leftovers(objs, opt.set)
+		if err != nil {
+			return 2, err
+		}
+		for _, o := range left {
+			fmt.Println(ref(o))
+		}
+		return 0, nil
 	case "owners":
-		c, objs, err := setup(file)
+		c, objs, err := setup(file, opt.set)
 		if err != nil {
 			return 2, err
 		}
@@ -233,6 +254,65 @@ func run(cmd string, opt opts) (int, error) {
 		return 0, nil
 	}
 	return 2, fmt.Errorf("unknown command %q", cmd)
+}
+
+// setLabel marks an object as a member of a named apply set. Membership is what
+// makes pruning safe: only an object this tool labelled can be its leftover.
+const setLabel = "byok8s.dev/set"
+
+// leftovers lists the set's members, in the namespaces this manifest touches,
+// that the manifest no longer names, sorted by Kind/name.
+//
+// A removed object's kind need not appear in the manifest any more, so every
+// listable namespaced kind is searched.
+// ponytail: one list call per kind per namespace; kubectl's ApplySet records
+// the set's kinds on a parent object instead, worth it once the API is large.
+func (c *client) leftovers(objs []*unstructured.Unstructured, set string) ([]*unstructured.Unstructured, error) {
+	keep := map[string]bool{}
+	nss := map[string]bool{c.ns: true}
+	for _, o := range objs {
+		keep[key(o)] = true
+		if o.GetNamespace() != "" {
+			nss[o.GetNamespace()] = true
+		}
+	}
+	lists, err := c.disc.ServerPreferredNamespacedResources()
+	if err != nil && !discovery.IsGroupDiscoveryFailedError(err) {
+		return nil, err
+	}
+	lists = discovery.FilteredBy(discovery.SupportsAllVerbs{Verbs: []string{"list", "delete"}}, lists)
+	seen := map[types.UID]bool{}
+	var out []*unstructured.Unstructured
+	for _, l := range lists {
+		gv, err := schema.ParseGroupVersion(l.GroupVersion)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range l.APIResources {
+			for ns := range nss {
+				items, err := c.dyn.Resource(gv.WithResource(r.Name)).Namespace(ns).List(c.ctx,
+					metav1.ListOptions{LabelSelector: setLabel + "=" + set})
+				if err != nil {
+					return nil, fmt.Errorf("list %s: %w", r.Name, err)
+				}
+				for i := range items.Items {
+					o := &items.Items[i]
+					if keep[key(o)] || seen[o.GetUID()] {
+						continue
+					}
+					seen[o.GetUID()] = true
+					out = append(out, o)
+				}
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return ref(out[i]) < ref(out[j]) })
+	return out, nil
+}
+
+// key identifies an object across versions of its kind.
+func key(o *unstructured.Unstructured) string {
+	return o.GroupVersionKind().GroupKind().String() + "/" + o.GetNamespace() + "/" + o.GetName()
 }
 
 // owner is one field one manager claims.
@@ -270,6 +350,7 @@ func ownership(live *unstructured.Unstructured) ([]owner, error) {
 type client struct {
 	ctx    context.Context
 	dyn    dynamic.Interface
+	disc   discovery.DiscoveryInterface
 	mapper meta.RESTMapper
 	ns     string
 
@@ -280,10 +361,20 @@ type client struct {
 }
 
 // setup loads the manifest and connects, the way every cluster command starts.
-func setup(file string) (*client, []*unstructured.Unstructured, error) {
+func setup(file, set string) (*client, []*unstructured.Unstructured, error) {
 	objs, err := load(file)
 	if err != nil {
 		return nil, nil, err
+	}
+	if set != "" {
+		for _, o := range objs {
+			l := o.GetLabels()
+			if l == nil {
+				l = map[string]string{}
+			}
+			l[setLabel] = set
+			o.SetLabels(l)
+		}
 	}
 	kc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
@@ -304,7 +395,7 @@ func setup(file string) (*client, []*unstructured.Unstructured, error) {
 		return nil, nil, err
 	}
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))
-	c := &client{ctx: context.Background(), dyn: dyn, mapper: mapper, ns: ns, manager: "byok8s"}
+	c := &client{ctx: context.Background(), dyn: dyn, disc: dc, mapper: mapper, ns: ns, manager: "byok8s"}
 	for _, o := range objs {
 		if _, err := c.resource(o); err != nil {
 			return nil, nil, err

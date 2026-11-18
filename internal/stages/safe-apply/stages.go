@@ -55,6 +55,7 @@ func init() {
 	register(Stage{Slug: "field-ownership", Run: stageFieldOwnership})
 	register(Stage{Slug: "conflict-detect", Run: stageConflictDetect})
 	register(Stage{Slug: "force-conflicts", Run: stageForceConflicts})
+	register(Stage{Slug: "prune-plan", Run: stagePrunePlan})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -851,6 +852,91 @@ func stageForceConflicts(ctx context.Context, env *kube.Env, bin string) error {
 		if ownsKey(got.ManagedFields, c.manager, c.key) != c.owns {
 			return fmt.Errorf("after the forced apply, %s owning data.%s should be %t; managedFields say otherwise (managers: %v)", c.manager, c.key, c.owns, managers(got.ManagedFields))
 		}
+	}
+	return nil
+}
+
+// setLabel marks an object as a member of a named apply set.
+const setLabel = "byok8s.dev/set"
+
+// labeled is a ConfigMap carrying the given labels.
+func labeled(name string, labels map[string]string) string {
+	b, _ := json.Marshal(map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap",
+		"metadata": map[string]any{"name": name, "labels": labels},
+		"data":     map[string]string{"k": "v"},
+	})
+	return string(b) + "\n"
+}
+
+// stagePrunePlan — apply --set labels what it writes, and prune lists the
+// set's members a manifest no longer names, across kinds, without touching
+// anything: not objects outside the set, not objects of another set.
+func stagePrunePlan(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	secret := `{"apiVersion":"v1","kind":"Secret","metadata":{"name":"gone-secret"},"stringData":{"k":"v"}}` + "\n"
+	v1 := w.file("v1.yaml", cm("keep", map[string]string{"k": "v"})+"---\n"+cm("gone-cm", map[string]string{"k": "v"})+"---\n"+secret)
+	v2 := w.file("v2.yaml", cm("keep", map[string]string{"k": "v"}))
+
+	res, err := w.run("apply", "--set", "web", "-f", v1)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	got, err := env.ConfigMap(ctx, "keep")
+	if err != nil {
+		return err
+	}
+	if got.Labels[setLabel] != "web" {
+		return fmt.Errorf("apply --set web should label what it writes %s=web, ConfigMap/keep has labels %v", setLabel, got.Labels)
+	}
+	if err := env.SeedConfigMap(ctx, "stranger"); err != nil {
+		return err
+	}
+	if err := w.applyAs("other-tool", labeled("other-set", map[string]string{setLabel: "api"})); err != nil {
+		return err
+	}
+
+	res, err = w.run("prune", "--set", "web", "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	want := []string{"ConfigMap/gone-cm", "Secret/gone-secret"}
+	if g := lines(res.Stdout); strings.Join(g, "\n") != strings.Join(want, "\n") {
+		return fmt.Errorf("expected exactly these lines, sorted — the members of set web the manifest no longer names, whatever their kind:\n  %s\nConfigMap/stranger carries no set label and ConfigMap/other-set belongs to set api, so neither is listed; got:\n%s",
+			strings.Join(want, "\n  "), tail(res.Stdout))
+	}
+	if _, err := env.ConfigMap(ctx, "gone-cm"); err != nil {
+		return fmt.Errorf("prune only plans; ConfigMap/gone-cm is gone: %w", err)
+	}
+
+	res, err = w.run("prune", "--set", "web", "-f", v1)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if out := strings.TrimSpace(res.Stdout); out != "" {
+		return fmt.Errorf("every member of set web is in v1.yaml, so there is nothing to prune; got:\n%s", tail(res.Stdout))
+	}
+
+	res, err = w.run("prune", "-f", v2)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return fmt.Errorf("prune without --set cannot know what is its own and must fail, got exit 0:\n%s", tail(res.Stdout))
 	}
 	return nil
 }
