@@ -19,6 +19,8 @@
 // Stage 11: --force-conflicts takes the contested fields, and says which.
 // Stage 12: apply --set labels what it writes; `prune` lists the set's members
 // the manifest no longer names.
+// Stage 13: apply --prune deletes them, guarded: never one marked
+// prune: disabled, never after a refused apply, never from an empty manifest.
 
 package main
 
@@ -61,6 +63,7 @@ type opts struct {
 	unified bool
 	force   bool
 	set     string
+	prune   bool
 }
 
 func main() {
@@ -74,6 +77,7 @@ func main() {
 	fs.StringVar(&o.file, "f", "", "manifest file")
 	fs.BoolVar(&o.unified, "unified", false, "diff: render as a unified diff of YAML")
 	fs.BoolVar(&o.force, "force-conflicts", false, "take fields other managers own")
+	fs.BoolVar(&o.prune, "prune", false, "apply: delete members of --set the manifest no longer names")
 	fs.StringVar(&o.set, "set", "", "apply set: label applied objects as members, prune within it")
 	fs.Parse(os.Args[2:])
 
@@ -89,7 +93,7 @@ func main() {
 
 func run(cmd string, opt opts) (int, error) {
 	file := opt.file
-	if cmd == "prune" && opt.set == "" {
+	if (cmd == "prune" || opt.prune) && opt.set == "" {
 		return 2, fmt.Errorf("prune needs --set: without it nothing marks which objects are this manifest's")
 	}
 	switch cmd {
@@ -195,6 +199,9 @@ func run(cmd string, opt opts) (int, error) {
 		if err != nil {
 			return 2, err
 		}
+		if opt.prune && len(objs) == 0 {
+			return 2, fmt.Errorf("refusing to prune from an empty manifest: it would delete every member of set %q", opt.set)
+		}
 		var taken []string
 		if opt.force {
 			if taken, err = c.takes(objs); err != nil {
@@ -214,6 +221,9 @@ func run(cmd string, opt opts) (int, error) {
 			}
 			fmt.Println(ref(o), "applied")
 		}
+		if opt.prune {
+			return c.pruneSet(objs, opt.set)
+		}
 		return 0, nil
 	case "prune":
 		c, objs, err := setup(file, opt.set)
@@ -225,6 +235,10 @@ func run(cmd string, opt opts) (int, error) {
 			return 2, err
 		}
 		for _, o := range left {
+			if pruneDisabled(o) {
+				fmt.Println(ref(o), "kept: prune disabled")
+				continue
+			}
 			fmt.Println(ref(o))
 		}
 		return 0, nil
@@ -308,6 +322,49 @@ func (c *client) leftovers(objs []*unstructured.Unstructured, set string) ([]*un
 	}
 	sort.Slice(out, func(i, j int) bool { return ref(out[i]) < ref(out[j]) })
 	return out, nil
+}
+
+// pruneAnnotation set to "disabled" keeps an object out of every prune.
+const pruneAnnotation = "byok8s.dev/prune"
+
+func pruneDisabled(o *unstructured.Unstructured) bool {
+	return o.GetAnnotations()[pruneAnnotation] == "disabled"
+}
+
+// pruneSet deletes the set's leftovers. Each delete is conditional on the UID
+// and resourceVersion the plan saw, so an object recreated or changed since —
+// relabelled into another set, say — is left alone rather than deleted blind.
+func (c *client) pruneSet(objs []*unstructured.Unstructured, set string) (int, error) {
+	left, err := c.leftovers(objs, set)
+	if err != nil {
+		return 1, err
+	}
+	code := 0
+	for _, o := range left {
+		if pruneDisabled(o) {
+			fmt.Println(ref(o), "kept: prune disabled")
+			continue
+		}
+		r, err := c.resource(o)
+		if err != nil {
+			return 1, err
+		}
+		uid, rv := o.GetUID(), o.GetResourceVersion()
+		err = r.Delete(c.ctx, o.GetName(), metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &rv},
+		})
+		switch {
+		case err == nil:
+			fmt.Println(ref(o), "pruned")
+		case apierrors.IsNotFound(err):
+		case apierrors.IsConflict(err):
+			fmt.Println(ref(o), "kept: changed since the plan")
+			code = 1
+		default:
+			return 1, fmt.Errorf("%s: %w", ref(o), err)
+		}
+	}
+	return code, nil
 }
 
 // key identifies an object across versions of its kind.

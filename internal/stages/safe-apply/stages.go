@@ -56,6 +56,7 @@ func init() {
 	register(Stage{Slug: "conflict-detect", Run: stageConflictDetect})
 	register(Stage{Slug: "force-conflicts", Run: stageForceConflicts})
 	register(Stage{Slug: "prune-plan", Run: stagePrunePlan})
+	register(Stage{Slug: "prune-guard", Run: stagePruneGuard})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -937,6 +938,103 @@ func stagePrunePlan(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if res.ExitCode == 0 {
 		return fmt.Errorf("prune without --set cannot know what is its own and must fail, got exit 0:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// stagePruneGuard — apply --prune deletes the set's leftovers, and only those:
+// never one marked prune: disabled, never anything when the apply itself was
+// refused, and never the whole set because the manifest came out empty.
+func stagePruneGuard(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	exists := func(name string) bool { _, err := env.ConfigMap(ctx, name); return err == nil }
+	protected := `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"precious","annotations":{"byok8s.dev/prune":"disabled"}},"data":{"k":"v"}}` + "\n"
+	v1 := w.file("v1.yaml", cm("keep", map[string]string{"k": "v"})+"---\n"+cm("gone", map[string]string{"k": "v"})+"---\n"+protected)
+	v2 := w.file("v2.yaml", cm("keep", map[string]string{"k": "v"}))
+
+	res, err := w.run("apply", "--set", "web", "-f", v1)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := env.SeedConfigMap(ctx, "stranger"); err != nil {
+		return err
+	}
+	if err := w.applyAs("other-tool", labeled("other-set", map[string]string{setLabel: "api"})); err != nil {
+		return err
+	}
+
+	res, err = w.run("apply", "--set", "web", "--prune", "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if exists("gone") {
+		return fmt.Errorf("ConfigMap/gone is a member of set web that v2.yaml dropped, so apply --prune deletes it; it is still there\nstdout:\n%s", tail(res.Stdout))
+	}
+	if !strings.Contains(res.Stdout, "ConfigMap/gone pruned") {
+		return fmt.Errorf("expected a line \"ConfigMap/gone pruned\", got:\n%s", tail(res.Stdout))
+	}
+	if !exists("precious") {
+		return fmt.Errorf("ConfigMap/precious is annotated byok8s.dev/prune: disabled and must never be pruned, but it was deleted")
+	}
+	if !strings.Contains(res.Stdout, "ConfigMap/precious") {
+		return fmt.Errorf("an object kept because pruning is disabled for it should still be named, so nobody wonders why it survived; got:\n%s", tail(res.Stdout))
+	}
+	for _, name := range []string{"keep", "stranger", "other-set"} {
+		if !exists(name) {
+			return fmt.Errorf("ConfigMap/%s is not a leftover of set web, and apply --prune deleted it\nstdout:\n%s", name, tail(res.Stdout))
+		}
+	}
+
+	// A refused apply prunes nothing.
+	res, err = w.run("apply", "--set", "web", "-f", w.file("v3.yaml", cm("keep", map[string]string{"k": "v"})+"---\n"+cm("later", map[string]string{"k": "v"})))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := w.applyAs("other-tool", cm("keep", map[string]string{"k": "theirs"})); err != nil {
+		return err
+	}
+	res, err = w.run("apply", "--set", "web", "--prune", "-f", w.file("v4.yaml", cm("keep", map[string]string{"k": "ours"})))
+	if err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return fmt.Errorf("apply over other-tool's field must fail, got exit 0:\n%s", tail(res.Stdout))
+	}
+	if !exists("later") {
+		return fmt.Errorf("the apply was refused, yet ConfigMap/later was pruned: prune only after every object has been applied")
+	}
+
+	// An empty manifest is a mistake far more often than an intent.
+	res, err = w.run("apply", "--set", "web", "--prune", "-f", w.file("empty.yaml", "# nothing here\n"))
+	if err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return fmt.Errorf("apply --prune of an empty manifest would delete the whole set; it must refuse, got exit 0:\n%s", tail(res.Stdout))
+	}
+	if !exists("later") || !exists("keep") {
+		return fmt.Errorf("apply --prune of an empty manifest deleted members of set web")
+	}
+	res, err = w.run("apply", "--prune", "-f", v2)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return fmt.Errorf("apply --prune without --set cannot know what is its own and must fail, got exit 0:\n%s", tail(res.Stdout))
 	}
 	return nil
 }
