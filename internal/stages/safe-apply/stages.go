@@ -53,6 +53,7 @@ func init() {
 	register(Stage{Slug: "admission-preview", Run: stageAdmissionPreview})
 	register(Stage{Slug: "managed-fields", Run: stageManagedFields})
 	register(Stage{Slug: "field-ownership", Run: stageFieldOwnership})
+	register(Stage{Slug: "conflict-detect", Run: stageConflictDetect})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -711,6 +712,68 @@ func stageFieldOwnership(ctx context.Context, env *kube.Env, bin string) error {
 	want := map[string]string{"keep": "k", "shared": "s", "theirs": "t"}
 	if !reflect.DeepEqual(got.Data, want) {
 		return fmt.Errorf("after applying v2, expected data %v (mine was byok8s's alone and is gone; shared and theirs belong to other-tool too), got %v", want, got.Data)
+	}
+	return nil
+}
+
+// conflictLine finds the line naming a conflict on field, owned by manager.
+func conflictLine(out, obj, field, manager string) bool {
+	for _, l := range lines(out) {
+		if strings.HasPrefix(l, obj) && strings.Contains(l, "conflict") &&
+			strings.Contains(l, field) && strings.Contains(l, manager) {
+			return true
+		}
+	}
+	return false
+}
+
+// stageConflictDetect — a field another manager owns stops both diff and
+// apply, the conflict names the field and its owner, and apply writes nothing
+// at all, not even the objects that would have gone through.
+func stageConflictDetect(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.applyAs("other-tool", cm("contested", map[string]string{"greeting": "theirs"})); err != nil {
+		return err
+	}
+	m := w.file("m.yaml", cm("bystander", map[string]string{"x": "1"})+"---\n"+cm("contested", map[string]string{"greeting": "ours"}))
+
+	res, err := w.run("diff", "-f", m)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 2); err != nil {
+		return err
+	}
+	if !conflictLine(res.Stdout, "ConfigMap/contested", ".data.greeting", "other-tool") {
+		return fmt.Errorf("expected a line for ConfigMap/contested naming the conflict, the field .data.greeting and its owner other-tool, got:\n%s", tail(res.Stdout))
+	}
+	if err := hasLines(parseDiff(res.Stdout), "ConfigMap/bystander", `+ .data.x: "1"`); err != nil {
+		return fmt.Errorf("a conflict on one object must not hide the rest of the diff: %w", err)
+	}
+
+	res, err = w.run("apply", "-f", m)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return fmt.Errorf("apply over another manager's field must fail, got exit 0:\n%s", tail(res.Stdout))
+	}
+	if !conflictLine(res.Stdout, "ConfigMap/contested", ".data.greeting", "other-tool") {
+		return fmt.Errorf("apply should say which field conflicts and with whom, got:\n%s", tail(res.Stdout))
+	}
+	if _, err := env.ConfigMap(ctx, "bystander"); err == nil {
+		return fmt.Errorf("ConfigMap/bystander was created although the change as a whole was refused — check every object before writing any")
+	}
+	got, err := env.ConfigMap(ctx, "contested")
+	if err != nil {
+		return err
+	}
+	if got.Data["greeting"] != "theirs" {
+		return fmt.Errorf("the contested value changed to %q without --force-conflicts", got.Data["greeting"])
 	}
 	return nil
 }

@@ -14,6 +14,8 @@
 // rest of the diff still runs.
 // Stage 8: `owners -f FILE` reads managedFields: who owns each field, and how.
 // Stage 9: `apply -f FILE` applies for real, letting go of fields it drops.
+// Stage 10: a field another manager owns is a conflict, named with its owner;
+// apply dry-runs everything first and writes nothing if anything is refused.
 
 package main
 
@@ -142,7 +144,7 @@ func run(cmd string, opt opts) (int, error) {
 			after, err := c.after(o)
 			if refusal(err) {
 				refused = true
-				fmt.Printf("%s: rejected: %s\n", ref(o), err)
+				report(o, err)
 				pairs = append(pairs, [2]*unstructured.Unstructured{nil, nil})
 				continue
 			}
@@ -180,6 +182,9 @@ func run(cmd string, opt opts) (int, error) {
 		c, objs, err := setup(file)
 		if err != nil {
 			return 2, err
+		}
+		if !c.preflight(objs) {
+			return 1, fmt.Errorf("nothing applied: the server refused part of this change")
 		}
 		for _, o := range objs {
 			if _, err := c.apply(o, false); err != nil {
@@ -332,6 +337,40 @@ func (c *client) live(o *unstructured.Unstructured) (*unstructured.Unstructured,
 // defaulting, admission and the ownership merge, and stops before storage.
 func (c *client) after(o *unstructured.Unstructured) (*unstructured.Unstructured, error) {
 	return c.apply(o, true)
+}
+
+// preflight dry-runs every object and reports each refusal. Applying only once
+// every object would be accepted is what keeps a refused change from landing
+// half-done.
+func (c *client) preflight(objs []*unstructured.Unstructured) bool {
+	ok := true
+	for _, o := range objs {
+		if _, err := c.apply(o, true); err != nil {
+			report(o, err)
+			ok = false
+		}
+	}
+	return ok
+}
+
+// report prints why the server refused an object. A conflict is listed field by
+// field with the manager that owns it, because that is the question the user
+// has to answer: take the field, or leave it to them.
+func report(o *unstructured.Unstructured, err error) {
+	var status apierrors.APIStatus
+	if apierrors.IsConflict(err) && errors.As(err, &status) && status.Status().Details != nil {
+		for _, cause := range status.Status().Details.Causes {
+			if cause.Type != metav1.CauseTypeFieldManagerConflict {
+				continue
+			}
+			// The message reads: conflict with "manager" [using v1]: .path
+			_, rest, _ := strings.Cut(cause.Message, `"`)
+			manager, _, _ := strings.Cut(rest, `"`)
+			fmt.Printf("%s: conflict: %s owned by %q\n", ref(o), cause.Field, manager)
+		}
+		return
+	}
+	fmt.Printf("%s: rejected: %s\n", ref(o), err)
 }
 
 // refusal reports whether err is the server answering no — admission,
