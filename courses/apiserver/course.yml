@@ -1,0 +1,97 @@
+slug: apiserver
+name: Build your own kube-apiserver
+language: go
+entrypoint: main.go
+# No cluster: this course builds the thing the others are clients of, so its
+# stages talk to the learner's own server over HTTP.
+stages:
+  - slug: serve
+    name: Something that answers
+    difficulty: easy
+  - slug: discovery-root
+    name: What this server can do
+    difficulty: medium
+  - slug: resource-create
+    name: The first thing worth storing
+    difficulty: medium
+  - slug: resource-get
+    name: Ask for it by name
+    difficulty: easy
+  - slug: list
+    name: All of them, in order
+    difficulty: medium
+  - slug: update
+    name: The write that can lose a race
+    difficulty: medium
+  - slug: delete
+    name: Taking it back out
+    difficulty: medium
+  - slug: etcd
+    name: The part that survives a restart
+    difficulty: medium
+  - slug: resourceversion
+    name: How fresh an answer has to be
+    difficulty: medium
+  - slug: namespaces
+    name: The object every other object is in
+    difficulty: medium
+  - slug: field-selector
+    name: Only the ones that match
+    difficulty: medium
+  - slug: label-selector
+    name: The way everything finds everything
+    difficulty: medium
+  - slug: pagination
+    name: A collection too big for one answer
+    difficulty: medium
+  - slug: watch
+    name: The request that never ends
+    difficulty: hard
+  - slug: watch-from-rv
+    name: Catching up without starting over
+    difficulty: hard
+  - slug: bookmarks
+    name: Nothing happened, and here is proof
+    difficulty: medium
+  - slug: patch-merge
+    name: Saying only what changed
+    difficulty: medium
+  - slug: patch-json
+    name: One element of a list
+    difficulty: hard
+  - slug: patch-strategic
+    name: Lists that belong to more than one writer
+    difficulty: hard
+  - slug: apply-ssa
+    name: One owner per field
+    difficulty: hard
+  - slug: apply-conflict
+    name: Two writers, one field
+    difficulty: hard
+  - slug: subresource-status
+    name: The half of the object that isn't yours
+    difficulty: medium
+  - slug: subresource-scale
+    name: How many, and nothing else
+    difficulty: hard
+  - slug: openapi
+    name: The schema kubectl reads first
+    difficulty: medium
+  - slug: authn-token
+    name: Who is asking
+    difficulty: medium
+  - slug: authn-cert
+    name: The certificate is the name
+    difficulty: hard
+  - slug: authz-rbac
+    name: May they do this
+    difficulty: hard
+  - slug: admission-chain
+    name: Everyone else gets a say
+    difficulty: hard
+  - slug: audit-log
+    name: Who did what, written down
+    difficulty: hard
+  - slug: kubectl-drives-it
+    name: The client you did not write
+    difficulty: hard

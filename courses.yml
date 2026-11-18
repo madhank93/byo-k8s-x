@@ -29,13 +29,13 @@ entries:
 
   - slug: scheduler
     name: Build your own scheduler
-    status: planned
+    status: shipped
     tier: control loops
     blurb: Filter, score, bind — then priority and preemption.
 
   - slug: apiserver
     name: Build your own kube-apiserver
-    status: planned
+    status: shipped
     tier: the API plane
     blurb: REST over etcd, watch, server-side apply, RBAC — driven by real kubectl.
 
