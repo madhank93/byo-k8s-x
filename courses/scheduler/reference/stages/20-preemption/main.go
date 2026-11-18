@@ -22,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -467,6 +468,59 @@ func siblingsOn(pod *corev1.Pod, node *corev1.Node, placed []*corev1.Pod) int64 
 	return n
 }
 
+// assumeCache holds the pods this program is binding or has bound until the
+// all-pods cache shows them bound. Bind returns before the watch delivers that
+// change, and a cycle reading the stale copy would count the node as still free.
+type assumeCache struct {
+	mu   sync.Mutex
+	pods map[types.UID]*corev1.Pod
+}
+
+// record counts the pod against node from now on, whatever the cache says.
+func (a *assumeCache) record(pod *corev1.Pod, node string) {
+	p := pod.DeepCopy()
+	p.Spec.NodeName = node
+	a.mu.Lock()
+	a.pods[p.UID] = p
+	a.mu.Unlock()
+}
+
+// forget drops a deleted pod: its room is free whether or not the cache ever
+// showed it bound.
+func (a *assumeCache) forget(obj any) {
+	if t, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = t.Obj
+	}
+	if p, ok := obj.(*corev1.Pod); ok {
+		a.mu.Lock()
+		delete(a.pods, p.UID)
+		a.mu.Unlock()
+	}
+}
+
+// merge puts each assumed pod in place of a cached copy that is missing or not
+// yet bound, and stops assuming the ones the cache now shows bound.
+func (a *assumeCache) merge(placed []*corev1.Pod) []*corev1.Pod {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	unbound := map[types.UID]int{}
+	for i, p := range placed {
+		if p.Spec.NodeName != "" {
+			delete(a.pods, p.UID)
+		} else {
+			unbound[p.UID] = i
+		}
+	}
+	for uid, p := range a.pods {
+		if i, ok := unbound[uid]; ok {
+			placed[i] = p
+		} else {
+			placed = append(placed, p)
+		}
+	}
+	return placed
+}
+
 func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
@@ -508,6 +562,8 @@ func run() error {
 	allPods := nodeFactory.Core().V1().Pods()
 	podLister := allPods.Lister()
 	allPodsInformer := allPods.Informer()
+	// The pods this program binds, until the cache above shows them bound.
+	assumed := &assumeCache{pods: map[types.UID]*corev1.Pod{}}
 
 	// The volumes a pod mounts, and where they can be reached from: a claim
 	// names a volume, and the volume names the nodes that can see it.
@@ -531,6 +587,7 @@ func run() error {
 		if err != nil {
 			return ""
 		}
+		placed = assumed.merge(placed)
 		placed = others(placed, pod)
 		var candidates []*corev1.Node
 		for _, n := range all {
@@ -659,7 +716,7 @@ func run() error {
 			// first, and their going brings it back to the queue.
 			if all, err := nodeLister.List(labels.Everything()); err == nil {
 				if placed, err := podLister.List(labels.Everything()); err == nil {
-					placed = others(placed, pod)
+					placed = others(assumed.merge(placed), pod)
 					on, victims := "", []*corev1.Pod(nil)
 					// Room already being made is room enough: victims take a
 					// moment to go, and a pod that asks again while they do
@@ -695,8 +752,10 @@ func run() error {
 			notify()
 			return
 		}
+		assumed.record(pod, target)
 		// One pod that cannot be placed must not stop the others.
 		if err := bind(ctx, cs, pod, target); err != nil {
+			assumed.forget(pod)
 			fmt.Fprintf(os.Stderr, "bind %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			return
 		}
@@ -750,7 +809,7 @@ func run() error {
 	// a node arriving — and it is how a preempted pod's room reaches the pod
 	// that preempted it.
 	if _, err := allPodsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		DeleteFunc: func(any) { requeueAll() },
+		DeleteFunc: func(obj any) { assumed.forget(obj); requeueAll() },
 	}); err != nil {
 		return fmt.Errorf("watch placed pods: %w", err)
 	}
