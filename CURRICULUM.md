@@ -38,7 +38,7 @@ patch, scale, describe, logs, exec, port-forward.
 **Verified by** running your binary as a subprocess against a seeded namespace
 and asserting on its exit code and stdout.
 
-### `safe-apply` — Build your own diff and safe apply · 18 stages
+### [x] `safe-apply` — Build your own diff and safe apply · 18 stages
 
 What `kubectl diff` and `--server-side` actually do, and how to tell someone
 what a change will do before it does it. Takes `kubectl`'s apply stages as its

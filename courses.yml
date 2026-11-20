@@ -11,7 +11,7 @@ entries:
 
   - slug: safe-apply
     name: Build your own diff and safe apply
-    status: planned
+    status: shipped
     tier: the client
     blurb: Server-side dry-run, a three-way diff, and a change you can read before it lands.
 
