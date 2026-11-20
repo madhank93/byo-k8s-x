@@ -24,6 +24,10 @@ and you get a conflict with a manager no one runs any more:
 ConfigMap/cfg: conflict: .data.k owned by "kubectl-client-side-apply"
 ```
 
+kubectl only migrates after an apply succeeds, so it doesn't prevent that
+first conflict either; the grader's first server-side apply changes no values
+for that reason.
+
 `kubectl apply --server-side` migrates the object instead. After its apply,
 it looks for `Update` managers that own the last-applied annotation, the mark
 of client-side apply. It merges their field sets into its own `Apply` entry
@@ -39,7 +43,8 @@ second apply:
 
 The annotation goes too. After the merge, your manager owns it and your
 manifest doesn't mention it. Your tool has to do the same, as `byok8s`, after
-every real apply. Once it does, `kubectl diff --server-side` finds nothing to
+every real apply, whether it came from `apply -f` or `apply --plan`, and in
+place: the object keeps its `uid`, and a Service its cluster IP. Once it does, `kubectl diff --server-side` finds nothing to
 change after your apply, and `kubectl apply --server-side` after yours writes
 nothing at all: the resourceVersion stays the same.
 

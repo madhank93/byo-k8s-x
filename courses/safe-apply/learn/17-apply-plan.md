@@ -23,8 +23,9 @@ the plan was made, so apply first checks every pin:
   delete      same uid, same resourceVersion
 ```
 
-If any pin fails, nothing is written. Each stale object gets a line, the
-command exits 1, and the answer is to plan again:
+If any pin fails, nothing is written. Each stale object gets a line, and
+only the stale ones: an `unchanged` object someone edited counts, one nobody
+touched does not. The command exits 1, and the answer is to plan again:
 
 ```
 ConfigMap/same-a changed since the plan
@@ -57,7 +58,9 @@ anyway.
 
 - `o.SetUID(types.UID(ch.UID))`, `o.SetResourceVersion(ch.ResourceVersion)`
   on a copy of the planned object, never on the copy you keep.
-- `apierrors.IsConflict(err)`: a pin failed at write time.
+- A pin that fails at write time comes back as a 409 Conflict, or as a 422
+  Invalid when the `uid` now names a different object (deleted and
+  recreated). Don't branch on `apierrors.IsConflict(err)` alone.
 
 ## Hints
 

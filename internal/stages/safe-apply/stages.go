@@ -1538,11 +1538,13 @@ func stageApplyPlan(ctx context.Context, env *kube.Env, bin string) error {
 	}
 
 	// Each disturbance lands between plan and apply; the whole plan is refused.
+	// Only the up-front pin check is graded: every disturbance here lands before
+	// apply starts, so the pins sent with each write are never what refuses it.
 	v3 := w.file("v3.yaml", cm("same-a", map[string]string{"k": "v2"})+"---\n"+
 		cm("new-a", map[string]string{"k": "reviewed"})+"---\n"+cm("new-c", map[string]string{"k": "v"}))
 	untouched := func(what string, res *runner.Result, newC bool) error {
-		if res.ExitCode == 0 {
-			return fmt.Errorf("%s after the plan was made, so applying it must fail; got exit 0:\n%s", what, tail(res.Stdout))
+		if res.ExitCode != 1 {
+			return fmt.Errorf("%s after the plan was made, so applying it must fail with exit 1; got exit %d:\n%s", what, res.ExitCode, tail(res.Stdout))
 		}
 		if data("same-a") != "v" {
 			return fmt.Errorf("%s after the plan was made, yet ConfigMap/same-a was updated: check every pin before writing anything\nstdout:\n%s", what, tail(res.Stdout))
@@ -1570,6 +1572,7 @@ func stageApplyPlan(ctx context.Context, env *kube.Env, bin string) error {
 			}
 			return w.applyAs("other-tool", labeled("new-b", map[string]string{setLabel: "web"}))
 		}, false},
+		{"ConfigMap/new-a, planned unchanged, was edited", "new-a", func() error { return w.updateAs("kubectl-edit", "new-a", "extra", "x") }, false},
 	} {
 		p := filepath.Join(w.dir, d.name+".json")
 		res, err := w.run("plan", "--set", "web", "--prune", "--out", p, "-f", v3)
@@ -1589,8 +1592,14 @@ func stageApplyPlan(ctx context.Context, env *kube.Env, bin string) error {
 		if err := untouched(d.what, res, d.newC); err != nil {
 			return err
 		}
-		if !strings.Contains(res.Stdout, "ConfigMap/"+d.name) {
-			return fmt.Errorf("%s after the plan was made; the refusal should name ConfigMap/%s, got:\n%s", d.what, d.name, tail(res.Stdout))
+		var stale []string
+		for _, l := range lines(res.Stdout) {
+			if strings.HasSuffix(l, " changed since the plan") {
+				stale = append(stale, strings.TrimSuffix(l, " changed since the plan"))
+			}
+		}
+		if len(stale) != 1 || stale[0] != "ConfigMap/"+d.name {
+			return fmt.Errorf("%s after the plan was made; the refusal names it, and only it, in a line \"ConfigMap/%s changed since the plan\", got:\n%s", d.what, d.name, tail(res.Stdout))
 		}
 		if d.newC {
 			if err := env.Client.CoreV1().ConfigMaps(env.Namespace).Delete(ctx, "new-c", metav1.DeleteOptions{}); err != nil {
@@ -1650,7 +1659,7 @@ func service(name string, ports ...[2]int) string {
 func parityState(ctx context.Context, env *kube.Env) (map[string]any, error) {
 	core := env.Client.CoreV1()
 	var objs []any
-	for _, name := range []string{"cfg", "fresh"} {
+	for _, name := range parityConfigMaps {
 		c, err := core.ConfigMaps(env.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
@@ -1683,9 +1692,50 @@ func parityState(ctx context.Context, env *kube.Env) (map[string]any, error) {
 		if err := unstructured.SetNestedSlice(m, mf, "metadata", "managedFields"); err != nil {
 			return nil, err
 		}
-		out[[]string{"ConfigMap/cfg", "ConfigMap/fresh", "Service/web"}[i]] = m
+		out[[]string{"ConfigMap/cfg", "ConfigMap/fresh", "ConfigMap/late", "Service/web"}[i]] = m
 	}
 	return out, nil
+}
+
+// parityConfigMaps are the ConfigMaps the parity stage writes; Service/web is
+// the other object.
+var parityConfigMaps = []string{"cfg", "fresh", "late"}
+
+// identities maps each parity object that exists to its uid, plus the
+// Service's cluster IP: what a delete and recreate would change.
+func identities(ctx context.Context, env *kube.Env) (map[string]string, error) {
+	core := env.Client.CoreV1()
+	out := map[string]string{}
+	for _, name := range parityConfigMaps {
+		c, err := core.ConfigMaps(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out["ConfigMap/"+name+" uid"] = string(c.UID)
+	}
+	svc, err := core.Services(env.Namespace).Get(ctx, "web", metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out["Service/web uid"] = string(svc.UID)
+	out["Service/web clusterIP"] = svc.Spec.ClusterIP
+	return out, nil
+}
+
+// kubectlMinor reads the client's minor version, which may carry a "+" suffix.
+func kubectlMinor(out string) (int, error) {
+	var v struct {
+		ClientVersion struct{ Minor string } `json:"clientVersion"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		return 0, err
+	}
+	var minor int
+	_, err := fmt.Sscanf(v.ClientVersion.Minor, "%d", &minor)
+	return minor, err
 }
 
 // flatten lists every leaf of a decoded JSON value as path → value.
@@ -1745,34 +1795,59 @@ func stageKubectlParity(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	defer w.close()
+	// A user's kuberc or external diff tool would change what kubectl does.
+	kenv := append([]string{"KUBERC=off", "KUBECTL_EXTERNAL_DIFF="}, w.kc...)
 	kubectl := func(args ...string) (*runner.Result, error) {
-		return runner.InvokeEnv(ctx, "kubectl", w.kc, stages.Timeout, args...)
+		return runner.InvokeEnv(ctx, "kubectl", kenv, stages.Timeout, args...)
+	}
+	res, err := kubectl("version", "--client", "-o", "json")
+	if err != nil {
+		return err
+	}
+	if minor, err := kubectlMinor(res.Stdout); err != nil || minor < 26 {
+		return fmt.Errorf("this stage needs kubectl 1.26 or later, whose apply --server-side migrates client-side apply; kubectl version --client says:\n%s", tail(res.Stdout))
 	}
 	// v1 is applied client-side; v2 drops a key and a port, which only go if
 	// the client-side owner's fields are taken over; v3 changes values that
-	// owner used to hold.
+	// owner used to hold, and is the first apply to touch late.
+	late := cm("late", map[string]string{"k": "1", "old": "x"})
 	v := []string{
-		w.file("v1.yaml", cm("cfg", map[string]string{"k": "1", "old": "x"})+"---\n"+service("web", [2]int{80, 8080}, [2]int{443, 8443})),
+		w.file("v1.yaml", cm("cfg", map[string]string{"k": "1", "old": "x"})+"---\n"+service("web", [2]int{80, 8080}, [2]int{443, 8443})+"---\n"+late),
 		w.file("v2.yaml", cm("cfg", map[string]string{"k": "1"})+"---\n"+service("web", [2]int{80, 8080})+"---\n"+cm("fresh", map[string]string{"k": "v"})),
-		w.file("v3.yaml", cm("cfg", map[string]string{"k": "2", "new": "y"})+"---\n"+service("web", [2]int{80, 9090})+"---\n"+cm("fresh", map[string]string{"k": "v"})),
+		w.file("v3.yaml", cm("cfg", map[string]string{"k": "2", "new": "y"})+"---\n"+service("web", [2]int{80, 9090})+"---\n"+cm("fresh", map[string]string{"k": "v"})+"---\n"+
+			cm("late", map[string]string{"k": "1", "new": "y"})),
 	}
-	run := func(who string, apply func(file string) (*runner.Result, error)) ([]map[string]any, error) {
-		res, err := kubectl("apply", "-f", v[0])
+	run := func(who string, apply func(step int, file string) (*runner.Result, error)) ([]map[string]any, error) {
+		res, err := kubectl("apply", "--server-side=false", "-f", v[0])
 		if err != nil {
 			return nil, err
 		}
 		if err := wantExit(res, 0); err != nil {
 			return nil, fmt.Errorf("kubectl apply (client-side) of v1.yaml: %w", err)
 		}
+		ids, err := identities(ctx, env)
+		if err != nil {
+			return nil, err
+		}
 		var states []map[string]any
 		for i, f := range v[1:] {
-			res, err := apply(f)
+			res, err := apply(i+2, f)
 			if err != nil {
 				return nil, err
 			}
 			if err := wantExit(res, 0); err != nil {
 				return nil, fmt.Errorf("%s applying v%d.yaml over what client-side kubectl apply wrote: %w", who, i+2, err)
 			}
+			now, err := identities(ctx, env)
+			if err != nil {
+				return nil, err
+			}
+			for k, was := range ids {
+				if now[k] != was {
+					return nil, fmt.Errorf("%s applying v%d.yaml changed %s from %s to %s: taking an object over updates it in place, never deletes and recreates it", who, i+2, k, was, orNone(now[k]))
+				}
+			}
+			ids = now
 			s, err := parityState(ctx, env)
 			if err != nil {
 				return nil, err
@@ -1782,14 +1857,14 @@ func stageKubectlParity(ctx context.Context, env *kube.Env, bin string) error {
 		return states, nil
 	}
 
-	theirs, err := run("kubectl apply --server-side --field-manager=byok8s", func(f string) (*runner.Result, error) {
+	theirs, err := run("kubectl apply --server-side --field-manager=byok8s", func(_ int, f string) (*runner.Result, error) {
 		return kubectl("apply", "--server-side", "--field-manager=byok8s", "-f", f)
 	})
 	if err != nil {
 		return err
 	}
 	core := env.Client.CoreV1()
-	for _, name := range []string{"cfg", "fresh"} {
+	for _, name := range parityConfigMaps {
 		if err := core.ConfigMaps(env.Namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
 			return err
 		}
@@ -1798,15 +1873,29 @@ func stageKubectlParity(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	err = kube.WaitFor(ctx, "kubectl's objects to be deleted", func(ctx context.Context) (bool, error) {
-		_, a := core.ConfigMaps(env.Namespace).Get(ctx, "cfg", metav1.GetOptions{})
-		_, b := core.ConfigMaps(env.Namespace).Get(ctx, "fresh", metav1.GetOptions{})
-		_, c := core.Services(env.Namespace).Get(ctx, "web", metav1.GetOptions{})
-		return apierrors.IsNotFound(a) && apierrors.IsNotFound(b) && apierrors.IsNotFound(c), nil
+		for _, name := range parityConfigMaps {
+			if _, err := core.ConfigMaps(env.Namespace).Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+				return false, nil
+			}
+		}
+		_, err := core.Services(env.Namespace).Get(ctx, "web", metav1.GetOptions{})
+		return apierrors.IsNotFound(err), nil
 	})
 	if err != nil {
 		return err
 	}
-	ours, err := run("your apply", func(f string) (*runner.Result, error) { return w.run("apply", "-f", f) })
+	// v3 goes through a plan file, so the takeover is graded on both paths.
+	ours, err := run("your apply", func(step int, f string) (*runner.Result, error) {
+		if step == 2 {
+			return w.run("apply", "-f", f)
+		}
+		path := filepath.Join(w.dir, "v3.json")
+		res, err := w.run("plan", "--out", path, "-f", f)
+		if err != nil || res.ExitCode != 1 {
+			return res, err
+		}
+		return w.run("apply", "--plan", path)
+	})
 	if err != nil {
 		return err
 	}
@@ -1818,7 +1907,7 @@ func stageKubectlParity(ctx context.Context, env *kube.Env, bin string) error {
 
 	rv := func() (string, error) {
 		var out []string
-		for _, name := range []string{"cfg", "fresh"} {
+		for _, name := range parityConfigMaps {
 			c, err := env.ConfigMap(ctx, name)
 			if err != nil {
 				return "", err
@@ -1835,7 +1924,7 @@ func stageKubectlParity(ctx context.Context, env *kube.Env, bin string) error {
 	if err != nil {
 		return err
 	}
-	res, err := kubectl("diff", "--server-side", "--field-manager=byok8s", "-f", v[2])
+	res, err = kubectl("diff", "--server-side", "--field-manager=byok8s", "-f", v[2])
 	if err != nil {
 		return err
 	}
