@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
@@ -59,6 +60,7 @@ func init() {
 	register(Stage{Slug: "prune-guard", Run: stagePruneGuard})
 	register(Stage{Slug: "drift-detect", Run: stageDriftDetect})
 	register(Stage{Slug: "impact-report", Run: stageImpactReport})
+	register(Stage{Slug: "plan-file", Run: stagePlanFile})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -1234,6 +1236,117 @@ func stageImpactReport(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if !conflictLine(res.Stdout, "ConfigMap/same-a", ".data.k", "other-tool") {
 		return fmt.Errorf("a plan the server would refuse names the conflict, as diff does; got:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// planFile is the plan format the course specifies, as stage 16 writes it and
+// stage 17 applies it.
+type planFile struct {
+	Set     string `json:"set"`
+	Prune   bool   `json:"prune"`
+	Force   bool   `json:"force"`
+	Changes []struct {
+		Action          string         `json:"action"`
+		UID             string         `json:"uid"`
+		ResourceVersion string         `json:"resourceVersion"`
+		Object          map[string]any `json:"object"`
+	} `json:"changes"`
+}
+
+// stagePlanFile — plan --out writes every change, in apply order with deletes
+// last, each object as it would be sent and each existing one pinned to the
+// UID and resourceVersion the plan saw. A plan the server would refuse is
+// never written.
+func stagePlanFile(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	v2, err := planFixture(w)
+	if err != nil {
+		return err
+	}
+	seen := map[string][2]string{}
+	for _, name := range []string{"same-a", "same-b", "precious", "changed", "gone"} {
+		c, err := env.ConfigMap(ctx, name)
+		if err != nil {
+			return err
+		}
+		seen[name] = [2]string{string(c.UID), c.ResourceVersion}
+	}
+
+	path := filepath.Join(w.dir, "plan.json")
+	res, err := w.run("plan", "--set", "web", "--prune", "--out", path, "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("plan --out %s exited 1 but wrote no file: %w", path, err)
+	}
+	var p planFile
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return fmt.Errorf("the plan file is not the JSON this stage describes: %w\n%s", err, tail(string(raw)))
+	}
+	if p.Set != "web" || !p.Prune || p.Force {
+		return fmt.Errorf("the plan records the options it was made with; expected set \"web\", prune true, force false, got set %q, prune %t, force %t", p.Set, p.Prune, p.Force)
+	}
+	want := map[string]string{
+		"new-a": "create", "new-b": "create", "changed": "update",
+		"same-a": "unchanged", "same-b": "unchanged", "precious": "unchanged", "gone": "delete",
+	}
+	if len(p.Changes) != len(want) {
+		return fmt.Errorf("expected %d changes, one per manifest object plus the delete of gone, got %d:\n%s", len(want), len(p.Changes), tail(string(raw)))
+	}
+	deleting := false
+	for _, c := range p.Changes {
+		o := &unstructured.Unstructured{Object: c.Object}
+		name := o.GetName()
+		if c.Action != want[name] {
+			return fmt.Errorf("ConfigMap/%s should be planned as %q, the plan says %q", name, want[name], c.Action)
+		}
+		if o.GetKind() != "ConfigMap" || o.GetAPIVersion() != "v1" || o.GetNamespace() != env.Namespace {
+			return fmt.Errorf("every planned object names its apiVersion, kind, namespace and name; ConfigMap/%s has %q %q namespace %q", name, o.GetAPIVersion(), o.GetKind(), o.GetNamespace())
+		}
+		if deleting && c.Action != "delete" {
+			return fmt.Errorf("deletes come last, after every object is applied, and ConfigMap/%s (%s) follows one", name, c.Action)
+		}
+		deleting = c.Action == "delete"
+		pin, live := [2]string{c.UID, c.ResourceVersion}, seen[name]
+		if c.Action == "create" {
+			live = [2]string{}
+		}
+		if pin != live {
+			return fmt.Errorf("ConfigMap/%s (%s) should carry the uid and resourceVersion the plan saw, %q and %q; it has %q and %q", name, c.Action, live[0], live[1], pin[0], pin[1])
+		}
+		if name == "changed" {
+			if v, _, _ := unstructured.NestedString(o.Object, "data", "k"); v != "new" || o.GetLabels()[setLabel] != "web" {
+				return fmt.Errorf("an object to apply is stored as it will be sent, set label included; ConfigMap/changed has data.k %q and labels %v", v, o.GetLabels())
+			}
+		}
+	}
+	if _, err := env.ConfigMap(ctx, "gone"); err != nil {
+		return fmt.Errorf("plan only writes a file; ConfigMap/gone was deleted")
+	}
+
+	if err := w.applyAs("other-tool", cm("same-a", map[string]string{"k": "theirs"})); err != nil {
+		return err
+	}
+	refusedPath := filepath.Join(w.dir, "refused.json")
+	res, err = w.run("plan", "--set", "web", "--prune", "--out", refusedPath, "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 2); err != nil {
+		return err
+	}
+	if _, err := os.Stat(refusedPath); err == nil {
+		return fmt.Errorf("the server would refuse this change, so there is no plan to apply; plan wrote %s anyway", refusedPath)
 	}
 	return nil
 }

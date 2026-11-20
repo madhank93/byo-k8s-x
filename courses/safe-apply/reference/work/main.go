@@ -25,6 +25,8 @@
 // this tool applied them, and who.
 // Stage 15: `plan -f FILE` says what apply would do to each object, prune
 // included, and totals it, without writing anything.
+// Stage 16: `plan --out PLAN` also writes the plan down: each change with the
+// UID and resourceVersion it was planned against.
 
 package main
 
@@ -68,6 +70,7 @@ type opts struct {
 	force   bool
 	set     string
 	prune   bool
+	out     string
 }
 
 func main() {
@@ -83,6 +86,7 @@ func main() {
 	fs.BoolVar(&o.force, "force-conflicts", false, "take fields other managers own")
 	fs.BoolVar(&o.prune, "prune", false, "apply: delete members of --set the manifest no longer names")
 	fs.StringVar(&o.set, "set", "", "apply set: label applied objects as members, prune within it")
+	fs.StringVar(&o.out, "out", "", "plan: write the plan to this file")
 	fs.Parse(os.Args[2:])
 
 	code, err := run(cmd, o)
@@ -293,6 +297,12 @@ func run(cmd string, opt opts) (int, error) {
 		switch {
 		case refused:
 			return 2, nil
+		case opt.out != "":
+			if err := writePlan(opt.out, opt, changes); err != nil {
+				return 2, err
+			}
+		}
+		switch {
 		case len(changes) > count["unchanged"]:
 			return 1, nil
 		}
@@ -423,10 +433,52 @@ func (c *client) pruneSet(objs []*unstructured.Unstructured, set string) (int, e
 }
 
 // change is what an apply would do to one object: create, update, leave it
-// unchanged, or delete it as a leftover of the set.
+// unchanged, or delete it as a leftover of the set. uid and rv are the live
+// object's as the plan saw it, empty for a create.
 type change struct {
-	action string
-	obj    *unstructured.Unstructured
+	action  string
+	obj     *unstructured.Unstructured
+	uid, rv string
+}
+
+// planFile is a plan as written to disk: the options it was made with, and
+// every change in the order apply makes them, deletes last. Applying it later
+// is safe only while each object still has the UID and resourceVersion here.
+type planFile struct {
+	Set     string       `json:"set,omitempty"`
+	Prune   bool         `json:"prune"`
+	Force   bool         `json:"force"`
+	Changes []planChange `json:"changes"`
+}
+
+type planChange struct {
+	Action          string         `json:"action"`
+	UID             string         `json:"uid,omitempty"`
+	ResourceVersion string         `json:"resourceVersion,omitempty"`
+	Object          map[string]any `json:"object"`
+}
+
+// writePlan writes the changes down. An object to apply is stored whole, as it
+// would be sent; one to delete only by apiVersion, kind, namespace and name.
+func writePlan(path string, opt opts, changes []change) error {
+	p := planFile{Set: opt.set, Prune: opt.prune, Force: opt.force, Changes: []planChange{}}
+	for _, ch := range changes {
+		obj := ch.obj.Object
+		if ch.action == "delete" {
+			id := &unstructured.Unstructured{}
+			id.SetAPIVersion(ch.obj.GetAPIVersion())
+			id.SetKind(ch.obj.GetKind())
+			id.SetNamespace(ch.obj.GetNamespace())
+			id.SetName(ch.obj.GetName())
+			obj = id.Object
+		}
+		p.Changes = append(p.Changes, planChange{ch.action, ch.uid, ch.rv, obj})
+	}
+	b, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(b, '\n'), 0o644)
 }
 
 // plan works out every change an apply with these options would make, from a
@@ -449,14 +501,17 @@ func (c *client) plan(objs []*unstructured.Unstructured, opt opts) ([]change, bo
 		if err != nil {
 			return nil, false, fmt.Errorf("%s: %w", ref(o), err)
 		}
-		action := "unchanged"
+		ch := change{action: "unchanged", obj: o}
 		switch {
 		case live == nil:
-			action = "create"
+			ch.action = "create"
 		case len(fieldDiff(live, after)) > 0:
-			action = "update"
+			ch.action = "update"
 		}
-		out = append(out, change{action, o})
+		if live != nil {
+			ch.uid, ch.rv = string(live.GetUID()), live.GetResourceVersion()
+		}
+		out = append(out, ch)
 	}
 	if !opt.prune {
 		return out, refused, nil
@@ -470,7 +525,7 @@ func (c *client) plan(objs []*unstructured.Unstructured, opt opts) ([]change, bo
 			fmt.Println(ref(o), "kept: prune disabled")
 			continue
 		}
-		out = append(out, change{"delete", o})
+		out = append(out, change{action: "delete", obj: o, uid: string(o.GetUID()), rv: o.GetResourceVersion()})
 	}
 	return out, refused, nil
 }
