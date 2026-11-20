@@ -61,6 +61,7 @@ func init() {
 	register(Stage{Slug: "drift-detect", Run: stageDriftDetect})
 	register(Stage{Slug: "impact-report", Run: stageImpactReport})
 	register(Stage{Slug: "plan-file", Run: stagePlanFile})
+	register(Stage{Slug: "apply-plan", Run: stageApplyPlan})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -1347,6 +1348,181 @@ func stagePlanFile(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if _, err := os.Stat(refusedPath); err == nil {
 		return fmt.Errorf("the server would refuse this change, so there is no plan to apply; plan wrote %s anyway", refusedPath)
+	}
+	return nil
+}
+
+// editPlan rewrites one key of a planned object's data in a plan file, the way
+// a reviewer might amend a plan before approving it.
+func editPlan(path, name, key, value string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var p map[string]any
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return fmt.Errorf("the plan file is not JSON: %w", err)
+	}
+	changes, _ := p["changes"].([]any)
+	for _, c := range changes {
+		ch, _ := c.(map[string]any)
+		obj, _ := ch["object"].(map[string]any)
+		if (&unstructured.Unstructured{Object: obj}).GetName() == name {
+			if err := unstructured.SetNestedField(obj, value, "data", key); err != nil {
+				return err
+			}
+			b, _ := json.Marshal(p)
+			return os.WriteFile(path, b, 0o644)
+		}
+	}
+	return fmt.Errorf("the plan has no change for ConfigMap/%s:\n%s", name, tail(string(raw)))
+}
+
+// stageApplyPlan — apply --plan applies a plan file exactly as written, with
+// no manifest, and only while every object is still as the plan saw it. An
+// edit, a create or a delete since the plan refuses the whole plan before
+// anything is written, and a delete never removes an object recreated since.
+func stageApplyPlan(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	v2, err := planFixture(w)
+	if err != nil {
+		return err
+	}
+	exists := func(name string) bool { _, err := env.ConfigMap(ctx, name); return err == nil }
+	data := func(name string) string {
+		c, err := env.ConfigMap(ctx, name)
+		if err != nil {
+			return "(absent)"
+		}
+		return c.Data["k"]
+	}
+
+	path := filepath.Join(w.dir, "plan.json")
+	res, err := w.run("plan", "--set", "web", "--prune", "--out", path, "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	// What lands is the reviewed file, not the manifest it came from.
+	if err := editPlan(path, "new-a", "k", "reviewed"); err != nil {
+		return err
+	}
+	if err := os.Remove(v2); err != nil {
+		return err
+	}
+	res, err = w.run("apply", "--plan", path)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	for name, want := range map[string]string{"new-a": "reviewed", "new-b": "v", "changed": "new", "same-a": "v", "precious": "v", "gone": "(absent)"} {
+		if got := data(name); got != want {
+			return fmt.Errorf("after apply --plan, ConfigMap/%s should have data.k %s, it has %s (new-a was edited in the plan file, and the plan is what applies)\nstdout:\n%s", name, want, got, tail(res.Stdout))
+		}
+	}
+	if c, _ := env.ConfigMap(ctx, "new-a"); c.Labels[setLabel] != "web" || !hasApply(c.ManagedFields, "byok8s") {
+		return fmt.Errorf("ConfigMap/new-a should be applied by byok8s with the set label the plan carries; labels %v, managers %v", c.Labels, managers(c.ManagedFields))
+	}
+	if !exists("stranger") {
+		return fmt.Errorf("ConfigMap/stranger was never in the plan, and apply --plan deleted it")
+	}
+
+	// Each disturbance lands between plan and apply; the whole plan is refused.
+	v3 := w.file("v3.yaml", cm("same-a", map[string]string{"k": "v2"})+"---\n"+
+		cm("new-a", map[string]string{"k": "reviewed"})+"---\n"+cm("new-c", map[string]string{"k": "v"}))
+	untouched := func(what string, res *runner.Result, newC bool) error {
+		if res.ExitCode == 0 {
+			return fmt.Errorf("%s after the plan was made, so applying it must fail; got exit 0:\n%s", what, tail(res.Stdout))
+		}
+		if data("same-a") != "v" {
+			return fmt.Errorf("%s after the plan was made, yet ConfigMap/same-a was updated: check every pin before writing anything\nstdout:\n%s", what, tail(res.Stdout))
+		}
+		if exists("new-c") != newC {
+			return fmt.Errorf("%s after the plan was made, yet ConfigMap/new-c was created: check every pin before writing anything\nstdout:\n%s", what, tail(res.Stdout))
+		}
+		for _, name := range []string{"same-b", "changed", "new-b"} {
+			if !exists(name) {
+				return fmt.Errorf("%s after the plan was made, yet ConfigMap/%s was pruned\nstdout:\n%s", what, name, tail(res.Stdout))
+			}
+		}
+		return nil
+	}
+	for _, d := range []struct {
+		what, name string
+		disturb    func() error
+		newC       bool
+	}{
+		{"ConfigMap/same-a was edited", "same-a", func() error { return w.updateAs("kubectl-edit", "same-a", "extra", "x") }, false},
+		{"ConfigMap/new-c was created by someone else", "new-c", func() error { return env.SeedConfigMap(ctx, "new-c") }, true},
+		{"ConfigMap/new-b was deleted and recreated", "new-b", func() error {
+			if err := env.Client.CoreV1().ConfigMaps(env.Namespace).Delete(ctx, "new-b", metav1.DeleteOptions{}); err != nil {
+				return err
+			}
+			return w.applyAs("other-tool", labeled("new-b", map[string]string{setLabel: "web"}))
+		}, false},
+	} {
+		p := filepath.Join(w.dir, d.name+".json")
+		res, err := w.run("plan", "--set", "web", "--prune", "--out", p, "-f", v3)
+		if err != nil {
+			return err
+		}
+		if err := wantExit(res, 1); err != nil {
+			return err
+		}
+		if err := d.disturb(); err != nil {
+			return err
+		}
+		res, err = w.run("apply", "--plan", p)
+		if err != nil {
+			return err
+		}
+		if err := untouched(d.what, res, d.newC); err != nil {
+			return err
+		}
+		if !strings.Contains(res.Stdout, "ConfigMap/"+d.name) {
+			return fmt.Errorf("%s after the plan was made; the refusal should name ConfigMap/%s, got:\n%s", d.what, d.name, tail(res.Stdout))
+		}
+		if d.newC {
+			if err := env.Client.CoreV1().ConfigMaps(env.Namespace).Delete(ctx, "new-c", metav1.DeleteOptions{}); err != nil {
+				return err
+			}
+		}
+	}
+
+	// A fresh plan applies, and a forced one takes the field it was planned to.
+	if err := w.applyAs("other-tool", cm("same-a", map[string]string{"k": "theirs"})); err != nil {
+		return err
+	}
+	res, err = w.run("plan", "--set", "web", "--prune", "--force-conflicts", "--out", path, "-f", v3)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	res, err = w.run("apply", "--plan", path)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("a plan made with --force-conflicts applies with it: %w", err)
+	}
+	if data("same-a") != "v2" || !exists("new-c") || !exists("precious") {
+		return fmt.Errorf("after the fresh plan, expected same-a data.k v2 (taken from other-tool), new-c created and precious kept; same-a has %s, new-c exists %t, precious exists %t",
+			data("same-a"), exists("new-c"), exists("precious"))
+	}
+	for _, name := range []string{"same-b", "changed", "new-b"} {
+		if exists(name) {
+			return fmt.Errorf("the fresh plan deletes ConfigMap/%s, and it is still there\nstdout:\n%s", name, tail(res.Stdout))
+		}
 	}
 	return nil
 }

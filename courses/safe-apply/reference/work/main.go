@@ -27,6 +27,8 @@
 // included, and totals it, without writing anything.
 // Stage 16: `plan --out PLAN` also writes the plan down: each change with the
 // UID and resourceVersion it was planned against.
+// Stage 17: `apply --plan PLAN` applies that file exactly as written, and only
+// while every object is still as the plan saw it.
 
 package main
 
@@ -71,6 +73,7 @@ type opts struct {
 	set     string
 	prune   bool
 	out     string
+	plan    string
 }
 
 func main() {
@@ -87,6 +90,7 @@ func main() {
 	fs.BoolVar(&o.prune, "prune", false, "apply: delete members of --set the manifest no longer names")
 	fs.StringVar(&o.set, "set", "", "apply set: label applied objects as members, prune within it")
 	fs.StringVar(&o.out, "out", "", "plan: write the plan to this file")
+	fs.StringVar(&o.plan, "plan", "", "apply: apply this plan file instead of a manifest")
 	fs.Parse(os.Args[2:])
 
 	code, err := run(cmd, o)
@@ -203,6 +207,9 @@ func run(cmd string, opt opts) (int, error) {
 		}
 		return 0, nil
 	case "apply":
+		if opt.plan != "" {
+			return applyPlan(opt.plan)
+		}
 		c, objs, err := setup(file, opt.set)
 		if err != nil {
 			return 2, err
@@ -481,6 +488,96 @@ func writePlan(path string, opt opts, changes []change) error {
 	return os.WriteFile(path, append(b, '\n'), 0o644)
 }
 
+// applyPlan applies a plan file as written, with the force it was made with;
+// set and prune are already in its objects and deletes. Every pin is checked
+// before anything is written, so a cluster that has moved on since the plan
+// refuses the whole plan rather than half of it.
+func applyPlan(path string) (int, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 2, err
+	}
+	var p planFile
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return 2, fmt.Errorf("%s: %w", path, err)
+	}
+	c, err := connect()
+	if err != nil {
+		return 2, err
+	}
+	c.force = p.Force
+	objs := make([]*unstructured.Unstructured, len(p.Changes))
+	var applies []*unstructured.Unstructured
+	stale := false
+	for i, ch := range p.Changes {
+		o := &unstructured.Unstructured{Object: ch.Object}
+		objs[i] = o
+		live, err := c.live(o)
+		if err != nil {
+			return 2, err
+		}
+		var uid, rv string
+		if live != nil {
+			uid, rv = string(live.GetUID()), live.GetResourceVersion()
+		}
+		if uid != ch.UID || rv != ch.ResourceVersion {
+			fmt.Println(ref(o), "changed since the plan")
+			stale = true
+		}
+		if ch.Action == "create" || ch.Action == "update" {
+			applies = append(applies, pinned(o, ch))
+		}
+	}
+	if stale {
+		return 1, fmt.Errorf("nothing applied: the cluster has changed since this plan was made; plan again")
+	}
+	if !c.preflight(applies) {
+		return 1, fmt.Errorf("nothing applied: the server refused part of this plan")
+	}
+	for i, ch := range p.Changes {
+		o := objs[i]
+		switch ch.Action {
+		case "create", "update":
+			if _, err := c.apply(pinned(o, ch), false); err != nil {
+				return 1, fmt.Errorf("%s: %w", ref(o), err)
+			}
+			fmt.Println(ref(o), "applied")
+		case "delete":
+			r, err := c.resource(o)
+			if err != nil {
+				return 1, err
+			}
+			uid, rv := types.UID(ch.UID), ch.ResourceVersion
+			err = r.Delete(c.ctx, o.GetName(), metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &rv},
+			})
+			switch {
+			case err == nil:
+				fmt.Println(ref(o), "pruned")
+			case apierrors.IsNotFound(err):
+			default:
+				return 1, fmt.Errorf("%s: %w", ref(o), err)
+			}
+		}
+	}
+	return 0, nil
+}
+
+// pinned is the object as apply sends it, carrying the plan's uid and
+// resourceVersion so the server refuses the write if either has changed. The
+// uid is what refuses an object deleted since: a resourceVersion alone in an
+// apply body recreates it.
+// ponytail: a create has no server-side "must not exist", so an object made
+// between the check and the write is applied over; a POST would close that.
+func pinned(o *unstructured.Unstructured, ch planChange) *unstructured.Unstructured {
+	c := o.DeepCopy()
+	if ch.UID != "" {
+		c.SetUID(types.UID(ch.UID))
+		c.SetResourceVersion(ch.ResourceVersion)
+	}
+	return c
+}
+
 // plan works out every change an apply with these options would make, from a
 // dry-run of each object and, with --prune, the set's leftovers. Refusals are
 // reported as diff reports them, and leave that object out of the plan.
@@ -633,32 +730,40 @@ func setup(file, set string) (*client, []*unstructured.Unstructured, error) {
 			o.SetLabels(l)
 		}
 	}
-	kc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
-	cfg, err := kc.ClientConfig()
+	c, err := connect()
 	if err != nil {
 		return nil, nil, err
 	}
-	ns, _, err := kc.Namespace()
-	if err != nil {
-		return nil, nil, err
-	}
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))
-	c := &client{ctx: context.Background(), dyn: dyn, disc: dc, mapper: mapper, ns: ns, manager: "byok8s"}
 	for _, o := range objs {
 		if _, err := c.resource(o); err != nil {
 			return nil, nil, err
 		}
 	}
 	return c, objs, nil
+}
+
+// connect builds a client from the kubeconfig.
+func connect() (*client, error) {
+	kc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
+	cfg, err := kc.ClientConfig()
+	if err != nil {
+		return nil, err
+	}
+	ns, _, err := kc.Namespace()
+	if err != nil {
+		return nil, err
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))
+	return &client{ctx: context.Background(), dyn: dyn, disc: dc, mapper: mapper, ns: ns, manager: "byok8s"}, nil
 }
 
 // resource resolves an object to the endpoint that serves it, and fills in the
