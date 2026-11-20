@@ -1,0 +1,71 @@
+slug: helm
+name: Build your own Helm
+language: go
+entrypoint: main.go
+stages:
+  - slug: chart-load
+    name: Read a chart
+    difficulty: easy
+  - slug: values-merge
+    name: Merge the values
+    difficulty: medium
+  - slug: template-engine
+    name: Render the templates
+    difficulty: medium
+  - slug: builtin-objects
+    name: Tell a template where it is
+    difficulty: medium
+  - slug: template-functions
+    name: Give templates a toolbox
+    difficulty: medium
+  - slug: named-templates
+    name: Define once, include anywhere
+    difficulty: medium
+  - slug: subcharts
+    name: Render a chart inside a chart
+    difficulty: hard
+  - slug: conditions
+    name: Switch subcharts on and off
+    difficulty: medium
+  - slug: values-schema
+    name: Refuse values that do not fit
+    difficulty: medium
+  - slug: manifest-split
+    name: Order the manifests like Helm
+    difficulty: medium
+  - slug: install
+    name: Install a release
+    difficulty: hard
+  - slug: release-storage
+    name: Remember the release
+    difficulty: hard
+  - slug: list-status
+    name: List what is installed
+    difficulty: medium
+  - slug: history
+    name: Keep every revision
+    difficulty: medium
+  - slug: upgrade-3way-merge
+    name: Upgrade without stamping on edits
+    difficulty: hard
+  - slug: rollback
+    name: Go back to a revision
+    difficulty: medium
+  - slug: hooks
+    name: Run hooks around the install
+    difficulty: hard
+  - slug: hook-weights
+    name: Run hooks in order
+    difficulty: medium
+  - slug: test
+    name: Test a release
+    difficulty: medium
+  - slug: uninstall
+    name: Uninstall cleanly
+    difficulty: medium
+  - slug: dependencies
+    name: Package and pin dependencies
+    difficulty: hard
+  - slug: template-parity
+    name: Agree with helm
+    difficulty: hard
