@@ -21,6 +21,8 @@
 // the manifest no longer names.
 // Stage 13: apply --prune deletes them, guarded: never one marked
 // prune: disabled, never after a refused apply, never from an empty manifest.
+// Stage 14: `drift -f FILE` names the fields someone else has changed since
+// this tool applied them, and who.
 
 package main
 
@@ -242,6 +244,30 @@ func run(cmd string, opt opts) (int, error) {
 			fmt.Println(ref(o))
 		}
 		return 0, nil
+	case "drift":
+		c, objs, err := setup(file, opt.set)
+		if err != nil {
+			return 2, err
+		}
+		code := 0
+		for _, o := range objs {
+			live, err := c.live(o)
+			if err != nil {
+				return 2, err
+			}
+			if live == nil {
+				continue
+			}
+			ds, err := drift(o, live, c.manager)
+			if err != nil {
+				return 2, fmt.Errorf("%s: %w", ref(o), err)
+			}
+			for _, d := range ds {
+				fmt.Printf("%s: drift: %s\n", ref(o), d)
+				code = 1
+			}
+		}
+		return code, nil
 	case "owners":
 		c, objs, err := setup(file, opt.set)
 		if err != nil {
@@ -398,6 +424,43 @@ func ownership(live *unstructured.Unstructured) ([]owner, error) {
 		}
 		return out[i].manager < out[j].manager
 	})
+	return out, nil
+}
+
+// drift lists the fields the manifest sets whose live value differs and that
+// manager no longer owns: someone else wrote them since. A differing field the
+// manager still owns is a change the manifest is making, not drift. A field
+// missing from live has no owner left to name, so it reads as a new field.
+// ponytail: lists compare whole, so owning any element hides drift in another.
+func drift(desired, live *unstructured.Unstructured, manager string) ([]string, error) {
+	owners, err := ownership(live)
+	if err != nil {
+		return nil, err
+	}
+	have := leaves(live)
+	var out []string
+	for p, want := range leaves(desired) {
+		got, ok := have[p]
+		if !ok || got == want {
+			continue
+		}
+		mine, by := false, ""
+		for _, w := range owners {
+			if w.path != p && !strings.HasPrefix(w.path, p+".") && !strings.HasPrefix(w.path, p+"[") {
+				continue
+			}
+			if w.manager == manager {
+				mine = true
+			} else if by == "" {
+				by = w.manager
+			}
+		}
+		if mine || by == "" {
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s %s -> %s by %q", p, want, got, by))
+	}
+	sort.Strings(out)
 	return out, nil
 }
 

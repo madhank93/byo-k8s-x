@@ -57,6 +57,7 @@ func init() {
 	register(Stage{Slug: "force-conflicts", Run: stageForceConflicts})
 	register(Stage{Slug: "prune-plan", Run: stagePrunePlan})
 	register(Stage{Slug: "prune-guard", Run: stagePruneGuard})
+	register(Stage{Slug: "drift-detect", Run: stageDriftDetect})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -1035,6 +1036,90 @@ func stagePruneGuard(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if res.ExitCode == 0 {
 		return fmt.Errorf("apply --prune without --set cannot know what is its own and must fail, got exit 0:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// stageDriftDetect — drift names each field the manifest sets that another
+// manager has since changed, with its live value and that manager. A change
+// the manifest itself is making is not drift, nor is a field the manifest
+// never mentions, and the command writes nothing.
+func stageDriftDetect(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	calm := cm("calm", map[string]string{"k": "v"})
+	v1 := w.file("v1.yaml", cm("app", map[string]string{"color": "blue", "size": "s", "mode": "a"})+"---\n"+calm)
+	res, err := w.run("apply", "-f", v1)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	// mode stays shared with other-tool at the same value; size is taken.
+	if err := w.applyAs("other-tool", cm("app", map[string]string{"size": "xl", "mode": "a"})); err != nil {
+		return err
+	}
+	if err := w.updateAs("kubectl-edit", "app", "color", "red"); err != nil {
+		return err
+	}
+	if err := w.updateAs("kubectl-edit", "app", "extra", "x"); err != nil {
+		return err
+	}
+
+	res, err = w.run("drift", "-f", w.file("v2.yaml", cm("app", map[string]string{"color": "blue", "size": "s", "mode": "b"})+"---\n"+calm))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	for _, c := range []struct{ field, value, manager string }{
+		{".data.color", `"red"`, "kubectl-edit"},
+		{".data.size", `"xl"`, "other-tool"},
+	} {
+		found := false
+		for _, l := range lines(res.Stdout) {
+			found = found || strings.HasPrefix(l, "ConfigMap/app") && strings.Contains(l, "drift") &&
+				strings.Contains(l, c.field) && strings.Contains(l, c.value) && strings.Contains(l, c.manager)
+		}
+		if !found {
+			return fmt.Errorf("%s was changed to %s by %s, so expected a line like\n  ConfigMap/app: drift: %s \"…\" -> %s by %q\ngot:\n%s",
+				c.field, c.value, c.manager, c.field, c.value, c.manager, tail(res.Stdout))
+		}
+	}
+	for field, why := range map[string]string{
+		".data.mode":  "byok8s still owns data.mode, so the new value is this manifest's own change, not drift",
+		".data.extra": "data.extra is not in the manifest, so whoever set it has not changed anything of yours",
+	} {
+		if strings.Contains(res.Stdout, field) {
+			return fmt.Errorf("%s; got:\n%s", why, tail(res.Stdout))
+		}
+	}
+	if strings.Contains(res.Stdout, "ConfigMap/calm") {
+		return fmt.Errorf("nobody touched ConfigMap/calm, yet it is reported:\n%s", tail(res.Stdout))
+	}
+	got, err := env.ConfigMap(ctx, "app")
+	if err != nil {
+		return err
+	}
+	if got.Data["color"] != "red" || got.Data["mode"] != "a" {
+		return fmt.Errorf("drift only reports; it changed ConfigMap/app to %v", got.Data)
+	}
+
+	res, err = w.run("drift", "-f", w.file("calm.yaml", calm))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if out := strings.TrimSpace(res.Stdout); out != "" {
+		return fmt.Errorf("ConfigMap/calm has not drifted, so drift prints nothing; got:\n%s", tail(res.Stdout))
 	}
 	return nil
 }
