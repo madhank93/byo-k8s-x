@@ -29,6 +29,8 @@
 // UID and resourceVersion it was planned against.
 // Stage 17: `apply --plan PLAN` applies that file exactly as written, and only
 // while every object is still as the plan saw it.
+// Stage 18: apply takes over objects client-side `kubectl apply` wrote, as
+// `kubectl apply --server-side` does, so both leave the same managedFields.
 
 package main
 
@@ -53,12 +55,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/jsonmergepatch"
+	"k8s.io/apimachinery/pkg/util/sets"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/csaupgrade"
 
 	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 	"sigs.k8s.io/yaml"
@@ -231,7 +235,11 @@ func run(cmd string, opt opts) (int, error) {
 			fmt.Println(t)
 		}
 		for _, o := range objs {
-			if _, err := c.apply(o, false); err != nil {
+			live, err := c.apply(o, false)
+			if err == nil {
+				err = c.adopt(o, live)
+			}
+			if err != nil {
 				return 1, fmt.Errorf("%s: %w", ref(o), err)
 			}
 			fmt.Println(ref(o), "applied")
@@ -538,7 +546,11 @@ func applyPlan(path string) (int, error) {
 		o := objs[i]
 		switch ch.Action {
 		case "create", "update":
-			if _, err := c.apply(pinned(o, ch), false); err != nil {
+			live, err := c.apply(pinned(o, ch), false)
+			if err == nil {
+				err = c.adopt(o, live)
+			}
+			if err != nil {
 				return 1, fmt.Errorf("%s: %w", ref(o), err)
 			}
 			fmt.Println(ref(o), "applied")
@@ -896,6 +908,39 @@ func (c *client) apply(o *unstructured.Unstructured, dryRun bool) (*unstructured
 		po.DryRun = []string{metav1.DryRunAll}
 	}
 	return r.Patch(c.ctx, o.GetName(), types.ApplyPatchType, body, po)
+}
+
+// lastAppliedPath is the annotation's field, as managedFields name it.
+var lastAppliedPath = fieldpath.NewSet(fieldpath.MakePathOrDie("metadata", "annotations", lastApplied))
+
+// adopt takes over an object client-side `kubectl apply` wrote. Its fields are
+// owned by an Update manager that never lets go of them, so a field the
+// manifest drops would stay forever. As kubectl does, merge every Update
+// manager that owns the last-applied annotation into this manager's Apply
+// entry, then apply again so the dropped fields go.
+// ponytail: a conflict on the migration patch fails the apply; kubectl
+// re-reads and retries a few times.
+func (c *client) adopt(o, live *unstructured.Unstructured) error {
+	names := sets.New[string]()
+	for _, e := range csaupgrade.FindFieldsOwners(live.GetManagedFields(), metav1.ManagedFieldsOperationUpdate, lastAppliedPath) {
+		names.Insert(e.Manager)
+	}
+	if names.Len() == 0 {
+		return nil
+	}
+	patch, err := csaupgrade.UpgradeManagedFieldsPatch(live, names, c.manager)
+	if err != nil || patch == nil {
+		return err
+	}
+	r, err := c.resource(o)
+	if err != nil {
+		return err
+	}
+	if _, err := r.Patch(c.ctx, o.GetName(), types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("take over from client-side apply: %w", err)
+	}
+	_, err = c.apply(o, false)
+	return err
 }
 
 // fieldDiff lists what changes between two versions of an object, one line per

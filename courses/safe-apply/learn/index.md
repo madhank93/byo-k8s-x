@@ -62,8 +62,8 @@ could not be computed — including when the server refuses the change.
 Each stage writes manifests to a temporary directory, runs your program with
 a kubeconfig whose context points at a namespace of its own, and judges the
 exit code, stdout, and the state the cluster is left in. Your program uses
-the field manager `byok8s` unless told otherwise. Nothing inspects your
-source.
+the field manager `byok8s` unless told otherwise. Stage 18 also runs the
+real `kubectl` on PATH. Nothing inspects your source.
 
 ## Further reading
 

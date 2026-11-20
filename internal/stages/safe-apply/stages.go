@@ -12,12 +12,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -62,6 +65,7 @@ func init() {
 	register(Stage{Slug: "impact-report", Run: stageImpactReport})
 	register(Stage{Slug: "plan-file", Run: stagePlanFile})
 	register(Stage{Slug: "apply-plan", Run: stageApplyPlan})
+	register(Stage{Slug: "kubectl-parity", Run: stageKubectlParity})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -1523,6 +1527,232 @@ func stageApplyPlan(ctx context.Context, env *kube.Env, bin string) error {
 		if exists(name) {
 			return fmt.Errorf("the fresh plan deletes ConfigMap/%s, and it is still there\nstdout:\n%s", name, tail(res.Stdout))
 		}
+	}
+	return nil
+}
+
+// service is a ClusterIP Service selecting app=web, one port per pair of port
+// and targetPort.
+func service(name string, ports ...[2]int) string {
+	var ps []map[string]any
+	for _, p := range ports {
+		ps = append(ps, map[string]any{"name": fmt.Sprintf("p%d", p[0]), "port": p[0], "targetPort": p[1]})
+	}
+	b, _ := json.Marshal(map[string]any{
+		"apiVersion": "v1", "kind": "Service",
+		"metadata": map[string]any{"name": name},
+		"spec":     map[string]any{"selector": map[string]string{"app": "web"}, "ports": ps},
+	})
+	return string(b) + "\n"
+}
+
+// parityState is every object the parity stage writes, keyed by kind and name,
+// without what differs between two identical writes: identity, timestamps,
+// the allocated cluster IP, status. managedFields stay, minus their times.
+func parityState(ctx context.Context, env *kube.Env) (map[string]any, error) {
+	core := env.Client.CoreV1()
+	var objs []any
+	for _, name := range []string{"cfg", "fresh"} {
+		c, err := core.ConfigMaps(env.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		objs = append(objs, c)
+	}
+	s, err := core.Services(env.Namespace).Get(ctx, "web", metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	objs = append(objs, s)
+	out := map[string]any{}
+	for i, o := range objs {
+		b, _ := json.Marshal(o)
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			return nil, err
+		}
+		for _, f := range [][]string{
+			{"metadata", "uid"}, {"metadata", "resourceVersion"}, {"metadata", "creationTimestamp"},
+			{"metadata", "generation"}, {"status"}, {"spec", "clusterIP"}, {"spec", "clusterIPs"},
+		} {
+			unstructured.RemoveNestedField(m, f...)
+		}
+		mf, _, _ := unstructured.NestedSlice(m, "metadata", "managedFields")
+		for _, e := range mf {
+			delete(e.(map[string]any), "time")
+		}
+		sort.Slice(mf, func(i, j int) bool { return fmt.Sprint(mf[i]) < fmt.Sprint(mf[j]) })
+		if err := unstructured.SetNestedSlice(m, mf, "metadata", "managedFields"); err != nil {
+			return nil, err
+		}
+		out[[]string{"ConfigMap/cfg", "ConfigMap/fresh", "Service/web"}[i]] = m
+	}
+	return out, nil
+}
+
+// flatten lists every leaf of a decoded JSON value as path → value.
+func flatten(path string, v any, out map[string]string) {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, c := range t {
+			flatten(path+"."+k, c, out)
+		}
+	case []any:
+		for i, c := range t {
+			flatten(fmt.Sprintf("%s[%d]", path, i), c, out)
+		}
+	default:
+		b, _ := json.Marshal(v)
+		out[path] = string(b)
+	}
+}
+
+// stateDiff lists the leaves where two parityStates differ.
+func stateDiff(theirs, ours map[string]any) []string {
+	a, b := map[string]string{}, map[string]string{}
+	flatten("", theirs, a)
+	flatten("", ours, b)
+	var out []string
+	for p, v := range a {
+		if b[p] != v {
+			out = append(out, fmt.Sprintf("%s: kubectl %s, yours %s", p, v, orNone(b[p])))
+		}
+	}
+	for p, v := range b {
+		if _, ok := a[p]; !ok {
+			out = append(out, fmt.Sprintf("%s: kubectl (none), yours %s", p, v))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	return s
+}
+
+// stageKubectlParity — objects that client-side kubectl apply created are
+// taken over and then changed exactly as kubectl apply --server-side would:
+// the same data, the same fields removed, and the same managedFields. After
+// that, kubectl finds nothing left to change.
+func stageKubectlParity(ctx context.Context, env *kube.Env, bin string) error {
+	if _, err := exec.LookPath("kubectl"); err != nil {
+		return fmt.Errorf("this stage compares your tool with the real kubectl, and there is no kubectl on PATH: install one (mise install provisions the version the course is graded with)")
+	}
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	kubectl := func(args ...string) (*runner.Result, error) {
+		return runner.InvokeEnv(ctx, "kubectl", w.kc, stages.Timeout, args...)
+	}
+	// v1 is applied client-side; v2 drops a key and a port, which only go if
+	// the client-side owner's fields are taken over; v3 changes values that
+	// owner used to hold.
+	v := []string{
+		w.file("v1.yaml", cm("cfg", map[string]string{"k": "1", "old": "x"})+"---\n"+service("web", [2]int{80, 8080}, [2]int{443, 8443})),
+		w.file("v2.yaml", cm("cfg", map[string]string{"k": "1"})+"---\n"+service("web", [2]int{80, 8080})+"---\n"+cm("fresh", map[string]string{"k": "v"})),
+		w.file("v3.yaml", cm("cfg", map[string]string{"k": "2", "new": "y"})+"---\n"+service("web", [2]int{80, 9090})+"---\n"+cm("fresh", map[string]string{"k": "v"})),
+	}
+	run := func(who string, apply func(file string) (*runner.Result, error)) ([]map[string]any, error) {
+		res, err := kubectl("apply", "-f", v[0])
+		if err != nil {
+			return nil, err
+		}
+		if err := wantExit(res, 0); err != nil {
+			return nil, fmt.Errorf("kubectl apply (client-side) of v1.yaml: %w", err)
+		}
+		var states []map[string]any
+		for i, f := range v[1:] {
+			res, err := apply(f)
+			if err != nil {
+				return nil, err
+			}
+			if err := wantExit(res, 0); err != nil {
+				return nil, fmt.Errorf("%s applying v%d.yaml over what client-side kubectl apply wrote: %w", who, i+2, err)
+			}
+			s, err := parityState(ctx, env)
+			if err != nil {
+				return nil, err
+			}
+			states = append(states, s)
+		}
+		return states, nil
+	}
+
+	theirs, err := run("kubectl apply --server-side --field-manager=byok8s", func(f string) (*runner.Result, error) {
+		return kubectl("apply", "--server-side", "--field-manager=byok8s", "-f", f)
+	})
+	if err != nil {
+		return err
+	}
+	core := env.Client.CoreV1()
+	for _, name := range []string{"cfg", "fresh"} {
+		if err := core.ConfigMaps(env.Namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+			return err
+		}
+	}
+	if err := core.Services(env.Namespace).Delete(ctx, "web", metav1.DeleteOptions{}); err != nil {
+		return err
+	}
+	err = kube.WaitFor(ctx, "kubectl's objects to be deleted", func(ctx context.Context) (bool, error) {
+		_, a := core.ConfigMaps(env.Namespace).Get(ctx, "cfg", metav1.GetOptions{})
+		_, b := core.ConfigMaps(env.Namespace).Get(ctx, "fresh", metav1.GetOptions{})
+		_, c := core.Services(env.Namespace).Get(ctx, "web", metav1.GetOptions{})
+		return apierrors.IsNotFound(a) && apierrors.IsNotFound(b) && apierrors.IsNotFound(c), nil
+	})
+	if err != nil {
+		return err
+	}
+	ours, err := run("your apply", func(f string) (*runner.Result, error) { return w.run("apply", "-f", f) })
+	if err != nil {
+		return err
+	}
+	for i := range theirs {
+		if d := stateDiff(theirs[i], ours[i]); len(d) > 0 {
+			return fmt.Errorf("after applying v%d.yaml, the cluster differs from what kubectl apply --server-side leaves:\n  %s", i+2, strings.Join(d, "\n  "))
+		}
+	}
+
+	rv := func() (string, error) {
+		var out []string
+		for _, name := range []string{"cfg", "fresh"} {
+			c, err := env.ConfigMap(ctx, name)
+			if err != nil {
+				return "", err
+			}
+			out = append(out, c.ResourceVersion)
+		}
+		s, err := core.Services(env.Namespace).Get(ctx, "web", metav1.GetOptions{})
+		if err != nil {
+			return "", err
+		}
+		return strings.Join(append(out, s.ResourceVersion), ","), nil
+	}
+	before, err := rv()
+	if err != nil {
+		return err
+	}
+	res, err := kubectl("diff", "--server-side", "--field-manager=byok8s", "-f", v[2])
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("after your apply of v3.yaml, kubectl diff --server-side should find nothing to change: %w", err)
+	}
+	res, err = kubectl("apply", "--server-side", "--field-manager=byok8s", "-f", v[2])
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if after, err := rv(); err != nil || after != before {
+		return fmt.Errorf("kubectl apply --server-side of v3.yaml after yours should write nothing; resourceVersions went from %s to %s", before, after)
 	}
 	return nil
 }
