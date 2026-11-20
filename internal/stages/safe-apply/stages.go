@@ -58,6 +58,7 @@ func init() {
 	register(Stage{Slug: "prune-plan", Run: stagePrunePlan})
 	register(Stage{Slug: "prune-guard", Run: stagePruneGuard})
 	register(Stage{Slug: "drift-detect", Run: stageDriftDetect})
+	register(Stage{Slug: "impact-report", Run: stageImpactReport})
 }
 
 // stageManifestLoad — every object in a multi-document file, in order, with
@@ -1122,6 +1123,130 @@ func stageDriftDetect(ctx context.Context, env *kube.Env, bin string) error {
 		return fmt.Errorf("ConfigMap/calm has not drifted, so drift prints nothing; got:\n%s", tail(res.Stdout))
 	}
 	return nil
+}
+
+// planFixture applies a set of five ConfigMaps as set web, one of them
+// protected from pruning, plus an unlabelled stranger, and returns the
+// manifest for the next version: three unchanged, one updated, two created,
+// one dropped. Stages 15 and 16 both plan against it.
+func planFixture(w *work) (string, error) {
+	protected := `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"precious","annotations":{"byok8s.dev/prune":"disabled"}},"data":{"k":"v"}}` + "\n"
+	same := cm("same-a", map[string]string{"k": "v"}) + "---\n" + cm("same-b", map[string]string{"k": "v"}) + "---\n" + protected
+	v1 := w.file("v1.yaml", same+"---\n"+cm("changed", map[string]string{"k": "old"})+"---\n"+cm("gone", map[string]string{"k": "v"}))
+	res, err := w.run("apply", "--set", "web", "-f", v1)
+	if err != nil {
+		return "", err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return "", err
+	}
+	if err := w.env.SeedConfigMap(w.ctx, "stranger"); err != nil {
+		return "", err
+	}
+	return w.file("v2.yaml", same+"---\n"+cm("changed", map[string]string{"k": "new"})+"---\n"+
+		cm("new-a", map[string]string{"k": "v"})+"---\n"+cm("new-b", map[string]string{"k": "v"})), nil
+}
+
+// stageImpactReport — plan names what apply --prune would do to each object
+// and totals it, exits like diff, and changes nothing in the cluster.
+func stageImpactReport(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	v2, err := planFixture(w)
+	if err != nil {
+		return err
+	}
+
+	res, err := w.run("plan", "--set", "web", "--prune", "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	got := lines(res.Stdout)
+	for _, want := range []string{
+		"ConfigMap/new-a create", "ConfigMap/new-b create",
+		"ConfigMap/changed update",
+		"ConfigMap/same-a unchanged", "ConfigMap/same-b unchanged", "ConfigMap/precious unchanged",
+		"ConfigMap/gone delete",
+	} {
+		found := false
+		for _, l := range got {
+			found = found || strings.HasPrefix(l, want)
+		}
+		if !found {
+			return fmt.Errorf("expected a line starting %q, got:\n%s", want, tail(res.Stdout))
+		}
+	}
+	if !hasTotals(got, 2, 1, 1, 3) {
+		return fmt.Errorf("expected the totals line \"2 to create, 1 to update, 1 to delete, 3 unchanged\" (ConfigMap/precious is in the manifest, so it is unchanged, not kept), got:\n%s", tail(res.Stdout))
+	}
+	if strings.Contains(res.Stdout, "stranger") {
+		return fmt.Errorf("ConfigMap/stranger is not in set web, so the plan does not mention it:\n%s", tail(res.Stdout))
+	}
+	exists := func(name string) bool { _, err := env.ConfigMap(ctx, name); return err == nil }
+	if exists("new-a") || !exists("gone") {
+		return fmt.Errorf("plan only reports; it created ConfigMap/new-a or deleted ConfigMap/gone")
+	}
+	if c, err := env.ConfigMap(ctx, "changed"); err != nil || c.Data["k"] != "old" {
+		return fmt.Errorf("plan only reports; ConfigMap/changed was changed or removed")
+	}
+
+	// A protected leftover is named but never counted as a delete.
+	res, err = w.run("plan", "--set", "web", "--prune", "-f", w.file("v3.yaml", cm("same-a", map[string]string{"k": "v"})))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	if !strings.Contains(res.Stdout, "ConfigMap/precious kept") {
+		return fmt.Errorf("expected \"ConfigMap/precious kept: prune disabled\", got:\n%s", tail(res.Stdout))
+	}
+	if !hasTotals(lines(res.Stdout), 0, 0, 3, 1) {
+		return fmt.Errorf("dropping all but same-a deletes same-b, changed and gone, and keeps precious; expected \"0 to create, 0 to update, 3 to delete, 1 unchanged\", got:\n%s", tail(res.Stdout))
+	}
+
+	res, err = w.run("plan", "--set", "web", "-f", w.file("v1-again.yaml", cm("same-a", map[string]string{"k": "v"})+"---\n"+cm("changed", map[string]string{"k": "old"})))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if !hasTotals(lines(res.Stdout), 0, 0, 0, 2) {
+		return fmt.Errorf("without --prune nothing is deleted and nothing here changes; expected \"0 to create, 0 to update, 0 to delete, 2 unchanged\", got:\n%s", tail(res.Stdout))
+	}
+
+	if err := w.applyAs("other-tool", cm("same-a", map[string]string{"k": "theirs"})); err != nil {
+		return err
+	}
+	res, err = w.run("plan", "--set", "web", "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 2); err != nil {
+		return err
+	}
+	if !conflictLine(res.Stdout, "ConfigMap/same-a", ".data.k", "other-tool") {
+		return fmt.Errorf("a plan the server would refuse names the conflict, as diff does; got:\n%s", tail(res.Stdout))
+	}
+	return nil
+}
+
+// hasTotals finds the plan's totals line.
+func hasTotals(got []string, create, update, del, unchanged int) bool {
+	want := fmt.Sprintf("%d to create, %d to update, %d to delete, %d unchanged", create, update, del, unchanged)
+	for _, l := range got {
+		if strings.Contains(l, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // ownsKey reports whether manager's managedFields entry claims data.key.

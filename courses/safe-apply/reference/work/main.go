@@ -23,6 +23,8 @@
 // prune: disabled, never after a refused apply, never from an empty manifest.
 // Stage 14: `drift -f FILE` names the fields someone else has changed since
 // this tool applied them, and who.
+// Stage 15: `plan -f FILE` says what apply would do to each object, prune
+// included, and totals it, without writing anything.
 
 package main
 
@@ -268,6 +270,33 @@ func run(cmd string, opt opts) (int, error) {
 			}
 		}
 		return code, nil
+	case "plan":
+		c, objs, err := setup(file, opt.set)
+		if err != nil {
+			return 2, err
+		}
+		if opt.prune && len(objs) == 0 {
+			return 2, fmt.Errorf("refusing to prune from an empty manifest: it would delete every member of set %q", opt.set)
+		}
+		c.force = opt.force
+		changes, refused, err := c.plan(objs, opt)
+		if err != nil {
+			return 2, err
+		}
+		count := map[string]int{}
+		for _, ch := range changes {
+			fmt.Println(ref(ch.obj), ch.action)
+			count[ch.action]++
+		}
+		fmt.Printf("%d to create, %d to update, %d to delete, %d unchanged\n",
+			count["create"], count["update"], count["delete"], count["unchanged"])
+		switch {
+		case refused:
+			return 2, nil
+		case len(changes) > count["unchanged"]:
+			return 1, nil
+		}
+		return 0, nil
 	case "owners":
 		c, objs, err := setup(file, opt.set)
 		if err != nil {
@@ -391,6 +420,59 @@ func (c *client) pruneSet(objs []*unstructured.Unstructured, set string) (int, e
 		}
 	}
 	return code, nil
+}
+
+// change is what an apply would do to one object: create, update, leave it
+// unchanged, or delete it as a leftover of the set.
+type change struct {
+	action string
+	obj    *unstructured.Unstructured
+}
+
+// plan works out every change an apply with these options would make, from a
+// dry-run of each object and, with --prune, the set's leftovers. Refusals are
+// reported as diff reports them, and leave that object out of the plan.
+func (c *client) plan(objs []*unstructured.Unstructured, opt opts) ([]change, bool, error) {
+	var out []change
+	refused := false
+	for _, o := range objs {
+		live, err := c.live(o)
+		if err != nil {
+			return nil, false, err
+		}
+		after, err := c.after(o)
+		if refusal(err) {
+			refused = true
+			report(o, err)
+			continue
+		}
+		if err != nil {
+			return nil, false, fmt.Errorf("%s: %w", ref(o), err)
+		}
+		action := "unchanged"
+		switch {
+		case live == nil:
+			action = "create"
+		case len(fieldDiff(live, after)) > 0:
+			action = "update"
+		}
+		out = append(out, change{action, o})
+	}
+	if !opt.prune {
+		return out, refused, nil
+	}
+	left, err := c.leftovers(objs, opt.set)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, o := range left {
+		if pruneDisabled(o) {
+			fmt.Println(ref(o), "kept: prune disabled")
+			continue
+		}
+		out = append(out, change{"delete", o})
+	}
+	return out, refused, nil
 }
 
 // key identifies an object across versions of its kind.
