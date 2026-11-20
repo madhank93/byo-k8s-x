@@ -28,6 +28,7 @@ import (
 	apiserverstages "github.com/madhank93/byo-k8s-x/internal/stages/apiserver"
 	controllerstages "github.com/madhank93/byo-k8s-x/internal/stages/controller"
 	kubectlstages "github.com/madhank93/byo-k8s-x/internal/stages/kubectl"
+	safeapplystages "github.com/madhank93/byo-k8s-x/internal/stages/safe-apply"
 	schedulerstages "github.com/madhank93/byo-k8s-x/internal/stages/scheduler"
 	webhookstages "github.com/madhank93/byo-k8s-x/internal/stages/webhook"
 )
@@ -49,6 +50,7 @@ var courses = map[string]course{
 	"webhook":    {webhookstages.Lookup, true},
 	"scheduler":  {schedulerstages.Lookup, true},
 	"apiserver":  {apiserverstages.Lookup, false},
+	"safe-apply": {safeapplystages.Lookup, true},
 }
 
 type testCase struct {
