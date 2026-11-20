@@ -37,6 +37,7 @@ not the cluster.
   color: blue     red        no, kubectl-edit  drift
   size: s         xl         no, other-tool    drift
   mode: b         a          yes (shared)      your change, not drift
+  tone: cool      cool       no, kubectl-edit  same value, not drift
   (nothing)       extra: x   no                not yours, not drift
 ```
 
@@ -50,6 +51,11 @@ ConfigMap/app: drift: .data.color "blue" -> "red" by "kubectl-edit"
 It exits 0 when nothing has drifted and 1 when something has, and changes
 nothing. A field missing from the live object has no owner left to name, so
 it looks exactly like a field you just added; leave it out.
+
+Ownership has blind spots. A list compares whole, and byok8s keeps owning each
+element's key, so a `kubectl set image` inside a container list goes
+unreported. And a field the manifest newly adds that someone else already holds
+reads as drift: managedFields cannot tell "never owned" from "lost".
 
 ## Go APIs
 

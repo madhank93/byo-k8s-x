@@ -32,10 +32,14 @@ as JSON:
 
 Three things make it something you can apply later:
 
-- **Every object, as it will be sent.** Namespace filled in, set label on.
-  Applying the plan must not need the manifest any more.
-- **Every change in the order apply makes it**, deletes last, exactly as stage
-  13 prunes only after everything else has landed.
+- **Every object, as it will be sent.** Namespace filled in, set label on, and
+  none of the server's own metadata: no `uid`, `resourceVersion`,
+  `managedFields` or `creationTimestamp` inside it. A delete holds only
+  `apiVersion`, `kind`, `metadata.name` and `metadata.namespace`. Applying the
+  plan must not need the manifest any more.
+- **Every change in the order apply makes it**, one per object: manifest order,
+  deletes last, exactly as stage 13 prunes only after everything else has
+  landed.
 - **A pin on everything that already exists.** `uid` and `resourceVersion` are
   the live object's as the plan saw it. The resourceVersion changes on every
   write, so if it still matches at apply time, nothing has touched the object
@@ -49,8 +53,9 @@ applying it cannot quietly change them. A protected leftover is not a change,
 so it is not in the file.
 
 If the server would refuse any part of the change, there is no plan to
-approve: report the refusal, exit 2, and write no file at all. Not an empty
-one, not a partial one.
+approve: report the refusal, exit 2, and write nothing. Not an empty file, not
+a partial one; any earlier file at that path is left as it was, and stage 17's
+pins refuse it if the cluster has moved on.
 
 ## Go APIs
 

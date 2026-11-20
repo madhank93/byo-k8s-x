@@ -1060,7 +1060,7 @@ func stageDriftDetect(ctx context.Context, env *kube.Env, bin string) error {
 	defer w.close()
 
 	calm := cm("calm", map[string]string{"k": "v"})
-	v1 := w.file("v1.yaml", cm("app", map[string]string{"color": "blue", "size": "s", "mode": "a"})+"---\n"+calm)
+	v1 := w.file("v1.yaml", cm("app", map[string]string{"color": "blue", "size": "s", "mode": "a", "tone": "warm"})+"---\n"+calm)
 	res, err := w.run("apply", "-f", v1)
 	if err != nil {
 		return err
@@ -1078,8 +1078,12 @@ func stageDriftDetect(ctx context.Context, env *kube.Env, bin string) error {
 	if err := w.updateAs("kubectl-edit", "app", "extra", "x"); err != nil {
 		return err
 	}
+	// tone is taken too, but already holds what v2 asks for.
+	if err := w.updateAs("kubectl-edit", "app", "tone", "cool"); err != nil {
+		return err
+	}
 
-	res, err = w.run("drift", "-f", w.file("v2.yaml", cm("app", map[string]string{"color": "blue", "size": "s", "mode": "b"})+"---\n"+calm))
+	res, err = w.run("drift", "-f", w.file("v2.yaml", cm("app", map[string]string{"color": "blue", "size": "s", "mode": "b", "tone": "cool"})+"---\n"+calm))
 	if err != nil {
 		return err
 	}
@@ -1103,6 +1107,7 @@ func stageDriftDetect(ctx context.Context, env *kube.Env, bin string) error {
 	for field, why := range map[string]string{
 		".data.mode":  "byok8s still owns data.mode, so the new value is this manifest's own change, not drift",
 		".data.extra": "data.extra is not in the manifest, so whoever set it has not changed anything of yours",
+		".data.tone":  "data.tone already has the value the manifest asks for, so there is nothing to undo",
 	} {
 		if strings.Contains(res.Stdout, field) {
 			return fmt.Errorf("%s; got:\n%s", why, tail(res.Stdout))
@@ -1242,7 +1247,58 @@ func stageImpactReport(ctx context.Context, env *kube.Env, bin string) error {
 	if !conflictLine(res.Stdout, "ConfigMap/same-a", ".data.k", "other-tool") {
 		return fmt.Errorf("a plan the server would refuse names the conflict, as diff does; got:\n%s", tail(res.Stdout))
 	}
+	if hasLine(res.Stdout, "ConfigMap/same-a ") {
+		return fmt.Errorf("the server refused ConfigMap/same-a, so it is left out of the plan, not given an action; got:\n%s", tail(res.Stdout))
+	}
+	res, err = w.run("plan", "--set", "web", "--force-conflicts", "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	if !hasLine(res.Stdout, "ConfigMap/same-a update") {
+		return fmt.Errorf("with --force-conflicts the server takes data.k from other-tool, so ConfigMap/same-a is an update; got:\n%s", tail(res.Stdout))
+	}
+
+	// The server stores cpu 1000m as "1"; comparing against the manifest
+	// instead of the dry-run would call that a change.
+	quota := w.file("quota.yaml", `{"apiVersion":"v1","kind":"ResourceQuota","metadata":{"name":"norm"},"spec":{"hard":{"cpu":"1000m"}}}`+"\n")
+	res, err = w.run("apply", "--set", "quota", "-f", quota)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	// The quota controller writes status once; plan after it, not during it.
+	if err := kube.WaitFor(ctx, "the quota controller to fill in ResourceQuota/norm's status", func(ctx context.Context) (bool, error) {
+		q, err := env.Client.CoreV1().ResourceQuotas(env.Namespace).Get(ctx, "norm", metav1.GetOptions{})
+		return err == nil && len(q.Status.Hard) > 0, nil
+	}); err != nil {
+		return err
+	}
+	res, err = w.run("plan", "--set", "quota", "-f", quota)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if !hasLine(res.Stdout, "ResourceQuota/norm unchanged") {
+		return fmt.Errorf("ResourceQuota/norm was applied from this manifest and the server stores cpu 1000m as \"1\", so it is unchanged; got:\n%s", tail(res.Stdout))
+	}
 	return nil
+}
+
+// hasLine reports whether a line of out starts with prefix.
+func hasLine(out, prefix string) bool {
+	for _, l := range lines(out) {
+		if strings.HasPrefix(l, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // planFile is the plan format the course specifies, as stage 16 writes it and
@@ -1309,9 +1365,28 @@ func stagePlanFile(ctx context.Context, env *kube.Env, bin string) error {
 		return fmt.Errorf("expected %d changes, one per manifest object plus the delete of gone, got %d:\n%s", len(want), len(p.Changes), tail(string(raw)))
 	}
 	deleting := false
+	planned := map[string]bool{}
+	var order []string
 	for _, c := range p.Changes {
 		o := &unstructured.Unstructured{Object: c.Object}
 		name := o.GetName()
+		if planned[name] {
+			return fmt.Errorf("ConfigMap/%s appears twice in the plan; each object has one change:\n%s", name, tail(string(raw)))
+		}
+		planned[name] = true
+		if c.Action == "delete" {
+			md, _ := o.Object["metadata"].(map[string]any)
+			if len(o.Object) != 3 || len(md) != 2 || o.GetName() == "" || o.GetNamespace() == "" {
+				return fmt.Errorf("a delete stores only what identifies the object: apiVersion, kind, metadata.name and metadata.namespace; ConfigMap/%s has %v", name, c.Object)
+			}
+		} else {
+			order = append(order, name)
+			for _, f := range []string{"managedFields", "uid", "resourceVersion", "creationTimestamp"} {
+				if _, ok := o.Object["metadata"].(map[string]any)[f]; ok {
+					return fmt.Errorf("an object to apply is stored as it will be sent, which the server's own metadata.%s is not; ConfigMap/%s has it", f, name)
+				}
+			}
+		}
 		if c.Action != want[name] {
 			return fmt.Errorf("ConfigMap/%s should be planned as %q, the plan says %q", name, want[name], c.Action)
 		}
@@ -1335,6 +1410,9 @@ func stagePlanFile(ctx context.Context, env *kube.Env, bin string) error {
 			}
 		}
 	}
+	if manifest := []string{"same-a", "same-b", "precious", "changed", "new-a", "new-b"}; !reflect.DeepEqual(order, manifest) {
+		return fmt.Errorf("objects to apply come in manifest order, %v; the plan has %v", manifest, order)
+	}
 	if _, err := env.ConfigMap(ctx, "gone"); err != nil {
 		return fmt.Errorf("plan only writes a file; ConfigMap/gone was deleted")
 	}
@@ -1352,6 +1430,26 @@ func stagePlanFile(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if _, err := os.Stat(refusedPath); err == nil {
 		return fmt.Errorf("the server would refuse this change, so there is no plan to apply; plan wrote %s anyway", refusedPath)
+	}
+
+	forcedPath := filepath.Join(w.dir, "forced.json")
+	res, err = w.run("plan", "--set", "web", "--prune", "--force-conflicts", "--out", forcedPath, "-f", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 1); err != nil {
+		return err
+	}
+	if !hasLine(res.Stdout, "ConfigMap/same-a update") {
+		return fmt.Errorf("with --force-conflicts the server takes data.k from other-tool, so ConfigMap/same-a is an update; got:\n%s", tail(res.Stdout))
+	}
+	raw, err = os.ReadFile(forcedPath)
+	if err != nil {
+		return fmt.Errorf("plan --force-conflicts --out %s exited 1 but wrote no file: %w", forcedPath, err)
+	}
+	var forced planFile
+	if err := json.Unmarshal(raw, &forced); err != nil || !forced.Force {
+		return fmt.Errorf("a plan made with --force-conflicts records \"force\": true, so applying it takes the same fields; got:\n%s", tail(string(raw)))
 	}
 	return nil
 }

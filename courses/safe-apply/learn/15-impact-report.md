@@ -12,16 +12,18 @@ is about to be deleted. Terraform answers that question with a plan, and
 ends it with a count:
 
 ```
+ConfigMap/precious kept: prune disabled
 ConfigMap/new-a create
 ConfigMap/changed update
 ConfigMap/same-a unchanged
 ConfigMap/gone delete
-ConfigMap/precious kept: prune disabled
-2 to create, 1 to update, 1 to delete, 3 unchanged
+1 to create, 1 to update, 1 to delete, 1 unchanged
 ```
 
 `plan -f FILE` takes the same flags as `apply` (`--set`, `--prune`,
 `--force-conflicts`) and says what that apply would do, without doing it.
+With `--force-conflicts` a field another manager owns is the server's to take,
+so that object is an update, not a refusal.
 Every piece already exists; this stage puts them in one place:
 
 ```
@@ -35,9 +37,10 @@ Every piece already exists; this stage puts them in one place:
 ```
 
 Use the dry-run, not the manifest, to decide between update and unchanged. A
-manifest that leaves out a defaulted field is not asking for a change, and
-only the server knows what it would default. A kept leftover is named but not
-counted: it is not going anywhere.
+manifest that leaves out a defaulted field is not asking for a change, nor is
+one that writes a ResourceQuota's `cpu: 1000m` the server stores as `"1"`, and
+only the server knows what it would default or normalise. A kept leftover is
+named but not counted: it is not going anywhere.
 
 The totals line comes last and always has all four counts, in that order. A
 refusal is reported the way `diff` reports it and the object is left out of
