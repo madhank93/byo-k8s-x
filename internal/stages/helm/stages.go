@@ -8,11 +8,18 @@
 package helm
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
+	"github.com/madhank93/byo-k8s-x/internal/cluster"
 	"github.com/madhank93/byo-k8s-x/internal/kube"
 	"github.com/madhank93/byo-k8s-x/internal/runner"
 	"github.com/madhank93/byo-k8s-x/internal/stages"
@@ -51,6 +59,7 @@ func init() {
 	register(Stage{Slug: "values-schema", Run: stageValuesSchema})
 	register(Stage{Slug: "manifest-split", Run: stageManifestSplit})
 	register(Stage{Slug: "install", Run: stageInstall})
+	register(Stage{Slug: "release-storage", Run: stageReleaseStorage})
 }
 
 const chartYAML = `apiVersion: v2
@@ -1957,4 +1966,326 @@ func tail(s string) string {
 		l = append([]string{"…"}, l[len(l)-20:]...)
 	}
 	return "  " + strings.Join(l, "\n  ")
+}
+
+// stageReleaseStorage — install records revision 1 as a Secret in Helm's own
+// format, which the real helm reads back; a name with any revision is refused,
+// a refused install records nothing, and a failed create is recorded as failed.
+func stageReleaseStorage(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := needHelm(w); err != nil {
+		return err
+	}
+	ns := env.Namespace
+
+	files := webChart("hello")
+	files["README.md"] = "read me\n"
+	web := w.chart("web", files)
+	vals := w.file("vals.yaml", "port: 9090\nextra:\n  list: [1, 2]\n")
+	start := time.Now().Add(-time.Second)
+	res, err := w.run("install", "-f", vals, "--set", "msg=hi", "first", web)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	end := time.Now().Add(time.Second)
+	summary := `NAME: first
+LAST DEPLOYED: *
+NAMESPACE: ` + ns + `
+STATUS: deployed
+REVISION: 1
+NOTES:
+Installed first into ` + ns + `.
+Say hi.
+`
+	if err := wantSummary(res.Stdout, summary, "install first"); err != nil {
+		return err
+	}
+
+	rec, err := wantRecord(ctx, env, "first", 1, "deployed", start, end)
+	if err != nil {
+		return err
+	}
+	tmpl, err := w.run("template", "-n", ns, "-f", vals, "--set", "msg=hi", "first", web)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(tmpl, 0); err != nil {
+		return fmt.Errorf("template, run with install's arguments, to compare with the recorded manifest: %w", err)
+	}
+	var templates []any
+	for _, n := range []string{"templates/NOTES.txt", "templates/config.yaml", "templates/svc.yaml"} {
+		templates = append(templates, map[string]any{"name": n, "data": base64.StdEncoding.EncodeToString([]byte(files[n]))})
+	}
+	for _, c := range []struct {
+		path string
+		got  any
+		want any
+	}{
+		{"name", rec["name"], "first"},
+		{"namespace", rec["namespace"], ns},
+		{"version", rec["version"], 1.0},
+		{"info.status", dig(rec, "info", "status"), "deployed"},
+		{"info.description", dig(rec, "info", "description"), "Install complete"},
+		{"info.notes (rendered, not trimmed)", dig(rec, "info", "notes"), "Installed first into " + ns + ".\nSay hi.\n"},
+		{"chart.metadata", dig(rec, "chart", "metadata"), map[string]any{"name": "web", "version": "1.0.0", "appVersion": "2.1", "apiVersion": "v2"}},
+		{"chart.templates (the top chart's only, data in base64), sorted by name", sortedByName(dig(rec, "chart", "templates")), templates},
+		{"chart.values (the chart's defaults)", dig(rec, "chart", "values"), map[string]any{"msg": "hello", "port": 8080.0}},
+		{"chart.files (every other file of the top chart)", sortedByName(dig(rec, "chart", "files")), []any{map[string]any{"name": "README.md", "data": base64.StdEncoding.EncodeToString([]byte("read me\n"))}}},
+		{"config (the user's values: -f, then --set)", rec["config"], map[string]any{"msg": "hi", "port": 9090.0, "extra": map[string]any{"list": []any{1.0, 2.0}}}},
+		{"manifest (what template prints)", rec["manifest"], tmpl.Stdout},
+	} {
+		if !reflect.DeepEqual(c.got, c.want) {
+			return fmt.Errorf("the release record's %s should be\n  %s\ngot\n  %s", c.path, jsonText(c.want), jsonText(c.got))
+		}
+	}
+	first, _ := dig(rec, "info", "first_deployed").(string)
+	last, _ := dig(rec, "info", "last_deployed").(string)
+	if t, err := time.Parse(time.RFC3339Nano, last); err != nil || first != last || t.Before(start) || t.After(end) {
+		return fmt.Errorf("info.first_deployed and info.last_deployed should both be the install's time, as Go's time.Time marshals to JSON (RFC 3339), got %q and %q", first, last)
+	}
+
+	// The real helm reads what the program wrote.
+	res, err = w.helm("status", "first")
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("helm status first, run by the real helm against your record: %w", err)
+	}
+	if err := wantSummary(res.Stdout, summary, "helm status first, run by the real helm against your record"); err != nil {
+		return err
+	}
+	res, err = w.helm("get", "values", "first", "-a", "-o", "json")
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("helm get values first -a, run by the real helm against your record: %w", err)
+	}
+	if err := wantYAML(res.Stdout, `{msg: hi, port: 9090, extra: {list: [1, 2]}}`, "helm get values first --all, the record's config over its chart's values"); err != nil {
+		return err
+	}
+	res, err = w.helm("list", "-o", "json")
+	if err != nil {
+		return err
+	}
+	var listed []map[string]any
+	if err := json.Unmarshal([]byte(res.Stdout), &listed); err != nil || len(listed) != 1 {
+		return fmt.Errorf("helm list, run by the real helm, should find exactly release first, got:\n%s\n%s", tail(res.Stdout), tail(res.Stderr))
+	}
+	delete(listed[0], "updated")
+	if want := map[string]any{"name": "first", "namespace": ns, "revision": "1", "status": "deployed", "chart": "web-1.0.0", "app_version": "2.1"}; !reflect.DeepEqual(listed[0], want) {
+		return fmt.Errorf("helm list, run by the real helm against your record, should show\n  %s\ngot\n  %s", jsonText(want), jsonText(listed[0]))
+	}
+
+	// A name with any revision is taken, and nothing is touched.
+	if res, err = w.run("install", "--set", "msg=again", "first", web); err != nil {
+		return err
+	}
+	if err := wantRefusal(res, "cannot re-use a name that is still in use", "installing first a second time"); err != nil {
+		return err
+	}
+	if cm, err := env.ConfigMap(ctx, "first-config"); err != nil || cm.Data["msg"] != "hi" {
+		return fmt.Errorf("the refused second install of first should leave ConfigMap first-config with msg=hi, got %v (%v)", cm, err)
+	}
+	if err := wantRevisions(ctx, env, "first", 1); err != nil {
+		return err
+	}
+
+	// The same holds for a release the real helm installed.
+	if res, err = w.helm("install", "--set", "msg=h", "helmed", web); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("the grader's own helm install helmed: %w", err)
+	}
+	if res, err = w.run("install", "helmed", web); err != nil {
+		return err
+	}
+	if err := wantRefusal(res, "cannot re-use a name that is still in use", "installing helmed, which the real helm installed"); err != nil {
+		return err
+	}
+
+	// An install refused by the ownership check never got as far as a record.
+	if err := seedConfigMap(ctx, env, "grab-taken", nil, nil); err != nil {
+		return err
+	}
+	grab := w.chart("grab", map[string]string{
+		"Chart.yaml":           "apiVersion: v2\nname: grab\nversion: 1.0.0\n",
+		"templates/taken.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: grab-taken\n",
+	})
+	if res, err = w.run("install", "grab", grab); err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("ConfigMap grab-taken exists and no release owns it: %w", err)
+	}
+	if err := wantRevisions(ctx, env, "grab", 0); err != nil {
+		return fmt.Errorf("%w: a refusal by the ownership check comes before the record is written", err)
+	}
+
+	// A create the API server rejects leaves a failed revision.
+	broken := w.chart("broken", map[string]string{
+		"Chart.yaml":         "apiVersion: v2\nname: broken\nversion: 0.2.0\n",
+		"templates/a.yaml":   "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: broken-ok\n",
+		"templates/bad.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: broken-bad\ndata:\n  \"no spaces\": x\n",
+	})
+	start = time.Now().Add(-time.Second)
+	if res, err = w.run("install", "broken", broken); err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("ConfigMap broken-bad has a data key the API server rejects (\"no spaces\"), so install broken fails: %w", err)
+	}
+	if !strings.Contains(res.Stderr, "INSTALLATION FAILED") {
+		return fmt.Errorf("a failed install says so, as Helm does (Error: INSTALLATION FAILED: ...), stderr was:\n%s", tail(res.Stderr))
+	}
+	rec, err = wantRecord(ctx, env, "broken", 1, "failed", start, time.Now().Add(time.Second))
+	if err != nil {
+		return fmt.Errorf("%w (the create of broken-bad was rejected, so revision 1 ends failed)", err)
+	}
+	if d, _ := dig(rec, "info", "description").(string); !strings.HasPrefix(d, `Release "broken" failed: `) || !strings.Contains(d, "is invalid") {
+		return fmt.Errorf(`a failed revision's info.description is Helm's: Release "broken" failed: <the error from the API server>, got %q`, d)
+	}
+	if res, err = w.helm("status", "broken"); err != nil {
+		return err
+	}
+	if !strings.Contains(res.Stdout, "STATUS: failed\n") {
+		return fmt.Errorf("helm status broken, run by the real helm against your record, should say STATUS: failed, got:\n%s\n%s", tail(res.Stdout), tail(res.Stderr))
+	}
+	if res, err = w.run("install", "broken", broken); err != nil {
+		return err
+	}
+	return wantRefusal(res, "cannot re-use a name that is still in use", "installing broken again: a failed revision still holds the name")
+}
+
+// wantRecord finds a release's revision Secret by Helm's labels, checks the
+// labels and type, and returns the decoded record.
+func wantRecord(ctx context.Context, env *kube.Env, name string, version int, status string, start, end time.Time) (map[string]any, error) {
+	secrets, err := env.Client.CoreV1().Secrets(env.Namespace).List(ctx, metav1.ListOptions{LabelSelector: "owner=helm,name=" + name + ",version=" + strconv.Itoa(version)})
+	if err != nil {
+		return nil, err
+	}
+	secretName := fmt.Sprintf("sh.helm.release.v1.%s.v%d", name, version)
+	if len(secrets.Items) != 1 || secrets.Items[0].Name != secretName {
+		var got []string
+		for _, s := range secrets.Items {
+			got = append(got, s.Name)
+		}
+		return nil, fmt.Errorf("expected one Secret labelled owner=helm,name=%s,version=%d, named %s, found %v", name, version, secretName, got)
+	}
+	s := secrets.Items[0]
+	if s.Type != "helm.sh/release.v1" {
+		return nil, fmt.Errorf("Secret %s should have type helm.sh/release.v1, got %q", s.Name, s.Type)
+	}
+	mod, err := strconv.ParseInt(s.Labels["modifiedAt"], 10, 64)
+	if err != nil || mod < start.Unix() || mod > end.Unix() {
+		return nil, fmt.Errorf("Secret %s's label modifiedAt should be the Unix time, in seconds, it was last written, got %q", s.Name, s.Labels["modifiedAt"])
+	}
+	want := map[string]string{"name": name, "owner": "helm", "status": status, "version": strconv.Itoa(version), "modifiedAt": s.Labels["modifiedAt"]}
+	if !reflect.DeepEqual(s.Labels, want) {
+		return nil, fmt.Errorf("Secret %s should be labelled exactly %v, got %v", s.Name, want, s.Labels)
+	}
+	gz, err := base64.StdEncoding.DecodeString(string(s.Data["release"]))
+	if err != nil {
+		return nil, fmt.Errorf("Secret %s's data.release should be base64 text (of gzipped JSON): %v", s.Name, err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(gz))
+	if err != nil {
+		return nil, fmt.Errorf("Secret %s's data.release, base64-decoded, should be gzip: %v", s.Name, err)
+	}
+	var rec map[string]any
+	if err := json.NewDecoder(zr).Decode(&rec); err != nil {
+		return nil, fmt.Errorf("Secret %s's data.release, decoded and gunzipped, should be the release as JSON: %v", s.Name, err)
+	}
+	return rec, nil
+}
+
+// wantRevisions checks how many revision Secrets a release has.
+func wantRevisions(ctx context.Context, env *kube.Env, name string, n int) error {
+	secrets, err := env.Client.CoreV1().Secrets(env.Namespace).List(ctx, metav1.ListOptions{LabelSelector: "owner=helm,name=" + name})
+	if err != nil {
+		return err
+	}
+	if len(secrets.Items) != n {
+		var got []string
+		for _, s := range secrets.Items {
+			got = append(got, s.Name)
+		}
+		return fmt.Errorf("release %s should have %d revision Secret(s), found %v", name, n, got)
+	}
+	return nil
+}
+
+// wantRefusal is a refusal carrying Helm's own words.
+func wantRefusal(res *runner.Result, text, what string) error {
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	if !strings.Contains(res.Stderr, text) {
+		return fmt.Errorf("%s should be refused as Helm refuses it:\n  %s\nstderr was:\n%s", what, text, tail(res.Stderr))
+	}
+	return nil
+}
+
+// dig walks nested JSON objects, returning nil where a key is missing.
+func dig(v any, keys ...string) any {
+	for _, k := range keys {
+		m, _ := v.(map[string]any)
+		v = m[k]
+	}
+	return v
+}
+
+// sortedByName orders a JSON list of {name, data} entries by name, since the
+// order a program walks a chart in is its own business.
+func sortedByName(v any) any {
+	l, ok := v.([]any)
+	if !ok {
+		return v
+	}
+	l = append([]any(nil), l...)
+	sort.SliceStable(l, func(i, j int) bool {
+		a, _ := dig(l[i], "name").(string)
+		b, _ := dig(l[j], "name").(string)
+		return a < b
+	})
+	return l
+}
+
+func jsonText(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+// needHelm checks for the real helm, which the release stages grade against:
+// what the program records must be readable by it, and what it prints must
+// match it.
+func needHelm(w *work) error {
+	if _, err := exec.LookPath("helm"); err != nil {
+		return fmt.Errorf("this stage compares your program with the real helm, and there is no helm on PATH: install one (mise install provisions the version the course is graded with)")
+	}
+	res, err := w.helm("version", "--short")
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(res.Stdout, "v3.") {
+		return fmt.Errorf("this stage is graded against helm 3; helm version --short says %q", strings.TrimSpace(res.Stdout))
+	}
+	return nil
+}
+
+// helm runs the real helm against the stage's cluster and namespace. The
+// context is named outright so that no HELM_KUBECONTEXT in the environment
+// can point it at another cluster.
+func (w *work) helm(args ...string) (*runner.Result, error) {
+	env := append([]string{"HELM_NAMESPACE=" + w.env.Namespace}, w.kc...)
+	return runner.InvokeEnv(w.ctx, "helm", env, stages.Timeout, append([]string{"--kube-context", cluster.Context}, args...)...)
 }

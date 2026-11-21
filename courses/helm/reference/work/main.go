@@ -33,12 +33,18 @@
 // Stage 11: `install [-n NS] [-f FILE]... [--set k=v]... NAME DIR` creates the
 // rendered objects in the cluster, marked as the release's, and refuses to take
 // over objects it does not own. The namespace defaults to the kubeconfig's.
+//
+// Stage 12: install records the release as a Secret per revision, in Helm's
+// own format, and refuses a name that already has one.
 
 package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -55,6 +61,7 @@ import (
 	"github.com/Masterminds/semver/v3"
 	"github.com/Masterminds/sprig/v3"
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -62,6 +69,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/yaml"
@@ -154,9 +162,7 @@ func run(cmd string, args []string) error {
 				return err
 			}
 		}
-		for _, m := range ms {
-			fmt.Printf("---\n# Source: %s\n%s\n", m.Name, m.Data)
-		}
+		fmt.Print(manifestText(ms))
 		return nil
 	case "install":
 		if len(args) != 2 {
@@ -213,8 +219,8 @@ type Dependency struct {
 
 // File is one file of a chart, named by its slash path from the chart root.
 type File struct {
-	Name string
-	Data []byte
+	Name string `json:"name"`
+	Data []byte `json:"data"`
 }
 
 type Chart struct {
@@ -960,12 +966,18 @@ const (
 )
 
 func install(name, dir, ns string, files, sets []string) error {
-	rel := Release{Name: name, Namespace: ns, Revision: 1, IsInstall: true, Service: "Helm"}
-	r, err := renderRelease(dir, files, sets, rel)
+	k, err := connect()
 	if err != nil {
 		return err
 	}
-	k, err := connect()
+	// Any revision at all, whatever its status, holds the name.
+	if h, err := k.history(ns, name); err != nil {
+		return err
+	} else if len(h) > 0 {
+		return errors.New("cannot re-use a name that is still in use")
+	}
+	rel := Release{Name: name, Namespace: ns, Revision: 1, IsInstall: true, Service: "Helm"}
+	r, err := renderRelease(dir, files, sets, rel)
 	if err != nil {
 		return err
 	}
@@ -974,7 +986,7 @@ func install(name, dir, ns string, files, sets []string) error {
 		return err
 	}
 	// Every object is checked before any is created, so a refusal leaves
-	// nothing behind.
+	// nothing behind, not even a record.
 	for _, o := range objs {
 		live, err := k.get(o)
 		if err != nil {
@@ -987,27 +999,195 @@ func install(name, dir, ns string, files, sets []string) error {
 			// ponytail: an object already marked as this release's is not adopted; create fails on it.
 		}
 	}
+	now := time.Now()
+	rec := &Record{
+		Name: name, Namespace: ns, Version: 1,
+		Info: &Info{FirstDeployed: Time{now}, LastDeployed: Time{now}, Status: "pending-install",
+			Description: "Initial install underway", Notes: r.Notes},
+		Chart:    storedChart(r.Chart),
+		Config:   r.Config,
+		Manifest: manifestText(r.Manifests),
+	}
+	if err := k.saveRecord(rec, false); err != nil {
+		return err
+	}
 	for _, o := range objs {
 		mark(o.obj, name, ns)
 		if _, err := o.res.Create(k.ctx, o.obj, metav1.CreateOptions{FieldManager: "helm"}); err != nil {
-			return fmt.Errorf("failed to create resource: %w", err)
+			err = fmt.Errorf("failed to create resource: %w", err)
+			rec.Info.Status = "failed"
+			rec.Info.Description = fmt.Sprintf("Release %q failed: %s", name, err)
+			if serr := k.saveRecord(rec, true); serr != nil {
+				return serr
+			}
+			return err
 		}
 	}
-	printRelease(name, ns, "deployed", 1, r.Notes, time.Now())
+	rec.Info.Status, rec.Info.Description = "deployed", "Install complete"
+	if err := k.saveRecord(rec, true); err != nil {
+		return err
+	}
+	printRelease(rec)
 	return nil
 }
 
-// printRelease is the summary install prints.
-func printRelease(name, ns, status string, revision int, notes string, deployed time.Time) {
-	fmt.Printf("NAME: %s\n", name)
-	fmt.Printf("LAST DEPLOYED: %s\n", deployed.Format(time.ANSIC))
-	fmt.Printf("NAMESPACE: %s\n", ns)
-	fmt.Printf("STATUS: %s\n", status)
-	fmt.Printf("REVISION: %d\n", revision)
-	fmt.Println("TEST SUITE: None")
-	if notes != "" {
-		fmt.Printf("NOTES:\n%s\n", strings.TrimSpace(notes))
+// manifestText is the rendered documents as template prints them and as the
+// release records them.
+func manifestText(ms []File) string {
+	var b strings.Builder
+	for _, m := range ms {
+		fmt.Fprintf(&b, "---\n# Source: %s\n%s\n", m.Name, m.Data)
 	}
+	return b.String()
+}
+
+// printRelease is the summary install prints.
+func printRelease(r *Record) {
+	fmt.Printf("NAME: %s\n", r.Name)
+	fmt.Printf("LAST DEPLOYED: %s\n", r.Info.LastDeployed.Format(time.ANSIC))
+	fmt.Printf("NAMESPACE: %s\n", r.Namespace)
+	fmt.Printf("STATUS: %s\n", r.Info.Status)
+	fmt.Printf("REVISION: %d\n", r.Version)
+	fmt.Println("TEST SUITE: None")
+	if r.Info.Notes != "" {
+		fmt.Printf("NOTES:\n%s\n", strings.TrimSpace(r.Info.Notes))
+	}
+}
+
+// Record is Helm's release.Release, with the JSON names Helm stores it under.
+type Record struct {
+	Name      string         `json:"name,omitempty"`
+	Info      *Info          `json:"info,omitempty"`
+	Chart     *StoredChart   `json:"chart,omitempty"`
+	Config    map[string]any `json:"config,omitempty"`
+	Manifest  string         `json:"manifest,omitempty"`
+	Version   int            `json:"version,omitempty"`
+	Namespace string         `json:"namespace,omitempty"`
+}
+
+type Info struct {
+	FirstDeployed Time   `json:"first_deployed"`
+	LastDeployed  Time   `json:"last_deployed"`
+	Deleted       Time   `json:"deleted"`
+	Description   string `json:"description,omitempty"`
+	Status        string `json:"status,omitempty"`
+	Notes         string `json:"notes,omitempty"`
+}
+
+// Time is a time as Helm stores one: the zero time is "", which
+// time.Time's own JSON methods refuse.
+type Time struct{ time.Time }
+
+func (t Time) MarshalJSON() ([]byte, error) {
+	if t.IsZero() {
+		return []byte(`""`), nil
+	}
+	return t.Time.MarshalJSON()
+}
+
+func (t *Time) UnmarshalJSON(b []byte) error {
+	if string(b) == `""` || string(b) == "null" {
+		return nil
+	}
+	return t.Time.UnmarshalJSON(b)
+}
+
+// StoredChart is the top chart as a release keeps it: no subcharts.
+type StoredChart struct {
+	Metadata  Metadata       `json:"metadata"`
+	Lock      any            `json:"lock"`
+	Templates []File         `json:"templates"`
+	Values    map[string]any `json:"values"`
+	Schema    []byte         `json:"schema"`
+	Files     []File         `json:"files"`
+}
+
+func storedChart(c *Chart) *StoredChart {
+	s := &StoredChart{Metadata: c.Metadata, Templates: c.Templates, Values: c.Values, Schema: c.Schema}
+	for name, data := range c.Files {
+		s.Files = append(s.Files, File{Name: name, Data: data})
+	}
+	sort.Slice(s.Files, func(i, j int) bool { return s.Files[i].Name < s.Files[j].Name })
+	return s
+}
+
+// saveRecord writes a revision as Helm's Secrets driver does: gzipped JSON,
+// base64-encoded, labelled so revisions are found without decoding them.
+func (k *kube) saveRecord(r *Record, update bool) error {
+	raw, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	if _, err := zw.Write(raw); err != nil {
+		return err
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	s := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("sh.helm.release.v1.%s.v%d", r.Name, r.Version),
+			Labels: map[string]string{
+				"name": r.Name, "owner": "helm", "status": r.Info.Status,
+				"version": strconv.Itoa(r.Version), "modifiedAt": strconv.FormatInt(time.Now().Unix(), 10),
+			},
+		},
+		Type: "helm.sh/release.v1",
+		Data: map[string][]byte{"release": []byte(base64.StdEncoding.EncodeToString(gz.Bytes()))},
+	}
+	secrets := k.cs.CoreV1().Secrets(r.Namespace)
+	if update {
+		_, err = secrets.Update(k.ctx, s, metav1.UpdateOptions{})
+	} else {
+		_, err = secrets.Create(k.ctx, s, metav1.CreateOptions{})
+	}
+	return err
+}
+
+func decodeRecord(s *corev1.Secret) (*Record, error) {
+	gz, err := base64.StdEncoding.DecodeString(string(s.Data["release"]))
+	if err != nil {
+		return nil, err
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(gz))
+	if err != nil {
+		return nil, err
+	}
+	r := &Record{}
+	if err := json.NewDecoder(zr).Decode(r); err != nil {
+		return nil, fmt.Errorf("%s: %w", s.Name, err)
+	}
+	return r, nil
+}
+
+// records decodes every release Secret matching the selector in ns, or in
+// every namespace when ns is "".
+func (k *kube) records(ns, selector string) ([]*Record, error) {
+	list, err := k.cs.CoreV1().Secrets(ns).List(k.ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, err
+	}
+	var out []*Record
+	for i := range list.Items {
+		r, err := decodeRecord(&list.Items[i])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// history is every revision of a release, oldest first.
+func (k *kube) history(ns, name string) ([]*Record, error) {
+	h, err := k.records(ns, "owner=helm,name="+name)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(h, func(i, j int) bool { return h[i].Version < h[j].Version })
+	return h, nil
 }
 
 // mark labels and annotates an object as the release's.
@@ -1054,6 +1234,7 @@ func owned(live *unstructured.Unstructured, name, ns string) error {
 // resources that serve them.
 type kube struct {
 	ctx    context.Context
+	cs     kubernetes.Interface
 	dyn    dynamic.Interface
 	mapper meta.RESTMapper
 }
@@ -1067,11 +1248,15 @@ func connect() (*kube, error) {
 	if err != nil {
 		return nil, err
 	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
 	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &kube{ctx: context.Background(), dyn: dyn,
+	return &kube{ctx: context.Background(), cs: cs, dyn: dyn,
 		mapper: restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))}, nil
 }
 
