@@ -42,6 +42,7 @@ func init() {
 	register(Stage{Slug: "builtin-objects", Run: stageBuiltinObjects})
 	register(Stage{Slug: "template-functions", Run: stageTemplateFunctions})
 	register(Stage{Slug: "named-templates", Run: stageNamedTemplates})
+	register(Stage{Slug: "subcharts", Run: stageSubcharts})
 }
 
 const chartYAML = `apiVersion: v2
@@ -783,6 +784,184 @@ data:
   y: shallow-_b
 `, `"x" defined in _a.tpl, _b.tpl and sub/_c.tpl, and "y" in _b.tpl and _a/_deep.tpl:
 Helm keeps the define from the shallowest path, and at one depth the lexically first`)
+}
+
+// shopChart is a parent with two subcharts: db, with its own values, file,
+// defines and globals, and cache, with no values.yaml at all.
+func shopChart() map[string]string {
+	return map[string]string{
+		"Chart.yaml": `apiVersion: v2
+name: shop
+version: 1.0.0
+`,
+		"charts/cache/Chart.yaml": `apiVersion: v2
+name: cache
+version: 0.1.0
+`,
+		"charts/cache/templates/cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cache
+data:
+  values: {{ toJson .Values | squote }}
+`,
+		"charts/db/Chart.yaml": `apiVersion: v2
+name: db
+version: 0.3.0
+appVersion: "16"
+`,
+		"charts/db/db.conf": `listen = all
+`,
+		"charts/db/templates/_helpers.tpl": `{{- define "db.name" -}}db-{{ .Release.Name }}{{- end -}}
+{{- define "common.label" -}}from-db{{- end -}}
+`,
+		"charts/db/templates/cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "db.name" . }}
+data:
+  chart: {{ .Chart.Name }}-{{ .Chart.Version }}-{{ .Chart.AppVersion }}
+  port: {{ .Values.port | quote }}
+  name: {{ .Values.name }}
+  extra: {{ toJson .Values.extra | squote }}
+  global: {{ toJson .Values.global | squote }}
+  template: {{ .Template.Name }}
+  base: {{ .Template.BasePath }}
+  conf: {{ .Files.Get "db.conf" | trim | quote }}
+  label: {{ include "common.label" . }}
+  release: {{ .Release.Name }}
+`,
+		"charts/db/values.yaml": `global:
+  region: us
+  tier: data
+name: orders
+port: 5432
+extra:
+  kept: true
+`,
+		"templates/_helpers.tpl": `{{- define "common.label" -}}from-parent{{- end -}}
+`,
+		"templates/app.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-{{ .Chart.Name }}
+data:
+  env: {{ .Values.global.env }}
+  dbPort: {{ .Values.db.port | quote }}
+  dbName: {{ .Values.db.name | quote }}
+  subDefine: {{ include "db.name" . }}
+  label: {{ include "common.label" . }}
+  parentGlobal: {{ toJson .Values.global | squote }}
+  parentDb: {{ toJson .Values.db | squote }}
+  parentCache: {{ toJson .Values.cache | squote }}
+`,
+		"values.yaml": `global:
+  env: prod
+  region: eu
+db:
+  port: 6543
+  extra:
+    added: yes
+cache:
+  enabled: true
+`,
+	}
+}
+
+// stageSubcharts — charts under charts/ render with the parent: each sees its
+// own values laid over its defaults, the parent's globals on top of its own,
+// its own .Chart, .Files and .Template, and every define in the one set.
+func stageSubcharts(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	files := shopChart()
+	dir := w.chart("shop", files)
+	res, err := w.run("template", "web", dir)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := wantExact(res.Stdout, `---
+# Source: shop/charts/cache/templates/cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cache
+data:
+  values: '{"enabled":true,"global":{"env":"prod","region":"eu"}}'
+---
+# Source: shop/charts/db/templates/cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-web
+data:
+  chart: db-0.3.0-16
+  port: "6543"
+  name: orders
+  extra: '{"added":true,"kept":true}'
+  global: '{"env":"prod","region":"eu","tier":"data"}'
+  template: shop/charts/db/templates/cm.yaml
+  base: shop/charts/db/templates
+  conf: "listen = all"
+  label: from-parent
+  release: web
+---
+# Source: shop/templates/app.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-shop
+data:
+  env: prod
+  dbPort: "6543"
+  dbName: "orders"
+  subDefine: db-web
+  label: from-parent
+  parentGlobal: '{"env":"prod","region":"eu"}'
+  parentDb: '{"extra":{"added":true,"kept":true},"global":{"env":"prod","region":"eu","tier":"data"},"name":"orders","port":6543}'
+  parentCache: '{"enabled":true,"global":{"env":"prod","region":"eu"}}'
+`, `release web of shop, whose charts/ holds db and cache: shop's values under
+db: override db's defaults, shop's global wins over db's, and the merged db
+values are what shop's own templates see under .Values.db`); err != nil {
+		return err
+	}
+
+	res, err = w.run("template", "--set", "db.port=1", "--set", "global.env=dev", "web", dir)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	for _, line := range []string{
+		`  port: "1"`,
+		`  global: '{"env":"dev","region":"eu","tier":"data"}'`,
+		`  values: '{"enabled":true,"global":{"env":"dev","region":"eu"}}'`,
+	} {
+		if !strings.Contains(res.Stdout, line+"\n") {
+			return fmt.Errorf("with --set db.port=1 --set global.env=dev, the subcharts should render %q; got:\n%s", strings.TrimSpace(line), tail(res.Stdout))
+		}
+	}
+
+	for name, file := range map[string]string{"stray-file": "charts/notes.txt", "no-chart-yaml": "charts/empty/x.yaml"} {
+		bad := shopChart()
+		bad[file] = "x: 1\n"
+		res, err := w.run("template", "web", w.chart(name, bad))
+		if err != nil {
+			return err
+		}
+		if err := wantError(res); err != nil {
+			return fmt.Errorf("%s is not a chart, and Helm loads everything in charts/ as one: %w", file, err)
+		}
+	}
+	return nil
 }
 
 // work is one stage's scratch space: a directory for charts and values files,

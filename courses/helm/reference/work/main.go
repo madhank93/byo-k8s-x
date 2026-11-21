@@ -18,6 +18,9 @@
 //
 // Stage 6: templates define named templates and call them with template,
 // include and tpl.
+//
+// Stage 7: charts under charts/ render with the parent, each seeing its own
+// slice of the values plus the parent's globals.
 
 package main
 
@@ -94,7 +97,7 @@ func run(cmd string, args []string) error {
 		if err != nil {
 			return err
 		}
-		out, err := yaml.Marshal(coalesce(copyMap(c.Values), user))
+		out, err := yaml.Marshal(chartValues(c, user))
 		if err != nil {
 			return err
 		}
@@ -113,7 +116,7 @@ func run(cmd string, args []string) error {
 			return err
 		}
 		rel := Release{Name: args[0], Namespace: namespace, Revision: 1, IsInstall: true, Service: "Helm"}
-		docs, err := render(c, coalesce(copyMap(c.Values), user), rel)
+		docs, err := render(c, chartValues(c, user), rel)
 		if err != nil {
 			return err
 		}
@@ -176,6 +179,7 @@ type Chart struct {
 	Metadata  Metadata
 	Values    map[string]any
 	Templates []File
+	Subcharts []*Chart
 	Files     Files
 }
 
@@ -251,9 +255,29 @@ func load(dir string) (*Chart, error) {
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 	// Helm sorts templates by whole path, not directory by directory.
 	sort.Slice(c.Templates, func(i, j int) bool { return c.Templates[i].Name < c.Templates[j].Name })
-	return c, err
+
+	// Helm loads every entry of charts/ as a chart.
+	// ponytail: unpacked directories only; .tgz archives arrive with dependency build.
+	entries, err := os.ReadDir(filepath.Join(dir, "charts"))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			return nil, fmt.Errorf("error unpacking subchart %s in %s: not a chart directory", e.Name(), c.Metadata.Name)
+		}
+		sub, err := load(filepath.Join(dir, "charts", e.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("error unpacking subchart %s in %s: %w", e.Name(), c.Metadata.Name, err)
+		}
+		c.Subcharts = append(c.Subcharts, sub)
+	}
+	return c, nil
 }
 
 // validate applies the checks Helm makes before it will use a chart.
@@ -338,6 +362,32 @@ func coalesce(dst, src map[string]any) map[string]any {
 	return dst
 }
 
+// chartValues lays the user's values over the chart's defaults, then does the
+// same for each subchart under its name, after handing it the parent's
+// globals. The result is stored back, so the parent sees the merged subchart.
+func chartValues(c *Chart, user map[string]any) map[string]any {
+	v := coalesce(copyMap(c.Values), user)
+	for _, sub := range c.Subcharts {
+		sv, _ := v[sub.Metadata.Name].(map[string]any)
+		if sv == nil {
+			sv = map[string]any{}
+		}
+		if g, ok := v["global"].(map[string]any); ok {
+			sg, _ := sv["global"].(map[string]any)
+			if sg == nil {
+				sg = map[string]any{}
+			}
+			// ponytail: whole keys, parent wins; Helm merges nested global maps key by key.
+			for k, val := range g {
+				sg[k] = val
+			}
+			sv["global"] = sg
+		}
+		v[sub.Metadata.Name] = chartValues(sub, sv)
+	}
+	return v
+}
+
 func copyMap(m map[string]any) map[string]any {
 	out := make(map[string]any, len(m))
 	for k, v := range m {
@@ -397,6 +447,25 @@ func typedVal(v string) any {
 // results in path order. All files are parsed into one set so that any of them
 // can call a template another defines.
 func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
+	// Every chart's templates, named by their path from the top chart, each
+	// with the data its chart's templates see.
+	var all []File
+	data := map[string]map[string]any{}
+	var walk func(c *Chart, prefix string, vals map[string]any)
+	walk = func(c *Chart, prefix string, vals map[string]any) {
+		top := map[string]any{"Values": vals, "Release": rel, "Chart": c.Metadata, "Files": c.Files, "BasePath": prefix + "/templates"}
+		for _, f := range c.Templates {
+			all = append(all, File{Name: prefix + "/" + f.Name, Data: f.Data})
+			data[prefix+"/"+f.Name] = top
+		}
+		for _, sub := range c.Subcharts {
+			sv, _ := vals[sub.Metadata.Name].(map[string]any)
+			walk(sub, prefix+"/charts/"+sub.Metadata.Name, sv)
+		}
+	}
+	walk(c, c.Metadata.Name, vals)
+	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
+
 	t := template.New("gotpl").Option("missingkey=zero")
 	fm := funcMap()
 	// include and tpl close over the set, so they see every define in the chart.
@@ -418,27 +487,27 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 		return b.String(), err
 	}
 	t.Funcs(fm)
-	for _, f := range parseOrder(c.Templates) {
-		if _, err := t.New(c.Metadata.Name + "/" + f.Name).Parse(string(f.Data)); err != nil {
+	for _, f := range parseOrder(all) {
+		if _, err := t.New(f.Name).Parse(string(f.Data)); err != nil {
 			return nil, err
 		}
 	}
 	var out []File
-	for _, f := range c.Templates {
+	for _, f := range all {
 		base := filepath.Base(f.Name)
 		if strings.HasPrefix(base, "_") || strings.HasSuffix(base, "NOTES.txt") {
 			continue
 		}
-		name := c.Metadata.Name + "/" + f.Name
-		data := map[string]any{
-			"Values":   vals,
+		name, top := f.Name, data[f.Name]
+		d := map[string]any{
+			"Values":   top["Values"],
 			"Release":  rel,
-			"Chart":    c.Metadata,
-			"Files":    c.Files,
-			"Template": map[string]string{"Name": name, "BasePath": c.Metadata.Name + "/templates"},
+			"Chart":    top["Chart"],
+			"Files":    top["Files"],
+			"Template": map[string]string{"Name": name, "BasePath": top["BasePath"].(string)},
 		}
 		var b strings.Builder
-		if err := t.ExecuteTemplate(&b, name, data); err != nil {
+		if err := t.ExecuteTemplate(&b, name, d); err != nil {
 			return nil, err
 		}
 		// missingkey=zero prints a missing map key as "<no value>"; Helm blanks it.
