@@ -30,7 +30,8 @@ demo/
   and Helm 3 still loads those, treating them as `v1`.
 
 Everything under `templates/` is a template, including files in nested
-directories. Nothing outside it is.
+directories, except dotfiles directly inside `templates/`, which Helm never
+loads. Nothing outside it is.
 
 For this stage, add a command:
 
@@ -49,6 +50,10 @@ templates/configmap.yaml
 templates/sub/deeper.yaml
 ```
 
+Sorted means by the whole path as a string, the way Helm sorts:
+`templates/a-b.yaml` comes before `templates/a/x.yaml`, because `-` sorts
+before `/`.
+
 A missing or unparseable `Chart.yaml`, or one that fails a check above, makes
 the command exit non-zero with the reason on stderr.
 
@@ -59,7 +64,8 @@ the command exit non-zero with the reason on stderr.
   first, so a value that would not survive JSON does not survive it either.
 - `github.com/Masterminds/semver/v3` — `semver.NewVersion`, the parser Helm
   uses. It is lenient on purpose: `v1.2.3` and `1.2` are accepted.
-- `filepath.WalkDir` visits entries in lexical order.
+- `filepath.WalkDir` sorts each directory on its own, which is not the same
+  order as sorting whole paths; `sort.Strings` or `slices.Sort` afterwards is.
 
 ## Hints
 

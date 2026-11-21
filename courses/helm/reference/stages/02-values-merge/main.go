@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -132,7 +133,6 @@ func load(dir string) (*Chart, error) {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-	// WalkDir visits in lexical order, so the templates come out sorted.
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
@@ -142,6 +142,10 @@ func load(dir string) (*Chart, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		// Helm never loads dotfiles directly under templates/.
+		if strings.HasPrefix(rel, "templates/.") {
+			return nil
+		}
 		if !strings.HasPrefix(rel, "templates/") {
 			return nil
 		}
@@ -152,6 +156,8 @@ func load(dir string) (*Chart, error) {
 		c.Templates = append(c.Templates, File{Name: rel, Data: data})
 		return nil
 	})
+	// Helm sorts templates by whole path, not directory by directory.
+	sort.Slice(c.Templates, func(i, j int) bool { return c.Templates[i].Name < c.Templates[j].Name })
 	return c, err
 }
 

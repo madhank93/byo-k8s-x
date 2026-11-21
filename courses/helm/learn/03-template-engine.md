@@ -24,8 +24,9 @@ What Helm adds is the handling around the engine:
   set, named `CHART/templates/…` (`demo/templates/configmap.yaml`), so any
   file can call a template another file defines — stage 6 relies on it.
 - **Not everything is output.** A file whose name starts with `_`
-  (`_helpers.tpl`) holds definitions only. `NOTES.txt` is shown to the user
-  after an install, never sent to the cluster.
+  (`_helpers.tpl`) holds definitions only. A file whose name ends in
+  `NOTES.txt` is shown to the user after an install, never sent to the
+  cluster.
 - **Missing values render empty.** Helm runs with `missingkey=zero` and
   then blanks the `<no value>` Go prints for a missing map key, so
   `{{ .Values.nothing }}` is an empty string, not an error. Reading a field
@@ -40,8 +41,9 @@ For this stage, add:
 app template [-f FILE]... [--set k=v]... NAME DIR
 ```
 
-printing each rendered template, in path order, exactly as `helm template`
-does — the content with surrounding whitespace trimmed, under a header:
+printing each rendered template in path order — Helm orders by kind, which
+stage 10 adds — with the content's surrounding whitespace trimmed, under a
+header, as `helm template` does:
 
 ```
 ---
@@ -74,7 +76,7 @@ definition that has already been parsed into the set.
 
 Two loops over the templates: the first parses every file (partials
 included) under its `CHART/path` name; the second executes the ones that are
-output, skipping `_*` and `NOTES.txt`, and keeps the non-empty results.
+output, skipping `_*` and `*NOTES.txt`, and keeps the non-empty results.
 </details>
 
 ## Further reading

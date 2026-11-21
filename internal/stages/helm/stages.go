@@ -73,6 +73,9 @@ func stageChartLoad(ctx context.Context, env *kube.Env, bin string) error {
 		"templates/_helpers.tpl":    `{{- define "demo.name" -}}demo{{- end -}}` + "\n",
 		"templates/NOTES.txt":       "Installed.\n",
 		"templates/sub/deeper.yaml": configMapTemplate,
+		"templates/a-b.yaml":        configMapTemplate,
+		"templates/a/x.yaml":        configMapTemplate,
+		"templates/.hidden.yaml":    configMapTemplate,
 		"files/app.conf":            "key = value\n",
 		"README.md":                 "# demo\n",
 	})
@@ -87,11 +90,13 @@ func stageChartLoad(ctx context.Context, env *kube.Env, bin string) error {
 		"demo 1.2.3",
 		"templates/NOTES.txt",
 		"templates/_helpers.tpl",
+		"templates/a-b.yaml",
+		"templates/a/x.yaml",
 		"templates/configmap.yaml",
 		"templates/sub/deeper.yaml",
 	}
 	if err := wantLines(res.Stdout, want); err != nil {
-		return err
+		return fmt.Errorf("templates sort by whole path (a-b.yaml before a/x.yaml, since - sorts before /), and Helm never loads templates/.hidden.yaml: %w", err)
 	}
 
 	// Helm 2 charts had no apiVersion, and Helm 3 still loads them as v1.
@@ -108,6 +113,22 @@ func stageChartLoad(ctx context.Context, env *kube.Env, bin string) error {
 			res.ExitCode, tail(res.Stderr))
 	}
 	if err := wantLines(res.Stdout, []string{"legacy 0.1.0", "templates/configmap.yaml"}); err != nil {
+		return err
+	}
+
+	// Helm's semver parser is lenient: a leading v and a missing patch are fine.
+	lenient := w.chart("lenient", map[string]string{
+		"Chart.yaml":               "apiVersion: v2\nname: lenient\nversion: v1.2\ntype: application\n",
+		"templates/configmap.yaml": configMapTemplate,
+	})
+	if res, err = w.run("chart", lenient); err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("version v1.2 is a version Helm accepts, and type application is valid, but the program exited %d:\n%s",
+			res.ExitCode, tail(res.Stderr))
+	}
+	if err := wantLines(res.Stdout, []string{"lenient v1.2", "templates/configmap.yaml"}); err != nil {
 		return err
 	}
 
@@ -128,9 +149,8 @@ func stageChartLoad(ctx context.Context, env *kube.Env, bin string) error {
 		if err != nil {
 			return err
 		}
-		if res.ExitCode == 0 {
-			return fmt.Errorf("%s: %s, so this is not a chart Helm would load, but the program exited 0 with:\n%s",
-				bad.name, bad.why, tail(res.Stdout))
+		if err := wantError(res); err != nil {
+			return fmt.Errorf("%s: %s, so this is not a chart Helm would load: %w", bad.name, bad.why, err)
 		}
 	}
 	return nil
@@ -234,8 +254,8 @@ are a number and a boolean`); err != nil {
 		if err != nil {
 			return err
 		}
-		if res.ExitCode == 0 {
-			return fmt.Errorf("%s, but the program exited 0 with:\n%s", bad.why, tail(res.Stdout))
+		if err := wantError(res); err != nil {
+			return fmt.Errorf("%s: %w", bad.why, err)
 		}
 	}
 	return nil
@@ -273,15 +293,21 @@ data:
   item{{ $i }}: {{ $v }}
 {{- end }}
 `,
-		"templates/sub/d.yaml":   configMapTemplate,
-		"templates/_helpers.tpl": "{{/* a partial: never output, even text outside a define */}}\nnot a manifest\n",
-		"templates/NOTES.txt":    "Thanks {{ .Values.greeting }}\n",
+		"templates/c/e.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: e
+`,
+		"templates/sub/d.yaml":      configMapTemplate,
+		"templates/_helpers.tpl":    "{{/* a partial: never output, even text outside a define */}}\nnot a manifest\n",
+		"templates/NOTES.txt":       "Thanks {{ .Values.greeting }}\n",
+		"templates/sub/MYNOTES.txt": "Also notes, by the name's ending: {{ .Values.greeting }}\n",
 	})
 }
 
 // stageTemplateEngine — every template is rendered with the merged values and
 // printed the way helm template prints it: one "# Source:" document per file,
-// trimmed, in path order, with partials, notes and empty output left out.
+// trimmed, in whole-path order, with partials, notes and empty output left out.
 func stageTemplateEngine(ctx context.Context, env *kube.Env, bin string) error {
 	w, err := newWork(ctx, env, bin)
 	if err != nil {
@@ -319,6 +345,12 @@ data:
   item0: a
   item1: b
 ---
+# Source: demo/templates/c/e.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: e
+---
 # Source: demo/templates/sub/d.yaml
 apiVersion: v1
 kind: ConfigMap
@@ -336,14 +368,14 @@ metadata:
 		return err
 	}
 
-	res, err = w.run("template", "--set", "greeting=hi,enabled=true", "demo", dir)
+	res, err = w.run("template", "-f", w.file("hi.yaml", "greeting: hi\n"), "--set", "enabled=true", "demo", dir)
 	if err != nil {
 		return err
 	}
 	if err := wantExit(res, 0); err != nil {
 		return err
 	}
-	if err := wantExact(res.Stdout, greeting("hi")+optional+rest, "--set greeting=hi,enabled=true"); err != nil {
+	if err := wantExact(res.Stdout, greeting("hi")+optional+rest, "-f hi.yaml (greeting: hi) --set enabled=true"); err != nil {
 		return err
 	}
 
@@ -631,6 +663,15 @@ func (w *work) run(args ...string) (*runner.Result, error) {
 func wantExit(res *runner.Result, code int) error {
 	if res.ExitCode != code {
 		return fmt.Errorf("expected exit %d, got %d\nstdout:\n%s\nstderr:\n%s", code, res.ExitCode, tail(res.Stdout), tail(res.Stderr))
+	}
+	return nil
+}
+
+// wantError is a refusal the way Helm refuses: exit 1 with a reason on stderr,
+// which a crash (exit 2, a stack trace) is not.
+func wantError(res *runner.Result) error {
+	if res.ExitCode != 1 || strings.TrimSpace(res.Stderr) == "" {
+		return fmt.Errorf("expected exit 1 with an error message on stderr, got exit %d\nstdout:\n%s\nstderr:\n%s", res.ExitCode, tail(res.Stdout), tail(res.Stderr))
 	}
 	return nil
 }
