@@ -40,6 +40,7 @@ func init() {
 	register(Stage{Slug: "values-merge", Run: stageValuesMerge})
 	register(Stage{Slug: "template-engine", Run: stageTemplateEngine})
 	register(Stage{Slug: "builtin-objects", Run: stageBuiltinObjects})
+	register(Stage{Slug: "template-functions", Run: stageTemplateFunctions})
 }
 
 const chartYAML = `apiVersion: v2
@@ -458,6 +459,116 @@ data:
 		if err := wantExact(res.Stdout, want(c.release, c.ns), fmt.Sprintf("release %s in namespace %s (%s)", c.release, c.ns, c.flag)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// stageTemplateFunctions — Helm's function map: sprig's functions without env
+// and expandenv, plus toYaml, toJson and required, rendering exactly as Helm's.
+func stageTemplateFunctions(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	files := map[string]string{
+		"Chart.yaml": chartYAML,
+		"values.yaml": `name: Payments-Gateway-Primary-Region-Canary-Release-For-Load-Tester-Pool
+port: 8080
+labels:
+  tier: web
+  team: core
+resources:
+  limits: {cpu: 100m, memory: 64Mi}
+  requests: {cpu: 50m}
+tags: [beta, alpha]
+password: s3cret
+image:
+  tag: ""
+`,
+		"templates/cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.name | lower | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- toYaml .Values.labels | nindent 4 }}
+data:
+  port: {{ .Values.port | quote }}
+  region: {{ .Values.region | default "us-east-1" | quote }}
+  emptyTag: {{ .Values.image.tag | default "latest" | quote }}
+  shout: {{ upper "quiet" }}
+  tags: {{ .Values.tags | sortAlpha | join "," | quote }}
+  password: {{ .Values.password | b64enc | quote }}
+  json: {{ toJson .Values.labels | squote }}
+  sum: {{ add 1 2 | quote }}
+  resources: |
+{{ toYaml .Values.resources | indent 4 }}
+`,
+	}
+	res, err := w.run("template", "demo", w.chart("demo", files))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := wantExact(res.Stdout, `---
+# Source: demo/templates/cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payments-gateway-primary-region-canary-release-for-load-tester
+  labels:
+    team: core
+    tier: web
+data:
+  port: "8080"
+  region: "us-east-1"
+  emptyTag: "latest"
+  shout: QUIET
+  tags: "alpha,beta"
+  password: "czNjcmV0"
+  json: '{"team":"core","tier":"web"}'
+  sum: "3"
+  resources: |
+    limits:
+      cpu: 100m
+      memory: 64Mi
+    requests:
+      cpu: 50m
+`, "a template using sprig's functions and Helm's toYaml and toJson"); err != nil {
+		return err
+	}
+
+	files["templates/req.yaml"] = `tag: {{ required "image.tag is required" .Values.image.tag }}` + "\n"
+	res, err = w.run("template", "demo", w.chart("required", files))
+	if err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return fmt.Errorf("required \"image.tag is required\" was given an empty string, which must fail the render, but the program exited 0 with:\n%s", tail(res.Stdout))
+	}
+	if !strings.Contains(res.Stderr, "image.tag is required") {
+		return fmt.Errorf("required failed the render, but the error should carry its message, \"image.tag is required\"; stderr was:\n%s", tail(res.Stderr))
+	}
+	if res, err = w.run("template", "--set", "image.tag=1.0", "demo", w.chart("required", files)); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("with --set image.tag=1.0, required has its value: %w", err)
+	}
+	if !strings.Contains(res.Stdout, "tag: 1.0") {
+		return fmt.Errorf("required returns the value it checks, so req.yaml should render \"tag: 1.0\"; got:\n%s", tail(res.Stdout))
+	}
+	delete(files, "templates/req.yaml")
+
+	files["templates/env.yaml"] = `home: {{ env "HOME" }}` + "\n"
+	if res, err = w.run("template", "demo", w.chart("env", files)); err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return fmt.Errorf("Helm removes env from sprig's functions, so a chart cannot read the environment of whoever installs it; a template calling env must not render, but the program exited 0 with:\n%s", tail(res.Stdout))
 	}
 	return nil
 }

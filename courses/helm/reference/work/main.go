@@ -12,6 +12,9 @@
 //
 // Stage 4: templates see .Release, .Chart, .Template and .Files; `-n` and
 // `--namespace` name the release's namespace.
+//
+// Stage 5: templates call Helm's functions: sprig's, less env and expandenv,
+// plus toYaml and required.
 
 package main
 
@@ -27,6 +30,7 @@ import (
 	"text/template"
 
 	"github.com/Masterminds/semver/v3"
+	"github.com/Masterminds/sprig/v3"
 	"sigs.k8s.io/yaml"
 )
 
@@ -344,7 +348,7 @@ func typedVal(v string) any {
 // results in path order. All files are parsed into one set so that any of them
 // can call a template another defines.
 func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
-	t := template.New("gotpl").Option("missingkey=zero")
+	t := template.New("gotpl").Option("missingkey=zero").Funcs(funcMap())
 	for _, f := range c.Templates {
 		if _, err := t.New(c.Metadata.Name + "/" + f.Name).Parse(string(f.Data)); err != nil {
 			return nil, err
@@ -375,4 +379,34 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 		}
 	}
 	return out, nil
+}
+
+// funcMap is sprig's text functions with Helm's changes: nothing that reads
+// the environment of whoever renders the chart, and Helm's own additions.
+func funcMap() template.FuncMap {
+	f := sprig.TxtFuncMap()
+	delete(f, "env")
+	delete(f, "expandenv")
+	f["toYaml"] = toYAML
+	f["required"] = required
+	return f
+}
+
+// toYAML drops the trailing newline so that `toYaml x | nindent 4` controls
+// all of the surrounding whitespace itself.
+func toYAML(v any) string {
+	data, err := yaml.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSuffix(string(data), "\n")
+}
+
+// required fails the render when a value is missing or an empty string, and
+// otherwise passes the value through.
+func required(msg string, v any) (any, error) {
+	if s, ok := v.(string); v == nil || ok && s == "" {
+		return v, errors.New(msg)
+	}
+	return v, nil
 }
