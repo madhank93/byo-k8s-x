@@ -30,6 +30,10 @@ defaults turns it into a deletion. Helm calls that step *coalescing*, and it
 keeps the user-supplied layer on its own because the release remembers it
 separately from the defaults.
 
+A `null` with no default under it has nothing to delete, so it stays in the
+result as a null: `--set extra=null` on a chart with no `extra` gives
+`extra: null`.
+
 `--set` is a small language of its own. A dotted key builds nested maps,
 commas separate pairs, and the value is typed:
 

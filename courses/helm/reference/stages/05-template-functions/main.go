@@ -276,12 +276,17 @@ func mergeMaps(dst, src map[string]any) {
 }
 
 // coalesce overlays the user's values onto the chart's defaults, where a null
-// deletes the key instead of setting it.
+// deletes the default instead of setting it, and stays a null where there is
+// no default to delete.
 func coalesce(dst, src map[string]any) map[string]any {
 	for k, v := range src {
 		switch sv := v.(type) {
 		case nil:
-			delete(dst, k)
+			if _, ok := dst[k]; ok {
+				delete(dst, k)
+			} else {
+				dst[k] = nil
+			}
 		case map[string]any:
 			dv, ok := dst[k].(map[string]any)
 			if !ok {

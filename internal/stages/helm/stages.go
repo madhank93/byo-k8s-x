@@ -198,6 +198,7 @@ service:
 		"-f", prod, "-f", last,
 		"--set", "image.pullPolicy=Always,debug=true",
 		"--set", "extra.zip=007",
+		"--set", "extra.gone=null",
 		"--set", "service.type=null",
 		"--set", "count=10",
 		dir)
@@ -210,6 +211,7 @@ service:
 	if err := wantYAML(res.Stdout, `count: 10
 debug: true
 extra:
+  gone: null
   zip: "007"
 image:
   pullPolicy: Always
@@ -222,8 +224,29 @@ service:
 `, `the values, merged in Helm's order:
   values.yaml < -f prod.yaml < -f last.yaml < every --set, in order
 where a map merges key by key, a list is replaced whole, null deletes the
-default, "007" stays a string because of its leading zero, and 10 and true
+default (and stays a null where there is no default, as extra.gone does), "007"
+stays a string because of its leading zero, and 10 and true
 are a number and a boolean`); err != nil {
+		return err
+	}
+
+	// Files merge with each other before any default is deleted, so a later
+	// file can put back under a key that an earlier one nulled.
+	twoPass := w.chart("two-pass", map[string]string{
+		"Chart.yaml":               "apiVersion: v2\nname: two-pass\nversion: 0.1.0\n",
+		"values.yaml":              "labels:\n  team: web\nport: 80\n",
+		"templates/configmap.yaml": configMapTemplate,
+	})
+	res, err = w.run("values", "-f", w.file("nolabels.yaml", "labels: null\n"), "-f", w.file("xlabel.yaml", "labels:\n  x: \"1\"\n"), twoPass)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := wantYAML(res.Stdout, "labels: {team: web, x: \"1\"}\nport: 80\n", `defaults labels: {team: web}, then -f nolabels.yaml (labels: null), then
+-f xlabel.yaml (labels: {x: "1"}): the user's files merge first, the later map
+replacing the null, and only then meet the defaults`); err != nil {
 		return err
 	}
 
