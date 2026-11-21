@@ -625,7 +625,9 @@ func (c *client) plan(objs []*unstructured.Unstructured, opt opts) ([]change, bo
 		switch {
 		case live == nil:
 			ch.action = "create"
-		case len(fieldDiff(live, after)) > 0:
+		// Same content is still a write if apply would change what byok8s
+		// owns: an object another client made, say, is taken over.
+		case len(fieldDiff(live, after)) > 0, applied(live, c.manager) != applied(after, c.manager):
 			ch.action = "update"
 		}
 		if live != nil {
@@ -648,6 +650,17 @@ func (c *client) plan(objs []*unstructured.Unstructured, opt opts) ([]change, bo
 		out = append(out, change{action: "delete", obj: o, uid: string(o.GetUID()), rv: o.GetResourceVersion()})
 	}
 	return out, refused, nil
+}
+
+// applied is the set of fields manager has applied to o, as the server
+// encodes it, or "" if it has applied none.
+func applied(o *unstructured.Unstructured, manager string) string {
+	for _, mf := range o.GetManagedFields() {
+		if mf.Manager == manager && mf.Operation == metav1.ManagedFieldsOperationApply && mf.FieldsV1 != nil {
+			return string(mf.FieldsV1.Raw)
+		}
+	}
+	return ""
 }
 
 // key identifies an object across versions of its kind.

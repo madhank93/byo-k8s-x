@@ -1283,6 +1283,36 @@ func stageImpactReport(ctx context.Context, env *kube.Env, bin string) error {
 		return fmt.Errorf("without --prune nothing is deleted and nothing here changes; expected \"0 to create, 0 to update, 0 to delete, 2 unchanged\", got:\n%s", tail(res.Stdout))
 	}
 
+	// The same content made by another client is not byok8s's yet: applying it
+	// takes ownership, which is a write.
+	if _, err := env.Client.CoreV1().ConfigMaps(env.Namespace).Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "adopted", Labels: map[string]string{setLabel: "adopt"}},
+		Data:       map[string]string{"k": "v"},
+	}, metav1.CreateOptions{FieldManager: "kubectl-create"}); err != nil {
+		return err
+	}
+	adopt := w.file("adopt.yaml", cm("adopted", map[string]string{"k": "v"}))
+	for _, step := range []struct {
+		cmd, action, why string
+		exit             int
+	}{
+		{"plan", "update", "byok8s does not own it yet, so apply would write to take it over", 1},
+		{"apply", "", "", 0},
+		{"plan", "unchanged", "byok8s has applied it, so nothing is left to write", 0},
+	} {
+		res, err = w.run(step.cmd, "--set", "adopt", "-f", adopt)
+		if err != nil {
+			return err
+		}
+		if err := wantExit(res, step.exit); err != nil {
+			return fmt.Errorf("%s of ConfigMap/adopted, which kubectl-create made with the same content: %w", step.cmd, err)
+		}
+		if step.action != "" && !hasLine(res.Stdout, "ConfigMap/adopted "+step.action) {
+			return fmt.Errorf("ConfigMap/adopted has the manifest's content, but %s; expected \"ConfigMap/adopted %s\", got:\n%s",
+				step.why, step.action, tail(res.Stdout))
+		}
+	}
+
 	if err := w.applyAs("other-tool", cm("same-a", map[string]string{"k": "theirs"})); err != nil {
 		return err
 	}
