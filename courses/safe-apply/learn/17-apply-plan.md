@@ -50,6 +50,10 @@ in between. The write carries its own pin as well:
   an `Update`, not an `Apply`, and the course's ownership model would no
   longer hold.
 
+These pins are tested by a change that lands after your first write, once
+every up-front check has passed. Only the pin on each later write can catch
+it.
+
 `unchanged` objects are checked but not written. Applying the plan means
 making the changes it lists, and a no-op apply would not change anything
 anyway.

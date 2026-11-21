@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	admission "k8s.io/api/admission/v1"
+	admregv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -150,4 +152,97 @@ func unlistableAPI(ctx context.Context, env *kube.Env) (string, func(), error) {
 		return "", nil, err
 	}
 	return group, stop, nil
+}
+
+// intercept registers a validating webhook on the stage namespace's ConfigMaps
+// that, during the first real (not dry-run) op on ConfigMap name, runs act
+// and then admits the request: a change that lands while the learner is
+// mid-write, after any check it made up front. fired reports act's outcome,
+// or that it never ran. failurePolicy Ignore keeps a dead server harmless.
+func intercept(ctx context.Context, env *kube.Env, op admission.Operation, name string, act func() error) (fired func() error, stop func(), err error) {
+	probe := "webhook-probe-" + unique()
+	var (
+		mu     sync.Mutex
+		ran    bool
+		actErr error
+		probed bool
+	)
+	port, ca, stopServer, err := serveTLS(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		var review admission.AdmissionReview
+		if err := json.NewDecoder(r.Body).Decode(&review); err != nil || review.Request == nil {
+			http.Error(rw, "not an AdmissionReview", http.StatusBadRequest)
+			return
+		}
+		req := review.Request
+		mu.Lock()
+		first := req.Name == name && req.Operation == op && (req.DryRun == nil || !*req.DryRun) && !ran
+		ran = ran || first
+		probed = probed || req.Name == probe
+		mu.Unlock()
+		// act writes to this namespace too, so it runs unlocked: its own
+		// admission comes back through this handler.
+		if first {
+			err := act()
+			mu.Lock()
+			actErr = err
+			mu.Unlock()
+		}
+		review.Response = &admission.AdmissionResponse{UID: req.UID, Allowed: true}
+		review.Request = nil
+		json.NewEncoder(rw).Encode(review)
+	}))
+	if err != nil {
+		return nil, nil, err
+	}
+	cfgName := "safe-apply-" + unique()
+	url := fmt.Sprintf("https://%s/", net.JoinHostPort(stages.ExternalHost(), strconv.Itoa(port)))
+	ignore := admregv1.Ignore
+	sideEffects := admregv1.SideEffectClassNoneOnDryRun
+	timeout := int32(10)
+	adm := env.Client.AdmissionregistrationV1().ValidatingWebhookConfigurations()
+	_, err = adm.Create(ctx, &admregv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: cfgName},
+		Webhooks: []admregv1.ValidatingWebhook{{
+			Name:                    "intercept.safe-apply.byok8s.dev",
+			ClientConfig:            admregv1.WebhookClientConfig{URL: &url, CABundle: ca},
+			Rules:                   []admregv1.RuleWithOperations{{Operations: []admregv1.OperationType{admregv1.Create, admregv1.Update, admregv1.Delete}, Rule: admregv1.Rule{APIGroups: []string{""}, APIVersions: []string{"v1"}, Resources: []string{"configmaps"}}}},
+			NamespaceSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": env.Namespace}},
+			FailurePolicy:           &ignore,
+			SideEffects:             &sideEffects,
+			TimeoutSeconds:          &timeout,
+			AdmissionReviewVersions: []string{"v1"},
+		}},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		stopServer()
+		return nil, nil, err
+	}
+	stop = func() {
+		adm.Delete(context.WithoutCancel(ctx), cfgName, metav1.DeleteOptions{})
+		stopServer()
+	}
+	// The API server picks a new webhook up asynchronously; a dry-run create
+	// shows when it is calling this one.
+	waitCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	err = kube.WaitFor(waitCtx, "the API server to call the grader's webhook", func(ctx context.Context) (bool, error) {
+		env.Client.CoreV1().ConfigMaps(env.Namespace).Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: probe}},
+			metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+		mu.Lock()
+		defer mu.Unlock()
+		return probed, nil
+	})
+	if err != nil {
+		stop()
+		return nil, nil, err
+	}
+	fired = func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if !ran {
+			return fmt.Errorf("the program never wrote ConfigMap/%s (%s), so the change meant to land mid-apply never did", name, op)
+		}
+		return actErr
+	}
+	return fired, stop, nil
 }
