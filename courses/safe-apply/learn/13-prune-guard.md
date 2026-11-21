@@ -34,6 +34,9 @@ ConfigMap/gone pruned
 ConfigMap/precious kept: prune disabled
 ```
 
+A kind that stage 12 could not list is not pruned at all. You never saw its
+leftovers, so there is nothing to delete.
+
 The opt-out annotation is the same idea as Argo CD's `Prune=false` and
 Flux's `prune: disabled`. `prune` (the plan) prints the kept line too, so the
 plan and the apply agree.

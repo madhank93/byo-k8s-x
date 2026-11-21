@@ -333,7 +333,8 @@ const setLabel = "byok8s.dev/set"
 // that the manifest no longer names, sorted by Kind/name.
 //
 // A removed object's kind need not appear in the manifest any more, so every
-// listable namespaced kind is searched.
+// listable namespaced kind is searched. A kind whose API is down is skipped
+// with a warning: its leftovers go unseen, so they are kept, never deleted.
 // ponytail: one list call per kind per namespace; kubectl's ApplySet records
 // the set's kinds on a parent object instead, worth it once the API is large.
 func (c *client) leftovers(objs []*unstructured.Unstructured, set string) ([]*unstructured.Unstructured, error) {
@@ -346,7 +347,13 @@ func (c *client) leftovers(objs []*unstructured.Unstructured, set string) ([]*un
 		}
 	}
 	lists, err := c.disc.ServerPreferredNamespacedResources()
-	if err != nil && !discovery.IsGroupDiscoveryFailedError(err) {
+	var partial *discovery.ErrGroupDiscoveryFailed
+	switch {
+	case errors.As(err, &partial):
+		for gv, e := range partial.Groups {
+			fmt.Fprintf(os.Stderr, "warning: cannot look for leftovers in %s: %v\n", gv, e)
+		}
+	case err != nil:
 		return nil, err
 	}
 	lists = discovery.FilteredBy(discovery.SupportsAllVerbs{Verbs: []string{"list", "delete"}}, lists)
@@ -361,6 +368,10 @@ func (c *client) leftovers(objs []*unstructured.Unstructured, set string) ([]*un
 			for ns := range nss {
 				items, err := c.dyn.Resource(gv.WithResource(r.Name)).Namespace(ns).List(c.ctx,
 					metav1.ListOptions{LabelSelector: setLabel + "=" + set})
+				if apierrors.IsServiceUnavailable(err) || apierrors.IsNotFound(err) || apierrors.IsMethodNotSupported(err) {
+					fmt.Fprintf(os.Stderr, "warning: cannot look for leftovers among %s: %v\n", gv.WithResource(r.Name).GroupResource(), err)
+					break
+				}
 				if err != nil {
 					return nil, fmt.Errorf("list %s: %w", r.Name, err)
 				}

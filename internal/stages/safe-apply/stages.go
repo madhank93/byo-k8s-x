@@ -948,6 +948,27 @@ func stagePrunePlan(ctx context.Context, env *kube.Env, bin string) error {
 	if res.ExitCode == 0 {
 		return fmt.Errorf("prune without --set cannot know what is its own and must fail, got exit 0:\n%s", tail(res.Stdout))
 	}
+
+	// One kind the server cannot list hides only that kind's leftovers.
+	group, stop, err := unlistableAPI(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer stop()
+	res, err = w.run("prune", "--set", "web", "-f", v2)
+	stop()
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("widgets.%s is in discovery but answers every list with 503; prune still lists every other kind: %w", group, err)
+	}
+	if g := lines(res.Stdout); strings.Join(g, "\n") != strings.Join(want, "\n") {
+		return fmt.Errorf("with widgets.%s unlistable, the other kinds' leftovers are still these:\n  %s\ngot:\n%s", group, strings.Join(want, "\n  "), tail(res.Stdout))
+	}
+	if !strings.Contains(res.Stderr, group) {
+		return fmt.Errorf("widgets.%s could not be listed, so its leftovers are unknown; say so on stderr, naming the group. stderr:\n%s", group, tail(res.Stderr))
+	}
 	return nil
 }
 

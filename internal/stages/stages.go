@@ -8,6 +8,7 @@ package stages
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
@@ -26,3 +27,13 @@ type Stage struct {
 
 // Lookup resolves a stage slug within one course.
 type Lookup func(slug string) (Stage, bool)
+
+// ExternalHost is the name a kind cluster's API server reaches this machine
+// by. Docker Desktop and OrbStack publish host.docker.internal; a Linux
+// runner's Docker does not, so CI passes the kind network's gateway instead.
+func ExternalHost() string {
+	if h := os.Getenv("BYOK8S_EXTERNAL_HOST"); h != "" {
+		return h
+	}
+	return "host.docker.internal"
+}
