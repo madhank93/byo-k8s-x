@@ -5,6 +5,10 @@
 //
 // Stage 2: `values [-f FILE]... [--set k=v]... DIR` prints the chart's values
 // merged with the user's, as YAML.
+//
+// Stage 3: `template [-f FILE]... [--set k=v]... NAME DIR` renders every
+// template with the merged values and prints the manifests as helm template
+// does.
 
 package main
 
@@ -17,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/Masterminds/semver/v3"
 	"sigs.k8s.io/yaml"
@@ -80,6 +85,26 @@ func run(cmd string, args []string) error {
 			return err
 		}
 		fmt.Print(string(out))
+		return nil
+	case "template":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: template [-f FILE]... [--set k=v]... NAME DIR")
+		}
+		c, err := load(args[1])
+		if err != nil {
+			return err
+		}
+		user, err := userValues(files, sets)
+		if err != nil {
+			return err
+		}
+		docs, err := render(c, coalesce(copyMap(c.Values), user))
+		if err != nil {
+			return err
+		}
+		for _, d := range docs {
+			fmt.Printf("---\n# Source: %s\n%s\n", d.Name, d.Data)
+		}
 		return nil
 	}
 	return fmt.Errorf("unknown command %q", cmd)
@@ -285,4 +310,35 @@ func typedVal(v string) any {
 		}
 	}
 	return v
+}
+
+// render executes every template of the chart and returns the non-empty
+// results in path order. All files are parsed into one set so that any of them
+// can call a template another defines.
+func render(c *Chart, vals map[string]any) ([]File, error) {
+	t := template.New("gotpl").Option("missingkey=zero")
+	for _, f := range c.Templates {
+		if _, err := t.New(c.Metadata.Name + "/" + f.Name).Parse(string(f.Data)); err != nil {
+			return nil, err
+		}
+	}
+	data := map[string]any{"Values": vals}
+	var out []File
+	for _, f := range c.Templates {
+		base := filepath.Base(f.Name)
+		if strings.HasPrefix(base, "_") || base == "NOTES.txt" {
+			continue
+		}
+		name := c.Metadata.Name + "/" + f.Name
+		var b strings.Builder
+		if err := t.ExecuteTemplate(&b, name, data); err != nil {
+			return nil, err
+		}
+		// missingkey=zero prints a missing map key as "<no value>"; Helm blanks it.
+		text := strings.TrimSpace(strings.ReplaceAll(b.String(), "<no value>", ""))
+		if text != "" {
+			out = append(out, File{Name: name, Data: []byte(text)})
+		}
+	}
+	return out, nil
 }

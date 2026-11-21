@@ -38,6 +38,7 @@ func Lookup(slug string) (Stage, bool) {
 func init() {
 	register(Stage{Slug: "chart-load", Run: stageChartLoad})
 	register(Stage{Slug: "values-merge", Run: stageValuesMerge})
+	register(Stage{Slug: "template-engine", Run: stageTemplateEngine})
 }
 
 const chartYAML = `apiVersion: v2
@@ -238,6 +239,133 @@ are a number and a boolean`); err != nil {
 	return nil
 }
 
+// renderChart is a chart whose templates exercise text/template alone: values,
+// a condition, a range, a missing value, a nested file, a partial and notes.
+func renderChart(w *work) string {
+	return w.chart("demo", map[string]string{
+		"Chart.yaml":  chartYAML,
+		"values.yaml": "greeting: hello\nenabled: false\nitems: [a, b]\n",
+		"templates/a-greeting.yaml": `
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: greeting
+data:
+  greeting: {{ .Values.greeting }}
+  missing: "{{ .Values.nothing }}"
+
+`,
+		"templates/b-optional.yaml": `{{- if .Values.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: optional
+{{- end }}
+`,
+		"templates/c-list.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: items
+data:
+{{- range $i, $v := .Values.items }}
+  item{{ $i }}: {{ $v }}
+{{- end }}
+`,
+		"templates/sub/d.yaml":   configMapTemplate,
+		"templates/_helpers.tpl": "{{/* a partial: never output, even text outside a define */}}\nnot a manifest\n",
+		"templates/NOTES.txt":    "Thanks {{ .Values.greeting }}\n",
+	})
+}
+
+// stageTemplateEngine — every template is rendered with the merged values and
+// printed the way helm template prints it: one "# Source:" document per file,
+// trimmed, in path order, with partials, notes and empty output left out.
+func stageTemplateEngine(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	dir := renderChart(w)
+
+	greeting := func(g string) string {
+		return `---
+# Source: demo/templates/a-greeting.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: greeting
+data:
+  greeting: ` + g + `
+  missing: ""
+`
+	}
+	const optional = `---
+# Source: demo/templates/b-optional.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: optional
+`
+	const rest = `---
+# Source: demo/templates/c-list.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: items
+data:
+  item0: a
+  item1: b
+---
+# Source: demo/templates/sub/d.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo
+`
+	res, err := w.run("template", "demo", dir)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := wantExact(res.Stdout, greeting("hello")+rest, "the chart's defaults"); err != nil {
+		return err
+	}
+
+	res, err = w.run("template", "--set", "greeting=hi,enabled=true", "demo", dir)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := wantExact(res.Stdout, greeting("hi")+optional+rest, "--set greeting=hi,enabled=true"); err != nil {
+		return err
+	}
+
+	for _, bad := range []struct{ file, body, why string }{
+		{"templates/unclosed.yaml", "{{ .Values.greeting \n", "it does not parse"},
+		{"templates/deeper.yaml", "{{ .Values.greeting.deep }}\n", "it reads a field of a string"},
+	} {
+		dir := w.chart("bad-"+filepath.Base(bad.file), map[string]string{
+			"Chart.yaml": chartYAML, "values.yaml": "greeting: hello\n", bad.file: bad.body,
+		})
+		res, err := w.run("template", "demo", dir)
+		if err != nil {
+			return err
+		}
+		if res.ExitCode == 0 {
+			return fmt.Errorf("%s cannot render because %s, but the program exited 0 with:\n%s", bad.file, bad.why, tail(res.Stdout))
+		}
+		if !strings.Contains(res.Stderr, bad.file) {
+			return fmt.Errorf("%s cannot render because %s; the error should name the file, but stderr was:\n%s", bad.file, bad.why, tail(res.Stderr))
+		}
+	}
+	return nil
+}
+
 // work is one stage's scratch space: a directory for charts and values files,
 // and the environment that points the program at the stage's namespace.
 type work struct {
@@ -304,6 +432,15 @@ func wantLines(stdout string, want []string) error {
 	if got := lines(stdout); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		return fmt.Errorf("expected exactly these lines, in this order:\n  %s\ngot:\n%s",
 			strings.Join(want, "\n  "), tail(stdout))
+	}
+	return nil
+}
+
+// wantExact compares output byte for byte, showing both in full on a mismatch
+// because the difference is often whitespace.
+func wantExact(got, want, what string) error {
+	if got != want {
+		return fmt.Errorf("for %s, expected exactly (between the lines):\n-----\n%s-----\ngot:\n-----\n%s-----", what, want, got)
 	}
 	return nil
 }
