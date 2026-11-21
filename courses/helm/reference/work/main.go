@@ -36,6 +36,9 @@
 //
 // Stage 12: install records the release as a Secret per revision, in Helm's
 // own format, and refuses a name that already has one.
+//
+// Stage 13: `list [-a] [-A] [-q]` and `status NAME` read the records back and
+// print them as helm does.
 
 package main
 
@@ -103,6 +106,13 @@ func run(cmd string, args []string) error {
 	var show multi
 	fs.Var(&show, "s", "only show manifests from this template (repeatable)")
 	fs.Var(&show, "show-only", "only show manifests from this template (repeatable)")
+	var all, allNamespaces, short bool
+	fs.BoolVar(&all, "a", false, "list releases in every state")
+	fs.BoolVar(&all, "all", false, "list releases in every state")
+	fs.BoolVar(&allNamespaces, "A", false, "list releases in every namespace")
+	fs.BoolVar(&allNamespaces, "all-namespaces", false, "list releases in every namespace")
+	fs.BoolVar(&short, "q", false, "print release names only")
+	fs.BoolVar(&short, "short", false, "print release names only")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -171,6 +181,31 @@ func run(cmd string, args []string) error {
 		if err := install(args[0], args[1], namespace, files, sets); err != nil {
 			return fmt.Errorf("INSTALLATION FAILED: %w", err)
 		}
+		return nil
+	case "list":
+		if len(args) != 0 {
+			return fmt.Errorf(`"helm list" accepts no arguments`)
+		}
+		if allNamespaces {
+			namespace = ""
+		}
+		return list(namespace, all, short)
+	case "status":
+		if len(args) != 1 {
+			return fmt.Errorf(`"helm status" requires 1 argument`)
+		}
+		k, err := connect()
+		if err != nil {
+			return err
+		}
+		h, err := k.history(namespace, args[0])
+		if err != nil {
+			return err
+		}
+		if len(h) == 0 {
+			return errNotFound
+		}
+		printRelease(h[len(h)-1])
 		return nil
 	}
 	return fmt.Errorf("unknown command %q", cmd)
@@ -1300,4 +1335,70 @@ func (k *kube) get(o object) (*unstructured.Unstructured, error) {
 		return nil, nil
 	}
 	return live, err
+}
+
+var errNotFound = errors.New("release: not found")
+
+// list prints the latest revision of every release in ns (every namespace
+// when ns is ""), sorted by name. Without all, only deployed and failed
+// releases are shown.
+func list(ns string, all, short bool) error {
+	k, err := connect()
+	if err != nil {
+		return err
+	}
+	recs, err := k.records(ns, "owner=helm")
+	if err != nil {
+		return err
+	}
+	latest := map[string]*Record{}
+	var keys []string
+	for _, r := range recs {
+		key := r.Namespace + "/" + r.Name
+		if cur, ok := latest[key]; !ok {
+			keys = append(keys, key)
+		} else if cur.Version > r.Version {
+			continue
+		}
+		latest[key] = r
+	}
+	var shown []*Record
+	for _, key := range keys {
+		r := latest[key]
+		if all || r.Info.Status == "deployed" || r.Info.Status == "failed" {
+			shown = append(shown, r)
+		}
+	}
+	sort.SliceStable(shown, func(i, j int) bool { return shown[i].Name < shown[j].Name })
+	if short {
+		for _, r := range shown {
+			fmt.Println(r.Name)
+		}
+		return nil
+	}
+	rows := [][]string{{"NAME", "NAMESPACE", "REVISION", "UPDATED", "STATUS", "CHART", "APP VERSION"}}
+	for _, r := range shown {
+		rows = append(rows, []string{r.Name, r.Namespace, strconv.Itoa(r.Version), r.Info.LastDeployed.String(),
+			r.Info.Status, r.Chart.Metadata.Name + "-" + r.Chart.Metadata.Version, r.Chart.Metadata.AppVersion})
+	}
+	printTable(rows)
+	return nil
+}
+
+// printTable lays rows out as Helm's tables do: every cell padded to its
+// column's width, the last column too, and cells joined by a tab.
+func printTable(rows [][]string) {
+	widths := make([]int, len(rows[0]))
+	for _, row := range rows {
+		for i, cell := range row {
+			widths[i] = max(widths[i], len(cell))
+		}
+	}
+	for _, row := range rows {
+		cells := make([]string, len(row))
+		for i, cell := range row {
+			cells[i] = fmt.Sprintf("%-*s", widths[i], cell)
+		}
+		fmt.Println(strings.Join(cells, "\t"))
+	}
 }

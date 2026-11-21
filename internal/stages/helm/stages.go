@@ -60,6 +60,7 @@ func init() {
 	register(Stage{Slug: "manifest-split", Run: stageManifestSplit})
 	register(Stage{Slug: "install", Run: stageInstall})
 	register(Stage{Slug: "release-storage", Run: stageReleaseStorage})
+	register(Stage{Slug: "list-status", Run: stageListStatus})
 }
 
 const chartYAML = `apiVersion: v2
@@ -2288,4 +2289,155 @@ func needHelm(w *work) error {
 func (w *work) helm(args ...string) (*runner.Result, error) {
 	env := append([]string{"HELM_NAMESPACE=" + w.env.Namespace}, w.kc...)
 	return runner.InvokeEnv(w.ctx, "helm", env, stages.Timeout, append([]string{"--kube-context", cluster.Context}, args...)...)
+}
+
+// stageListStatus — list and status print exactly what the real helm prints
+// for the same releases, some installed by the program and some by helm, in
+// two namespaces and in every state the filters tell apart.
+func stageListStatus(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := needHelm(w); err != nil {
+		return err
+	}
+	ns := env.Namespace
+	ns2, err := extraNamespace(ctx, env, "other")
+	if err != nil {
+		return err
+	}
+	defer env.Client.CoreV1().Namespaces().Delete(context.WithoutCancel(ctx), ns2, metav1.DeleteOptions{})
+
+	web := w.chart("web", webChart("hello"))
+	broken := w.chart("broken", map[string]string{
+		"Chart.yaml":         "apiVersion: v2\nname: broken\nversion: 0.2.0\n",
+		"templates/bad.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: broken-bad\ndata:\n  \"no spaces\": x\n",
+	})
+	// "web" and "web-a" sort one way by name and the other by Secret name.
+	for _, step := range []struct {
+		helm bool
+		args []string
+		exit int
+	}{
+		{false, []string{"install", "--set", "msg=a", "web-a", web}, 0},
+		{false, []string{"install", "web", web}, 0},
+		{false, []string{"install", "broken", broken}, 1},
+		{false, []string{"install", "-n", ns2, "web-c", web}, 0},
+		{true, []string{"install", "helmed", web}, 0},
+		{true, []string{"upgrade", "--set", "msg=two", "helmed", web}, 0},
+		{true, []string{"install", "dropped", web}, 0},
+		{true, []string{"uninstall", "--keep-history", "dropped"}, 0},
+		{true, []string{"install", "-n", ns2, "elsewhere", web}, 0},
+	} {
+		run, who := w.run, "app"
+		if step.helm {
+			run, who = w.helm, "the grader's helm"
+		}
+		res, err := run(step.args...)
+		if err != nil {
+			return err
+		}
+		if err := wantExit(res, step.exit); err != nil {
+			return fmt.Errorf("%s %s: %w", who, strings.Join(step.args, " "), err)
+		}
+	}
+
+	for _, args := range [][]string{
+		{"list"},
+		{"list", "-a"},
+		{"list", "--all"},
+		{"list", "-q"},
+		{"list", "--short", "-a"},
+		{"list", "-n", ns2},
+		{"list", "--namespace", ns2, "-q"},
+		{"status", "web-a"},
+		{"status", "broken"},
+		{"status", "helmed"},
+		{"status", "dropped"},
+		{"status", "-n", ns2, "elsewhere"},
+	} {
+		if err := sameAsHelm(w, args, nil); err != nil {
+			return err
+		}
+	}
+	// Every namespace holds other releases too, some coming and going, so
+	// only the rows from this stage's namespaces are compared.
+	ours := func(row string) bool {
+		f := strings.Split(row, "\t")
+		return len(f) > 1 && (strings.TrimSpace(f[1]) == ns || strings.TrimSpace(f[1]) == ns2 || strings.TrimSpace(f[0]) == "NAME")
+	}
+	for _, args := range [][]string{{"list", "-A"}, {"list", "--all-namespaces", "-a"}} {
+		if err := sameAsHelm(w, args, ours); err != nil {
+			return err
+		}
+	}
+	names := map[string]bool{"web-a": true, "web": true, "broken": true, "helmed": true, "dropped": true, "web-c": true, "elsewhere": true}
+	if err := sameAsHelm(w, []string{"list", "-A", "-q"}, func(l string) bool { return names[l] }); err != nil {
+		return err
+	}
+
+	res, err := w.run("status", "nope")
+	if err != nil {
+		return err
+	}
+	return wantRefusal(res, "release: not found", "status nope, a release that does not exist")
+}
+
+// sameAsHelm runs the same command through the program and the real helm and
+// wants the same exit code and stdout. With keep, only the lines it keeps are
+// compared, each with the padding around its cells trimmed, since the widths
+// of a table depend on rows that were dropped.
+func sameAsHelm(w *work, args []string, keep func(string) bool) error {
+	want, err := w.helm(args...)
+	if err != nil {
+		return err
+	}
+	got, err := w.run(args...)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(got, want.ExitCode); err != nil {
+		return fmt.Errorf("%s, which exits %d for the real helm: %w", strings.Join(args, " "), want.ExitCode, err)
+	}
+	what := strings.Join(args, " ") + ", as the real helm prints it for the same releases"
+	if keep == nil {
+		return wantExact(got.Stdout, want.Stdout, what)
+	}
+	filter := func(s string) string {
+		var out []string
+		for _, l := range strings.Split(strings.TrimRight(s, "\n"), "\n") {
+			if keep(l) {
+				cells := strings.Split(l, "\t")
+				for i := range cells {
+					cells[i] = strings.TrimSpace(cells[i])
+				}
+				out = append(out, strings.Join(cells, "\t"))
+			}
+		}
+		return strings.Join(out, "\n") + "\n"
+	}
+	return wantExact(filter(got.Stdout), filter(want.Stdout), what+" (only this stage's releases, padding trimmed)")
+}
+
+// extraNamespace creates a second namespace for the stage, named after its
+// own, starting from scratch if an earlier run left one behind.
+func extraNamespace(ctx context.Context, env *kube.Env, suffix string) (string, error) {
+	name := env.Namespace + "-" + suffix
+	nss := env.Client.CoreV1().Namespaces()
+	if err := nss.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return "", fmt.Errorf("delete namespace %s: %w", name, err)
+	}
+	if err := kube.WaitFor(ctx, "the previous "+name+" namespace to go away", func(ctx context.Context) (bool, error) {
+		_, err := nss.Get(ctx, name, metav1.GetOptions{})
+		return apierrors.IsNotFound(err), nil
+	}); err != nil {
+		return "", err
+	}
+	_, err := nss.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{kube.StageLabel: strings.TrimPrefix(name, "bko-")}}}, metav1.CreateOptions{})
+	if err != nil {
+		return "", fmt.Errorf("create namespace %s: %w", name, err)
+	}
+	return name, nil
 }
