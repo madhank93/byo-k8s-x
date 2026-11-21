@@ -39,6 +39,7 @@ func init() {
 	register(Stage{Slug: "chart-load", Run: stageChartLoad})
 	register(Stage{Slug: "values-merge", Run: stageValuesMerge})
 	register(Stage{Slug: "template-engine", Run: stageTemplateEngine})
+	register(Stage{Slug: "builtin-objects", Run: stageBuiltinObjects})
 }
 
 const chartYAML = `apiVersion: v2
@@ -361,6 +362,101 @@ metadata:
 		}
 		if !strings.Contains(res.Stderr, bad.file) {
 			return fmt.Errorf("%s cannot render because %s; the error should name the file, but stderr was:\n%s", bad.file, bad.why, tail(res.Stderr))
+		}
+	}
+	return nil
+}
+
+// stageBuiltinObjects — templates see .Release, .Chart, .Template and .Files
+// with the values helm template gives them, .Template differing per file.
+func stageBuiltinObjects(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	const body = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-{{ .Chart.Name }}
+  namespace: {{ .Release.Namespace }}
+data:
+  revision: "{{ .Release.Revision }}"
+  isInstall: "{{ .Release.IsInstall }}"
+  isUpgrade: "{{ .Release.IsUpgrade }}"
+  service: {{ .Release.Service }}
+  chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+  appVersion: "{{ .Chart.AppVersion }}"
+  description: "{{ .Chart.Description }}"
+  template: {{ .Template.Name }}
+  basePath: {{ .Template.BasePath }}
+  conf: "{{ .Files.Get "files/app.conf" }}"
+  missing: "{{ .Files.Get "files/nope" }}"
+  chartYaml: "{{ .Files.Get "Chart.yaml" }}"
+  valuesYaml: "{{ .Files.Get "values.yaml" }}"
+  replicas: "{{ .Values.replicas }}"
+`
+	dir := w.chart("demo", map[string]string{
+		"Chart.yaml":              chartYAML,
+		"values.yaml":             "replicas: 2\n",
+		"files/app.conf":          "key = value",
+		"templates/builtins.yaml": body,
+		"templates/sub/where.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: where
+data:
+  template: {{ .Template.Name }}
+`,
+	})
+
+	want := func(release, ns string) string {
+		return `---
+# Source: demo/templates/builtins.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ` + release + `-demo
+  namespace: ` + ns + `
+data:
+  revision: "1"
+  isInstall: "true"
+  isUpgrade: "false"
+  service: Helm
+  chart: demo-1.2.3
+  appVersion: "4.5"
+  description: "a chart the grader wrote"
+  template: demo/templates/builtins.yaml
+  basePath: demo/templates
+  conf: "key = value"
+  missing: ""
+  chartYaml: ""
+  valuesYaml: ""
+  replicas: "2"
+---
+# Source: demo/templates/sub/where.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: where
+data:
+  template: demo/templates/sub/where.yaml
+`
+	}
+	for _, c := range []struct{ flag, release, ns string }{
+		{"-n", "web", "team-a"},
+		{"--namespace", "api", "team-b"},
+	} {
+		res, err := w.run("template", c.flag, c.ns, c.release, dir)
+		if err != nil {
+			return err
+		}
+		if err := wantExit(res, 0); err != nil {
+			return err
+		}
+		if err := wantExact(res.Stdout, want(c.release, c.ns), fmt.Sprintf("release %s in namespace %s (%s)", c.release, c.ns, c.flag)); err != nil {
+			return err
 		}
 	}
 	return nil

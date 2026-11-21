@@ -9,6 +9,9 @@
 // Stage 3: `template [-f FILE]... [--set k=v]... NAME DIR` renders every
 // template with the merged values and prints the manifests as helm template
 // does.
+//
+// Stage 4: templates see .Release, .Chart, .Template and .Files; `-n` and
+// `--namespace` name the release's namespace.
 
 package main
 
@@ -47,6 +50,9 @@ func (m *multi) Set(v string) error { *m = append(*m, v); return nil }
 func run(cmd string, args []string) error {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	var files, sets multi
+	var namespace string
+	fs.StringVar(&namespace, "n", "default", "release namespace")
+	fs.StringVar(&namespace, "namespace", "default", "release namespace")
 	fs.Var(&files, "f", "values file (repeatable)")
 	fs.Var(&sets, "set", "key=value (repeatable)")
 	if err := fs.Parse(args); err != nil {
@@ -98,7 +104,8 @@ func run(cmd string, args []string) error {
 		if err != nil {
 			return err
 		}
-		docs, err := render(c, coalesce(copyMap(c.Values), user))
+		rel := Release{Name: args[0], Namespace: namespace, Revision: 1, IsInstall: true, Service: "Helm"}
+		docs, err := render(c, coalesce(copyMap(c.Values), user), rel)
 		if err != nil {
 			return err
 		}
@@ -131,6 +138,23 @@ type Chart struct {
 	Metadata  Metadata
 	Values    map[string]any
 	Templates []File
+	Files     Files
+}
+
+// Files is every chart file that is not a template, Chart.yaml or values.yaml.
+type Files map[string][]byte
+
+// Get is .Files.Get in a template: the file's contents, or "" if it is absent.
+func (f Files) Get(name string) string { return string(f[name]) }
+
+// Release is .Release in a template.
+type Release struct {
+	Name      string
+	Namespace string
+	Revision  int
+	IsInstall bool
+	IsUpgrade bool
+	Service   string
 }
 
 func load(dir string) (*Chart, error) {
@@ -138,7 +162,7 @@ func load(dir string) (*Chart, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s is not a chart: %w", dir, err)
 	}
-	c := &Chart{}
+	c := &Chart{Files: Files{}}
 	if err := yaml.Unmarshal(raw, &c.Metadata); err != nil {
 		return nil, fmt.Errorf("cannot load Chart.yaml: %w", err)
 	}
@@ -167,14 +191,18 @@ func load(dir string) (*Chart, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if !strings.HasPrefix(rel, "templates/") {
+		if rel == "Chart.yaml" || rel == "values.yaml" {
 			return nil
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		c.Templates = append(c.Templates, File{Name: rel, Data: data})
+		if strings.HasPrefix(rel, "templates/") {
+			c.Templates = append(c.Templates, File{Name: rel, Data: data})
+		} else {
+			c.Files[rel] = data
+		}
 		return nil
 	})
 	return c, err
@@ -315,14 +343,13 @@ func typedVal(v string) any {
 // render executes every template of the chart and returns the non-empty
 // results in path order. All files are parsed into one set so that any of them
 // can call a template another defines.
-func render(c *Chart, vals map[string]any) ([]File, error) {
+func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 	t := template.New("gotpl").Option("missingkey=zero")
 	for _, f := range c.Templates {
 		if _, err := t.New(c.Metadata.Name + "/" + f.Name).Parse(string(f.Data)); err != nil {
 			return nil, err
 		}
 	}
-	data := map[string]any{"Values": vals}
 	var out []File
 	for _, f := range c.Templates {
 		base := filepath.Base(f.Name)
@@ -330,6 +357,13 @@ func render(c *Chart, vals map[string]any) ([]File, error) {
 			continue
 		}
 		name := c.Metadata.Name + "/" + f.Name
+		data := map[string]any{
+			"Values":   vals,
+			"Release":  rel,
+			"Chart":    c.Metadata,
+			"Files":    c.Files,
+			"Template": map[string]string{"Name": name, "BasePath": c.Metadata.Name + "/templates"},
+		}
 		var b strings.Builder
 		if err := t.ExecuteTemplate(&b, name, data); err != nil {
 			return nil, err
