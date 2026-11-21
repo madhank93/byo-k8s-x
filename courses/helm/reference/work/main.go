@@ -2,14 +2,20 @@
 //
 // Stage 1: `chart DIR` loads a chart directory, validates Chart.yaml, and
 // prints the chart's name and version followed by its template files.
+//
+// Stage 2: `values [-f FILE]... [--set k=v]... DIR` prints the chart's values
+// merged with the user's, as YAML.
 
 package main
 
 import (
+	"errors"
+	"flag"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Masterminds/semver/v3"
@@ -27,7 +33,22 @@ func main() {
 	}
 }
 
+// multi is a flag that may be repeated, keeping every value in order.
+type multi []string
+
+func (m *multi) String() string     { return strings.Join(*m, ",") }
+func (m *multi) Set(v string) error { *m = append(*m, v); return nil }
+
 func run(cmd string, args []string) error {
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	var files, sets multi
+	fs.Var(&files, "f", "values file (repeatable)")
+	fs.Var(&sets, "set", "key=value (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	args = fs.Args()
+
 	switch cmd {
 	case "chart":
 		if len(args) != 1 {
@@ -41,6 +62,24 @@ func run(cmd string, args []string) error {
 		for _, t := range c.Templates {
 			fmt.Println(t.Name)
 		}
+		return nil
+	case "values":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: values [-f FILE]... [--set k=v]... DIR")
+		}
+		c, err := load(args[0])
+		if err != nil {
+			return err
+		}
+		user, err := userValues(files, sets)
+		if err != nil {
+			return err
+		}
+		out, err := yaml.Marshal(coalesce(copyMap(c.Values), user))
+		if err != nil {
+			return err
+		}
+		fmt.Print(string(out))
 		return nil
 	}
 	return fmt.Errorf("unknown command %q", cmd)
@@ -65,6 +104,7 @@ type File struct {
 
 type Chart struct {
 	Metadata  Metadata
+	Values    map[string]any
 	Templates []File
 }
 
@@ -82,6 +122,14 @@ func load(dir string) (*Chart, error) {
 		c.Metadata.APIVersion = "v1"
 	}
 	if err := validate(c.Metadata); err != nil {
+		return nil, err
+	}
+	c.Values = map[string]any{}
+	if raw, err := os.ReadFile(filepath.Join(dir, "values.yaml")); err == nil {
+		if err := yaml.Unmarshal(raw, &c.Values); err != nil {
+			return nil, fmt.Errorf("cannot load values.yaml: %w", err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	// WalkDir visits in lexical order, so the templates come out sorted.
@@ -124,4 +172,117 @@ func validate(m Metadata) error {
 		return fmt.Errorf("validation: chart.metadata.type must be application or library")
 	}
 	return nil
+}
+
+// userValues merges -f files in order, then --set flags in order. A null is
+// kept here, not applied: it means "delete the chart's default", which only
+// coalesce can do.
+func userValues(files, sets []string) (map[string]any, error) {
+	user := map[string]any{}
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		var m map[string]any
+		if err := yaml.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("%s: %w", f, err)
+		}
+		mergeMaps(user, m)
+	}
+	for _, s := range sets {
+		if err := parseSet(user, s); err != nil {
+			return nil, fmt.Errorf("failed parsing --set data: %w", err)
+		}
+	}
+	return user, nil
+}
+
+// mergeMaps overlays src onto dst: maps merge key by key, anything else,
+// lists and nulls included, replaces what was there.
+func mergeMaps(dst, src map[string]any) {
+	for k, v := range src {
+		sv, sok := v.(map[string]any)
+		dv, dok := dst[k].(map[string]any)
+		if sok && dok {
+			mergeMaps(dv, sv)
+		} else {
+			dst[k] = v
+		}
+	}
+}
+
+// coalesce overlays the user's values onto the chart's defaults, where a null
+// deletes the key instead of setting it.
+func coalesce(dst, src map[string]any) map[string]any {
+	for k, v := range src {
+		switch sv := v.(type) {
+		case nil:
+			delete(dst, k)
+		case map[string]any:
+			dv, ok := dst[k].(map[string]any)
+			if !ok {
+				dv = map[string]any{}
+			}
+			dst[k] = coalesce(dv, sv)
+		default:
+			dst[k] = v
+		}
+	}
+	return dst
+}
+
+func copyMap(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		if sub, ok := v.(map[string]any); ok {
+			v = copyMap(sub)
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// parseSet applies one --set argument: comma-separated a.b.c=value pairs.
+// ponytail: no list syntax ({a,b}, a[0]) or escaped commas; add when a stage needs them.
+func parseSet(into map[string]any, arg string) error {
+	for _, pair := range strings.Split(arg, ",") {
+		key, val, ok := strings.Cut(pair, "=")
+		if !ok {
+			return fmt.Errorf("key %q has no value", pair)
+		}
+		path := strings.Split(key, ".")
+		m := into
+		for _, p := range path[:len(path)-1] {
+			next, ok := m[p].(map[string]any)
+			if !ok {
+				next = map[string]any{}
+				m[p] = next
+			}
+			m = next
+		}
+		m[path[len(path)-1]] = typedVal(val)
+	}
+	return nil
+}
+
+// typedVal reads a --set value the way Helm does: booleans, null and integers
+// are typed, except that a leading zero keeps "007" a string.
+func typedVal(v string) any {
+	switch strings.ToLower(v) {
+	case "true":
+		return true
+	case "false":
+		return false
+	case "null":
+		return nil
+	case "0":
+		return int64(0)
+	}
+	if v != "" && v[0] != '0' {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return v
 }

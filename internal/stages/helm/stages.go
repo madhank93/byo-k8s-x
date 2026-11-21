@@ -12,7 +12,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
 	"github.com/madhank93/byo-k8s-x/internal/runner"
@@ -34,6 +37,7 @@ func Lookup(slug string) (Stage, bool) {
 
 func init() {
 	register(Stage{Slug: "chart-load", Run: stageChartLoad})
+	register(Stage{Slug: "values-merge", Run: stageValuesMerge})
 }
 
 const chartYAML = `apiVersion: v2
@@ -129,6 +133,111 @@ func stageChartLoad(ctx context.Context, env *kube.Env, bin string) error {
 	return nil
 }
 
+// stageValuesMerge — chart defaults, then -f files in order, then --set in
+// order, merged map by map: lists are replaced whole, null deletes a default,
+// and --set wins over every file wherever it appears on the command line.
+func stageValuesMerge(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	dir := w.chart("demo", map[string]string{
+		"Chart.yaml": chartYAML,
+		"values.yaml": `replicas: 1
+image:
+  repository: nginx
+  tag: "1.25"
+  pullPolicy: IfNotPresent
+service:
+  type: ClusterIP
+  port: 80
+labels:
+  team: web
+ports: [80, 443]
+debug: false
+`,
+		"templates/configmap.yaml": configMapTemplate,
+	})
+	prod := w.file("prod.yaml", `replicas: 3
+image:
+  tag: "1.27"
+labels: null
+ports: [8080]
+service:
+  port: 8443
+`)
+	last := w.file("last.yaml", "service:\n  port: 8080\nimage:\n  repository: mirror/nginx\n")
+
+	res, err := w.run("values",
+		"--set", "replicas=7",
+		"-f", prod, "-f", last,
+		"--set", "image.pullPolicy=Always,debug=true",
+		"--set", "extra.zip=007",
+		"--set", "service.type=null",
+		"--set", "count=10",
+		dir)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := wantYAML(res.Stdout, `count: 10
+debug: true
+extra:
+  zip: "007"
+image:
+  pullPolicy: Always
+  repository: mirror/nginx
+  tag: "1.27"
+ports: [8080]
+replicas: 7
+service:
+  port: 8080
+`, `the values, merged in Helm's order:
+  values.yaml < -f prod.yaml < -f last.yaml < every --set, in order
+where a map merges key by key, a list is replaced whole, null deletes the
+default, "007" stays a string because of its leading zero, and 10 and true
+are a number and a boolean`); err != nil {
+		return err
+	}
+
+	bare := w.chart("bare", map[string]string{
+		"Chart.yaml":               "apiVersion: v2\nname: bare\nversion: 0.1.0\n",
+		"templates/configmap.yaml": configMapTemplate,
+	})
+	res, err = w.run("values", "--set", "a.b.c=x", bare)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("a chart with no values.yaml has no defaults, which is allowed: %w", err)
+	}
+	if err := wantYAML(res.Stdout, "a: {b: {c: x}}\n", "a chart with no values.yaml, given --set a.b.c=x"); err != nil {
+		return err
+	}
+
+	for _, bad := range []struct {
+		args []string
+		why  string
+	}{
+		{[]string{"--set", "novalue", dir}, `--set novalue has no "=", so it sets nothing`},
+		{[]string{"-f", filepath.Join(w.dir, "missing.yaml"), dir}, "the -f file does not exist"},
+		{[]string{"-f", w.file("broken.yaml", "a: [b\n"), dir}, "the -f file is not valid YAML"},
+	} {
+		res, err := w.run(append([]string{"values"}, bad.args...)...)
+		if err != nil {
+			return err
+		}
+		if res.ExitCode == 0 {
+			return fmt.Errorf("%s, but the program exited 0 with:\n%s", bad.why, tail(res.Stdout))
+		}
+	}
+	return nil
+}
+
 // work is one stage's scratch space: a directory for charts and values files,
 // and the environment that points the program at the stage's namespace.
 type work struct {
@@ -197,6 +306,26 @@ func wantLines(stdout string, want []string) error {
 			strings.Join(want, "\n  "), tail(stdout))
 	}
 	return nil
+}
+
+// wantYAML compares output with the expected document as data, so key order,
+// indentation and quoting style are the program's own business.
+func wantYAML(got, want, what string) error {
+	var g, e any
+	if err := yaml.Unmarshal([]byte(got), &g); err != nil {
+		return fmt.Errorf("expected %s as YAML, but the output does not parse: %v\n%s", what, err, tail(got))
+	}
+	if err := yaml.Unmarshal([]byte(want), &e); err != nil {
+		panic(err)
+	}
+	if !reflect.DeepEqual(g, e) {
+		return fmt.Errorf("expected %s:\n%s\ngot:\n%s", what, indent(want), tail(got))
+	}
+	return nil
+}
+
+func indent(s string) string {
+	return "  " + strings.ReplaceAll(strings.TrimRight(s, "\n"), "\n", "\n  ")
 }
 
 // lines is stdout split into trimmed, non-empty lines.
