@@ -39,6 +39,9 @@
 //
 // Stage 13: `list [-a] [-A] [-q]` and `status NAME` read the records back and
 // print them as helm does.
+//
+// Stage 14: `history [--max N] NAME` and `get manifest|values|notes
+// [--revision N] NAME` read any revision.
 
 package main
 
@@ -83,7 +86,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: app <chart> [flags] ARGS")
 		os.Exit(2)
 	}
-	if err := run(os.Args[1], os.Args[2:]); err != nil {
+	cmd, args := os.Args[1], os.Args[2:]
+	if cmd == "get" && len(args) > 0 {
+		cmd, args = "get "+args[0], args[1:]
+	}
+	if err := run(cmd, args); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
@@ -113,6 +120,8 @@ func run(cmd string, args []string) error {
 	fs.BoolVar(&allNamespaces, "all-namespaces", false, "list releases in every namespace")
 	fs.BoolVar(&short, "q", false, "print release names only")
 	fs.BoolVar(&short, "short", false, "print release names only")
+	histMax := fs.Int("max", 256, "maximum number of revisions in the history")
+	revision := fs.Int("revision", 0, "the revision to get, 0 for the latest")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -194,18 +203,43 @@ func run(cmd string, args []string) error {
 		if len(args) != 1 {
 			return fmt.Errorf(`"helm status" requires 1 argument`)
 		}
-		k, err := connect()
+		r, err := revisionOf(namespace, args[0], 0)
 		if err != nil {
 			return err
 		}
-		h, err := k.history(namespace, args[0])
+		printRelease(r)
+		return nil
+	case "history":
+		if len(args) != 1 {
+			return fmt.Errorf(`"helm history" requires 1 argument`)
+		}
+		return history(namespace, args[0], *histMax)
+	case "get manifest", "get values", "get notes":
+		if len(args) != 1 {
+			return fmt.Errorf(`"helm %s" requires 1 argument`, cmd)
+		}
+		r, err := revisionOf(namespace, args[0], *revision)
 		if err != nil {
 			return err
 		}
-		if len(h) == 0 {
-			return errNotFound
+		switch cmd {
+		case "get manifest":
+			fmt.Println(r.Manifest)
+		case "get notes":
+			if r.Info.Notes != "" {
+				fmt.Printf("NOTES:\n%s\n", r.Info.Notes)
+			}
+		case "get values":
+			vals, title := r.Config, "USER-SUPPLIED VALUES:"
+			if all {
+				vals, title = chartValues(&Chart{Values: r.Chart.Values}, r.Config), "COMPUTED VALUES:"
+			}
+			out, err := yaml.Marshal(vals)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s\n%s", title, out)
 		}
-		printRelease(h[len(h)-1])
 		return nil
 	}
 	return fmt.Errorf("unknown command %q", cmd)
@@ -1401,4 +1435,45 @@ func printTable(rows [][]string) {
 		}
 		fmt.Println(strings.Join(cells, "\t"))
 	}
+}
+
+// revisionOf is one revision of a release, or its latest when revision is 0.
+func revisionOf(ns, name string, revision int) (*Record, error) {
+	k, err := connect()
+	if err != nil {
+		return nil, err
+	}
+	h, err := k.history(ns, name)
+	if err != nil {
+		return nil, err
+	}
+	for i := len(h) - 1; i >= 0; i-- {
+		if revision == 0 || h[i].Version == revision {
+			return h[i], nil
+		}
+	}
+	return nil, errNotFound
+}
+
+// history prints the last limit revisions of a release, oldest first.
+func history(ns, name string, limit int) error {
+	k, err := connect()
+	if err != nil {
+		return err
+	}
+	h, err := k.history(ns, name)
+	if err != nil {
+		return err
+	}
+	if len(h) == 0 {
+		return errNotFound
+	}
+	h = h[len(h)-min(limit, len(h)):]
+	rows := [][]string{{"REVISION", "UPDATED", "STATUS", "CHART", "APP VERSION", "DESCRIPTION"}}
+	for _, r := range h {
+		rows = append(rows, []string{strconv.Itoa(r.Version), r.Info.LastDeployed.Format(time.ANSIC), r.Info.Status,
+			r.Chart.Metadata.Name + "-" + r.Chart.Metadata.Version, r.Chart.Metadata.AppVersion, r.Info.Description})
+	}
+	printTable(rows)
+	return nil
 }

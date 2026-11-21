@@ -61,6 +61,7 @@ func init() {
 	register(Stage{Slug: "install", Run: stageInstall})
 	register(Stage{Slug: "release-storage", Run: stageReleaseStorage})
 	register(Stage{Slug: "list-status", Run: stageListStatus})
+	register(Stage{Slug: "history", Run: stageHistory})
 }
 
 const chartYAML = `apiVersion: v2
@@ -2440,4 +2441,92 @@ func extraNamespace(ctx context.Context, env *kube.Env, suffix string) (string, 
 		return "", fmt.Errorf("create namespace %s: %w", name, err)
 	}
 	return name, nil
+}
+
+// stageHistory — history and get print exactly what the real helm prints for
+// every revision of a release the program installed and helm then upgraded,
+// failed and upgraded again, past revision 10.
+func stageHistory(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := needHelm(w); err != nil {
+		return err
+	}
+	web := w.chart("web", webChart("hello"))
+	broken := w.chart("broken", map[string]string{
+		"Chart.yaml":         "apiVersion: v2\nname: broken\nversion: 0.2.0\n",
+		"templates/bad.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: broken-bad\ndata:\n  \"no spaces\": x\n",
+	})
+	res, err := w.run("install", "--set", "msg=one", "web", web)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if res, err = w.run("install", "plain", web); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	// Revision 3 fails; the rest supersede each other up to 11, which sorts
+	// before 2 as text. --history-max 0 keeps every revision.
+	upgrades := [][]string{{"--set", "msg=two", "web", web}, {"web", broken}}
+	for r := 4; r <= 11; r++ {
+		upgrades = append(upgrades, []string{"--set", fmt.Sprintf("msg=r%d", r), "web", web})
+	}
+	for _, u := range upgrades {
+		res, err := w.helm(append([]string{"upgrade", "--history-max", "0"}, u...)...)
+		if err != nil {
+			return err
+		}
+		want := 0
+		if u[1] == broken {
+			want = 1
+		}
+		if err := wantExit(res, want); err != nil {
+			return fmt.Errorf("the grader's helm upgrade %s, on top of your release: %w", strings.Join(u[:len(u)-1], " "), err)
+		}
+	}
+
+	for _, args := range [][]string{
+		{"history", "web"},
+		{"history", "--max", "3", "web"},
+		{"history", "plain"},
+		{"get", "manifest", "web"},
+		{"get", "manifest", "--revision", "1", "web"},
+		{"get", "manifest", "--revision", "3", "web"},
+		{"get", "values", "web"},
+		{"get", "values", "--revision", "1", "web"},
+		{"get", "values", "--revision", "3", "web"},
+		{"get", "values", "plain"},
+		{"get", "values", "--all", "web"},
+		{"get", "values", "-a", "--revision", "1", "web"},
+		{"get", "values", "-a", "plain"},
+		{"get", "notes", "web"},
+		{"get", "notes", "--revision", "1", "web"},
+		{"get", "notes", "--revision", "3", "web"},
+	} {
+		if err := sameAsHelm(w, args, nil); err != nil {
+			return err
+		}
+	}
+	for _, args := range [][]string{
+		{"history", "nope"},
+		{"get", "manifest", "--revision", "12", "web"},
+		{"get", "values", "nope"},
+	} {
+		res, err := w.run(args...)
+		if err != nil {
+			return err
+		}
+		if err := wantRefusal(res, "release: not found", strings.Join(args, " ")); err != nil {
+			return err
+		}
+	}
+	return nil
 }
