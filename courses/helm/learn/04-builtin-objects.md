@@ -13,9 +13,9 @@ the data a template is executed with, next to `.Values`:
 | Object | Fields a template uses |
 |---|---|
 | `.Release` | `Name`, `Namespace`, `Revision`, `IsInstall`, `IsUpgrade`, `Service` |
-| `.Chart` | the whole of `Chart.yaml`: `Name`, `Version`, `AppVersion`, `Description`, … |
+| `.Chart` | every field Helm reads from `Chart.yaml`: `Name`, `Version`, `AppVersion`, `Description`, `Home`, `Keywords`, `Maintainers`, `Dependencies`, … |
 | `.Template` | `Name` (`demo/templates/cm.yaml`) and `BasePath` (`demo/templates`) |
-| `.Files` | every chart file that is not a template, `Chart.yaml` or `values.yaml` |
+| `.Files` | every chart file Helm does not read itself (see below) |
 
 `helm template` renders as if it were a first install: `Revision` is 1,
 `IsInstall` is true, `IsUpgrade` false, and `Service` is always `Helm`.
@@ -28,9 +28,16 @@ template is executed with its own copy of the data.
 
 `.Files` is not a map but an object with methods, and the one every chart
 uses is `.Files.Get "files/app.conf"`, returning the file's contents as a
-string — or an empty string for a file that is not there. The chart's own
-`Chart.yaml`, `values.yaml` and templates are not files in this sense; Helm
-has already turned them into `.Chart`, `.Values` and the template set.
+string — or an empty string for a file that is not there. The files Helm
+reads itself are not files in this sense: `Chart.yaml`, `Chart.lock`,
+`values.yaml`, `values.schema.json`, `requirements.yaml`,
+`requirements.lock`, the templates, and everything under `charts/`.
+
+`.Chart` is the whole of Helm's `Chart.yaml` model, not only the fields
+used so far: `Home`, `Sources`, `Keywords`, `Maintainers` (each with `Name`,
+`Email`, `URL`), `Icon`, `Annotations`, `KubeVersion`, `Deprecated` and
+`Dependencies` (each with `Name`, `Version`, `Repository`, `Condition`,
+`Tags`, `Alias`). Later stages read the dependencies.
 
 For this stage, `template` accepts `-n NS` and `--namespace NS`, and every
 template sees the objects above. The stage renders a chart that prints them
@@ -55,8 +62,8 @@ is what you put under `Chart`.
 
 <details><summary>Approach</summary>
 
-Keep every non-template file the loader walks past, apart from `Chart.yaml`
-and `values.yaml`, in a `Files` map. Build the data map per template: the
+Keep every non-template file the loader walks past, apart from the ones
+Helm reads itself, in a `Files` map. Build the data map per template: the
 shared `Values`, `Release`, `Chart` and `Files`, plus that file's `Template`.
 </details>
 

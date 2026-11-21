@@ -452,9 +452,18 @@ data:
   chartYaml: "{{ .Files.Get "Chart.yaml" }}"
   valuesYaml: "{{ .Files.Get "values.yaml" }}"
   replicas: "{{ .Values.replicas }}"
+  home: {{ .Chart.Home }}
+  keyword: {{ index .Chart.Keywords 1 }}
+  maintainer: {{ (index .Chart.Maintainers 0).Email }}
+  schema: "{{ .Files.Get "values.schema.json" }}"
+  lock: "{{ .Files.Get "Chart.lock" }}"
+  requirements: "{{ .Files.Get "requirements.yaml" }}"
 `
 	dir := w.chart("demo", map[string]string{
-		"Chart.yaml":              chartYAML,
+		"Chart.yaml":              chartYAML + "home: https://example.com\nkeywords: [web, demo]\nmaintainers:\n- name: ann\n  email: ann@example.com\n",
+		"values.schema.json":      "{}\n",
+		"Chart.lock":              "dependencies: []\n",
+		"requirements.yaml":       "dependencies: []\n",
 		"values.yaml":             "replicas: 2\n",
 		"files/app.conf":          "key = value",
 		"templates/builtins.yaml": body,
@@ -467,7 +476,7 @@ data:
 `,
 	})
 
-	want := func(release, ns string) string {
+	want := func(release, ns, replicas string) string {
 		return `---
 # Source: demo/templates/builtins.yaml
 apiVersion: v1
@@ -489,7 +498,13 @@ data:
   missing: ""
   chartYaml: ""
   valuesYaml: ""
-  replicas: "2"
+  replicas: "` + replicas + `"
+  home: https://example.com
+  keyword: demo
+  maintainer: ann@example.com
+  schema: ""
+  lock: ""
+  requirements: ""
 ---
 # Source: demo/templates/sub/where.yaml
 apiVersion: v1
@@ -500,18 +515,23 @@ data:
   template: demo/templates/sub/where.yaml
 `
 	}
-	for _, c := range []struct{ flag, release, ns string }{
-		{"-n", "web", "team-a"},
-		{"--namespace", "api", "team-b"},
+	three := w.file("three.yaml", "replicas: 3\n")
+	for _, c := range []struct {
+		flag, release, ns, replicas string
+		files                       []string
+	}{
+		{"-n", "web", "team-a", "2", nil},
+		{"--namespace", "api", "team-b", "3", []string{"-f", three}},
 	} {
-		res, err := w.run("template", c.flag, c.ns, c.release, dir)
+		args := append(append([]string{"template"}, c.files...), c.flag, c.ns, c.release, dir)
+		res, err := w.run(args...)
 		if err != nil {
 			return err
 		}
 		if err := wantExit(res, 0); err != nil {
 			return err
 		}
-		if err := wantExact(res.Stdout, want(c.release, c.ns), fmt.Sprintf("release %s in namespace %s (%s)", c.release, c.ns, c.flag)); err != nil {
+		if err := wantExact(res.Stdout, want(c.release, c.ns, c.replicas), fmt.Sprintf("release %s in namespace %s (%s %s)", c.release, c.ns, strings.Join(c.files, " "), c.flag)); err != nil {
 			return err
 		}
 	}
@@ -596,34 +616,42 @@ data:
 		return err
 	}
 
+	for _, req := range []struct{ name, body, msg, why string }{
+		{"required-empty", `tag: {{ required "image.tag is required" .Values.image.tag }}`, "image.tag is required", "an empty string"},
+		{"required-absent", `x: {{ required "absent is required" .Values.absent }}`, "absent is required", "a value that is not set at all"},
+	} {
+		files["templates/req.yaml"] = req.body + "\n"
+		if res, err = w.run("template", "demo", w.chart(req.name, files)); err != nil {
+			return err
+		}
+		if res.ExitCode == 0 {
+			return fmt.Errorf("required %q was given %s, which must fail the render, but the program exited 0 with:\n%s", req.msg, req.why, tail(res.Stdout))
+		}
+		if !strings.Contains(res.Stderr, req.msg) {
+			return fmt.Errorf("required failed the render, but the error should carry its message, %q; stderr was:\n%s", req.msg, tail(res.Stderr))
+		}
+	}
 	files["templates/req.yaml"] = `tag: {{ required "image.tag is required" .Values.image.tag }}` + "\n"
-	res, err = w.run("template", "demo", w.chart("required", files))
-	if err != nil {
-		return err
-	}
-	if res.ExitCode == 0 {
-		return fmt.Errorf("required \"image.tag is required\" was given an empty string, which must fail the render, but the program exited 0 with:\n%s", tail(res.Stdout))
-	}
-	if !strings.Contains(res.Stderr, "image.tag is required") {
-		return fmt.Errorf("required failed the render, but the error should carry its message, \"image.tag is required\"; stderr was:\n%s", tail(res.Stderr))
-	}
-	if res, err = w.run("template", "--set", "image.tag=1.0", "demo", w.chart("required", files)); err != nil {
+	if res, err = w.run("template", "-f", w.file("tag.yaml", "image:\n  tag: \"1.0\"\n"), "demo", w.chart("required", files)); err != nil {
 		return err
 	}
 	if err := wantExit(res, 0); err != nil {
-		return fmt.Errorf("with --set image.tag=1.0, required has its value: %w", err)
+		return fmt.Errorf("with -f tag.yaml (image.tag: \"1.0\"), required has its value: %w", err)
 	}
 	if !strings.Contains(res.Stdout, "tag: 1.0") {
 		return fmt.Errorf("required returns the value it checks, so req.yaml should render \"tag: 1.0\"; got:\n%s", tail(res.Stdout))
 	}
 	delete(files, "templates/req.yaml")
 
-	files["templates/env.yaml"] = `home: {{ env "HOME" }}` + "\n"
-	if res, err = w.run("template", "demo", w.chart("env", files)); err != nil {
-		return err
-	}
-	if res.ExitCode == 0 {
-		return fmt.Errorf("Helm removes env from sprig's functions, so a chart cannot read the environment of whoever installs it; a template calling env must not render, but the program exited 0 with:\n%s", tail(res.Stdout))
+	for _, fn := range []string{`env "HOME"`, `expandenv "$HOME"`} {
+		name := strings.Fields(fn)[0]
+		files["templates/env.yaml"] = `home: {{ ` + fn + ` }}` + "\n"
+		if res, err = w.run("template", "demo", w.chart(name, files)); err != nil {
+			return err
+		}
+		if res.ExitCode == 0 {
+			return fmt.Errorf("Helm removes %s from sprig's functions, so a chart cannot read the environment of whoever installs it; a template calling it must not render, but the program exited 0 with:\n%s", name, tail(res.Stdout))
+		}
 	}
 	return nil
 }

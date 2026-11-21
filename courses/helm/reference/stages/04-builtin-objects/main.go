@@ -118,15 +118,45 @@ func run(cmd string, args []string) error {
 	return fmt.Errorf("unknown command %q", cmd)
 }
 
-// Metadata is Chart.yaml. Templates see it as .Chart, so the Go field names
-// are the ones chart authors write: .Chart.Name, .Chart.AppVersion.
+// Metadata is Chart.yaml, with the fields Helm's chart.Metadata has. Templates
+// see it as .Chart, so the Go field names are the ones chart authors write:
+// .Chart.Name, .Chart.AppVersion.
 type Metadata struct {
-	APIVersion  string `json:"apiVersion"`
-	Name        string `json:"name"`
-	Version     string `json:"version"`
-	AppVersion  string `json:"appVersion,omitempty"`
-	Description string `json:"description,omitempty"`
-	Type        string `json:"type,omitempty"`
+	Name         string            `json:"name,omitempty"`
+	Home         string            `json:"home,omitempty"`
+	Sources      []string          `json:"sources,omitempty"`
+	Version      string            `json:"version,omitempty"`
+	Description  string            `json:"description,omitempty"`
+	Keywords     []string          `json:"keywords,omitempty"`
+	Maintainers  []Maintainer      `json:"maintainers,omitempty"`
+	Icon         string            `json:"icon,omitempty"`
+	APIVersion   string            `json:"apiVersion,omitempty"`
+	Condition    string            `json:"condition,omitempty"`
+	Tags         string            `json:"tags,omitempty"`
+	AppVersion   string            `json:"appVersion,omitempty"`
+	Deprecated   bool              `json:"deprecated,omitempty"`
+	Annotations  map[string]string `json:"annotations,omitempty"`
+	KubeVersion  string            `json:"kubeVersion,omitempty"`
+	Dependencies []Dependency      `json:"dependencies,omitempty"`
+	Type         string            `json:"type,omitempty"`
+}
+
+type Maintainer struct {
+	Name  string `json:"name,omitempty"`
+	Email string `json:"email,omitempty"`
+	URL   string `json:"url,omitempty"`
+}
+
+// Dependency is one entry of Chart.yaml's dependencies.
+type Dependency struct {
+	Name         string   `json:"name"`
+	Version      string   `json:"version,omitempty"`
+	Repository   string   `json:"repository"`
+	Condition    string   `json:"condition,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
+	Enabled      bool     `json:"enabled,omitempty"`
+	ImportValues []any    `json:"import-values,omitempty"`
+	Alias        string   `json:"alias,omitempty"`
 }
 
 // File is one file of a chart, named by its slash path from the chart root.
@@ -195,7 +225,12 @@ func load(dir string) (*Chart, error) {
 		if strings.HasPrefix(rel, "templates/.") {
 			return nil
 		}
-		if rel == "Chart.yaml" || rel == "values.yaml" {
+		// Files Helm reads itself, and subcharts, are not .Files.
+		switch rel {
+		case "Chart.yaml", "Chart.lock", "values.yaml", "values.schema.json", "requirements.yaml", "requirements.lock":
+			return nil
+		}
+		if strings.HasPrefix(rel, "charts/") {
 			return nil
 		}
 		data, err := os.ReadFile(path)
