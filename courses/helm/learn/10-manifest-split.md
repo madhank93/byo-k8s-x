@@ -29,7 +29,8 @@ APIService
    Kinds not in the table — your CRDs' resources, and also webhook
    configurations, which the table leaves out — come after every known
    kind, alphabetically by kind. Documents of the same kind keep the order
-   they had: file path, then position in the file.
+   they had: file path, then position in the file. (Hook documents, which
+   stage 17 introduces, are pulled out and printed after the rest.)
 
 The split is a regular expression, and its edges show up in the output, so
 use Helm's exactly:

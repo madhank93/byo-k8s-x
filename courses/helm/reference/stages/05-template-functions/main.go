@@ -176,7 +176,8 @@ type Chart struct {
 	Files     Files
 }
 
-// Files is every chart file that is not a template, Chart.yaml or values.yaml.
+// Files is every chart file Helm does not read itself: not a template,
+// Chart.yaml, Chart.lock, values.yaml, values.schema.json or requirements.*.
 type Files map[string][]byte
 
 // Get is .Files.Get in a template: the file's contents, or "" if it is absent.
@@ -403,7 +404,7 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 	var out []File
 	for _, f := range c.Templates {
 		base := filepath.Base(f.Name)
-		if strings.HasPrefix(base, "_") || strings.HasSuffix(base, "NOTES.txt") {
+		if strings.HasPrefix(base, "_") {
 			continue
 		}
 		name := c.Metadata.Name + "/" + f.Name
@@ -420,7 +421,9 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 		}
 		// missingkey=zero prints a missing map key as "<no value>"; Helm blanks it.
 		text := strings.TrimSpace(strings.ReplaceAll(b.String(), "<no value>", ""))
-		if text != "" {
+		// NOTES.txt renders like any template, so its errors count, but it is
+		// not a manifest.
+		if text != "" && !strings.HasSuffix(base, "NOTES.txt") {
 			out = append(out, File{Name: name, Data: []byte(text)})
 		}
 	}

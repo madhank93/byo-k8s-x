@@ -45,8 +45,13 @@ The order Helm merges in is what makes those rules hold, so copy it:
 
 1. Lay the user's values over the parent's defaults.
 2. For each subchart, take that result's `<sub>` map (or an empty one),
-   copy the parent's `global` into it, and merge the subchart in the same
+   copy the parent's `global` into it (every subchart gets a `global` map,
+   empty if no chart above sets one), and merge the subchart in the same
    way, recursively. Store the merged map back under `<sub>`.
+
+A null under a subchart's key survives step 1, even where the parent has a
+default to delete, so that step 2 deletes the subchart's own default too:
+`--set db.port=null` leaves db with no `port` at all.
 
 **Everything else is per chart.** A subchart's templates see the
 subchart's own `.Chart` and `.Files`; `.Release` is shared. Its templates
@@ -62,8 +67,15 @@ are shallower, the parent's define wins.
 The output is every chart's templates together, sorted by that full path,
 which puts `shop/charts/…` before `shop/templates/…`.
 
-Anything in `charts/` that is not a chart directory is an error: Helm tries
-to load every entry there as a chart.
+Helm tries to load every entry of `charts/` as a chart, so anything else
+there is an error, with three exceptions: entries whose names start with
+`.` or `_` (a stray `.DS_Store`) are skipped, and a `.prov` provenance file
+becomes one of the parent's `.Files`.
+
+**Library charts** (`type: library`) render nothing. A library subchart
+lends its `_`-prefixed files' defines to the set and its other templates
+are left out; a library chart rendered on its own is refused with
+`library charts are not installable`.
 
 ## Go APIs
 

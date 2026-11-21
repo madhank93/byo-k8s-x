@@ -415,6 +415,7 @@ metadata:
 	for _, bad := range []struct{ file, body, why string }{
 		{"templates/unclosed.yaml", "{{ .Values.greeting \n", "it does not parse"},
 		{"templates/deeper.yaml", "{{ .Values.greeting.deep }}\n", "it reads a field of a string"},
+		{"templates/NOTES.txt", "{{ .Values.greeting.deep }}\n", "NOTES.txt renders like any template, and it reads a field of a string"},
 	} {
 		dir := w.chart("bad-"+filepath.Base(bad.file), map[string]string{
 			"Chart.yaml": chartYAML, "values.yaml": "greeting: hello\n", bad.file: bad.body,
@@ -634,8 +635,8 @@ data:
 		if res, err = w.run("template", "demo", w.chart(req.name, files)); err != nil {
 			return err
 		}
-		if res.ExitCode == 0 {
-			return fmt.Errorf("required %q was given %s, which must fail the render, but the program exited 0 with:\n%s", req.msg, req.why, tail(res.Stdout))
+		if err := wantError(res); err != nil {
+			return fmt.Errorf("required %q was given %s, which must fail the render: %w", req.msg, req.why, err)
 		}
 		if !strings.Contains(res.Stderr, req.msg) {
 			return fmt.Errorf("required failed the render, but the error should carry its message, %q; stderr was:\n%s", req.msg, tail(res.Stderr))
@@ -659,8 +660,8 @@ data:
 		if res, err = w.run("template", "demo", w.chart(name, files)); err != nil {
 			return err
 		}
-		if res.ExitCode == 0 {
-			return fmt.Errorf("Helm removes %s from sprig's functions, so a chart cannot read the environment of whoever installs it; a template calling it must not render, but the program exited 0 with:\n%s", name, tail(res.Stdout))
+		if err := wantError(res); err != nil {
+			return fmt.Errorf("Helm removes %s from sprig's functions, so a chart cannot read the environment of whoever installs it; a template calling it must not render: %w", name, err)
 		}
 	}
 	return nil
@@ -682,6 +683,8 @@ func stageNamedTemplates(ctx context.Context, env *kube.Env, bin string) error {
   tier: web
 greeting: "hello from {{ .Release.Name }} in {{ .Template.Name }}"
 nameRef: '{{ template "demo.fullname" . }}-ref'
+inline: '{{ define "demo.inline" }}IN-{{ .Values.labels.tier }}{{ end }}{{ include "demo.inline" . }}'
+blank: "{{ .Values.nothing }}x"
 `,
 		"templates/_helpers.tpl": `{{/* The release-qualified name, cut to Kubernetes' limit. */}}
 {{- define "demo.fullname" -}}
@@ -712,6 +715,9 @@ data:
   greeting: {{ tpl .Values.greeting . | quote }}
   ref: {{ tpl .Values.nameRef . }}
   local: {{ template "demo.local" . }}
+  inline: {{ tpl .Values.inline . }}
+  blank: {{ tpl .Values.blank . | len | quote }}
+  ctx: {{ tpl "{{ .k }}-{{ .v }}" (dict "k" "a" "v" "b") }}
 `,
 		"templates/other.yaml": `{{- define "demo.local" -}}
 defined-in-other-{{ .Chart.Version }}
@@ -745,13 +751,17 @@ data:
   greeting: "hello from web in demo/templates/cm.yaml"
   ref: web-demo-ref
   local: defined-in-other-1.2.3
+  inline: IN-web
+  blank: "1"
+  ctx: a-b
 ---
 # Source: demo/templates/other.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: web-demo-other
-`, "release web: named templates from _helpers.tpl and other.yaml, called with include, template and tpl"); err != nil {
+`, `release web: named templates from _helpers.tpl and other.yaml, called with include, template and tpl;
+tpl text may define a template and include it, its missing values print nothing, and its data can be any value`); err != nil {
 		return err
 	}
 
@@ -759,11 +769,26 @@ metadata:
 	if res, err = w.run("template", "web", w.chart("missing", files)); err != nil {
 		return err
 	}
-	if res.ExitCode == 0 {
-		return fmt.Errorf("templates/missing.yaml includes \"demo.nope\", which no file defines, so the render must fail, but the program exited 0 with:\n%s", tail(res.Stdout))
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("templates/missing.yaml includes \"demo.nope\", which no file defines, so the render must fail: %w", err)
 	}
 	if !strings.Contains(res.Stderr, "demo.nope") {
 		return fmt.Errorf("an include of an undefined template failed, but the error should name it, \"demo.nope\"; stderr was:\n%s", tail(res.Stderr))
+	}
+
+	loop := w.chart("loop", map[string]string{
+		"Chart.yaml":        chartYAML,
+		"templates/_r.tpl":  `{{ define "r" }}{{ include "r" . }}{{ end }}` + "\n",
+		"templates/cm.yaml": `x: {{ include "r" . }}` + "\n",
+	})
+	if res, err = w.run("template", "web", loop); err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("template r includes itself forever, which Helm stops after 1000 nested includes: %w", err)
+	}
+	if s := "rendering template has a nested reference name: r"; !strings.Contains(res.Stderr, s) {
+		return fmt.Errorf("an include that recurses forever should fail as Helm's does, with %q; stderr was:\n%s", s, tail(res.Stderr))
 	}
 
 	// Helm parses deepest paths first, then reverse lexical, and a later define
@@ -795,7 +820,8 @@ Helm keeps the define from the shallowest path, and at one depth the lexically f
 }
 
 // shopChart is a parent with two subcharts: db, with its own values, file,
-// defines and globals, and cache, with no values.yaml at all.
+// defines, globals and a subchart of its own, pool, and cache, with no
+// values.yaml at all.
 func shopChart() map[string]string {
 	return map[string]string{
 		"Chart.yaml": `apiVersion: v2
@@ -819,6 +845,15 @@ version: 0.3.0
 appVersion: "16"
 `,
 		"charts/db/db.conf": `listen = all
+`,
+		"charts/db/charts/pool/Chart.yaml":  "apiVersion: v2\nname: pool\nversion: 0.0.1\n",
+		"charts/db/charts/pool/values.yaml": "size: 5\n",
+		"charts/db/charts/pool/templates/cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pool
+data:
+  values: {{ toJson .Values | squote }}
 `,
 		"charts/db/templates/_helpers.tpl": `{{- define "db.name" -}}db-{{ .Release.Name }}{{- end -}}
 {{- define "common.label" -}}from-db{{- end -}}
@@ -904,6 +939,14 @@ metadata:
 data:
   values: '{"enabled":true,"global":{"env":"prod","region":"eu"}}'
 ---
+# Source: shop/charts/db/charts/pool/templates/cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pool
+data:
+  values: '{"global":{"env":"prod","region":"eu","tier":"data"},"size":5}'
+---
 # Source: shop/charts/db/templates/cm.yaml
 apiVersion: v1
 kind: ConfigMap
@@ -933,11 +976,12 @@ data:
   subDefine: db-web
   label: from-parent
   parentGlobal: '{"env":"prod","region":"eu"}'
-  parentDb: '{"extra":{"added":true,"kept":true},"global":{"env":"prod","region":"eu","tier":"data"},"name":"orders","port":6543}'
+  parentDb: '{"extra":{"added":true,"kept":true},"global":{"env":"prod","region":"eu","tier":"data"},"name":"orders","pool":{"global":{"env":"prod","region":"eu","tier":"data"},"size":5},"port":6543}'
   parentCache: '{"enabled":true,"global":{"env":"prod","region":"eu"}}'
-`, `release web of shop, whose charts/ holds db and cache: shop's values under
-db: override db's defaults, shop's global wins over db's, and the merged db
-values are what shop's own templates see under .Values.db`); err != nil {
+`, `release web of shop, whose charts/ holds db and cache, and db's holds pool:
+shop's values under db: override db's defaults, shop's global wins over db's
+and reaches pool through db, and the merged db values, pool's included, are
+what shop's own templates see under .Values.db`); err != nil {
 		return err
 	}
 
@@ -956,6 +1000,75 @@ values are what shop's own templates see under .Values.db`); err != nil {
 		if !strings.Contains(res.Stdout, line+"\n") {
 			return fmt.Errorf("with --set db.port=1 --set global.env=dev, the subcharts should render %q; got:\n%s", strings.TrimSpace(line), tail(res.Stdout))
 		}
+	}
+
+	// A null bound for a subchart deletes the subchart's own default too,
+	// however deep, not only the parent's.
+	if res, err = w.run("template", "--set", "db.port=null", "--set", "db.pool.size=null", "web", dir); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if line := `  parentDb: '{"extra":{"added":true,"kept":true},"global":{"env":"prod","region":"eu","tier":"data"},"name":"orders","pool":{"global":{"env":"prod","region":"eu","tier":"data"}}}'`; !strings.Contains(res.Stdout, line+"\n") {
+		return fmt.Errorf("--set db.port=null deletes db's own port: 5432 as well as shop's db.port: 6543, and db.pool.size=null deletes pool's size: 5, so shop's .Values.db should be\n%s\ngot:\n%s", line, tail(res.Stdout))
+	}
+
+	// Helm skips charts/ entries starting with . or _, keeps a .prov file as
+	// one of the parent's files, gives every subchart a global map, and renders
+	// only a library chart's defines.
+	extras := w.chart("extras", map[string]string{
+		"Chart.yaml":                 "apiVersion: v2\nname: extras\nversion: 1.0.0\n",
+		"templates/cm.yaml":          "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: extras\ndata:\n  lib: {{ include \"l.x\" . }}\n  prov: {{ .Files.Get \"charts/s-0.1.0.prov\" | trim | quote }}\n",
+		"charts/.DS_Store":           "junk\n",
+		"charts/_skip/README":        "junk\n",
+		"charts/s-0.1.0.prov":        "signed\n",
+		"charts/s/Chart.yaml":        "apiVersion: v2\nname: s\nversion: 0.1.0\n",
+		"charts/s/templates/cm.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: s\ndata:\n  values: {{ toJson .Values | squote }}\n",
+		"charts/l/Chart.yaml":        "apiVersion: v2\nname: l\nversion: 0.1.0\ntype: library\n",
+		"charts/l/templates/_x.tpl":  "{{- define \"l.x\" }}from-lib{{ end }}\n",
+		"charts/l/templates/cm.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: lib-rendered\n",
+	})
+	if res, err = w.run("template", "web", extras); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("charts/.DS_Store and charts/_skip are skipped and charts/s-0.1.0.prov is a file, so extras loads: %w", err)
+	}
+	if err := wantExact(res.Stdout, `---
+# Source: extras/charts/s/templates/cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s
+data:
+  values: '{"global":{}}'
+---
+# Source: extras/templates/cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: extras
+data:
+  lib: from-lib
+  prov: "signed"
+`, `extras: s gets an empty global though extras has none, l is a library chart
+whose define extras includes and whose cm.yaml never renders, and the .prov
+file is one of extras' .Files`); err != nil {
+		return err
+	}
+	toplib := w.chart("toplib", map[string]string{
+		"Chart.yaml":       "apiVersion: v2\nname: toplib\nversion: 1.0.0\ntype: library\n",
+		"templates/_x.tpl": "{{ define \"q\" }}{{ end }}\n",
+	})
+	if res, err = w.run("template", "web", toplib); err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("toplib is a library chart, which Helm will not render on its own: %w", err)
+	}
+	if !strings.Contains(res.Stderr, "library charts are not installable") {
+		return fmt.Errorf("a library chart should be refused as Helm refuses it, \"library charts are not installable\"; stderr was:\n%s", tail(res.Stderr))
 	}
 
 	for name, file := range map[string]string{"stray-file": "charts/notes.txt", "no-chart-yaml": "charts/empty/x.yaml"} {
@@ -1002,6 +1115,9 @@ dependencies:
   - name: metrics
     version: 0.1.0
     tags: [backend, ops]
+  - name: edge
+    version: 0.1.0
+    condition: nope.enabled, edge.enabled
 `
 	files["values.yaml"] = `global:
   env: prod
@@ -1009,9 +1125,18 @@ db:
   port: 6543
 cache:
   enabled: "yes"
+edge:
+  enabled: false
 tags:
   backend: false
 `
+	files["charts/db/Chart.yaml"] += `dependencies:
+  - name: pool
+    version: 0.0.1
+    condition: pool.enabled
+    tags: [pooling]
+`
+	files["charts/db/values.yaml"] += "tags:\n  pooling: false\n"
 	files["templates/app.yaml"] = `apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1019,7 +1144,7 @@ metadata:
 data:
   db: {{ toJson .Values.db | squote }}
 `
-	for _, sub := range []string{"queue", "metrics"} {
+	for _, sub := range []string{"queue", "metrics", "edge", "free"} {
 		files["charts/"+sub+"/Chart.yaml"] = "apiVersion: v2\nname: " + sub + "\nversion: 0.1.0\n"
 		files["charts/"+sub+"/templates/cm.yaml"] = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " + sub + "\n"
 	}
@@ -1038,13 +1163,15 @@ data:
 		want []string
 		why  string
 	}{
-		{nil, src("cache", "db", "queue"),
-			`cache.enabled is "yes", not a boolean, so it is skipped and cache stays on; queue's own default queue.enabled: true beats tags.backend: false; metrics has only tags, and backend is false`},
-		{[]string{"db.enabled=false"}, src("cache", "queue"), "db.enabled is false"},
-		{[]string{"tags.ops=true"}, src("cache", "db", "metrics", "queue"), "metrics is tagged backend and ops, and one true tag is enough"},
-		{[]string{"tags.backend=true", "queue.enabled=false"}, src("cache", "db", "metrics"), "queue.enabled: false is a condition, and a condition beats tags"},
-		{[]string{"global.cache=false"}, src("db", "queue"), "cache's condition is cache.enabled,global.cache: the first is not a boolean, the second is false"},
-		{[]string{"cache.enabled=false", "tags.frontend=true"}, src("db", "queue"), "cache.enabled: false decides before the frontend tag is looked at"},
+		{nil, src("cache", "db", "edge", "free", "queue"),
+			`cache.enabled is "yes", not a boolean, so it is skipped and cache stays on; queue's own default queue.enabled: true beats tags.backend: false; metrics has only tags, and backend is false; edge's condition is trimmed as a whole, so its second path is " edge.enabled", which is not set; free is in charts/ but not in dependencies; db's own default tags.pooling: false switches pool off`},
+		{[]string{"db.enabled=false"}, src("cache", "edge", "free", "queue"), "db.enabled is false, and pool goes with it"},
+		{[]string{"tags.ops=true"}, src("cache", "db", "edge", "free", "metrics", "queue"), "metrics is tagged backend and ops, and one true tag is enough"},
+		{[]string{"tags.backend=true", "queue.enabled=false"}, src("cache", "db", "edge", "free", "metrics"), "queue.enabled: false is a condition, and a condition beats tags"},
+		{[]string{"global.cache=false"}, src("db", "edge", "free", "queue"), "cache's condition is cache.enabled,global.cache: the first is not a boolean, the second is false"},
+		{[]string{"cache.enabled=false", "tags.frontend=true"}, src("db", "edge", "free", "queue"), "cache.enabled: false decides before the frontend tag is looked at"},
+		{[]string{"db.pool.enabled=true"}, src("cache", "db/charts/pool", "db", "edge", "free", "queue"), "pool's condition, pool.enabled, is read under db's values, db.pool.enabled"},
+		{[]string{"tags.pooling=true"}, src("cache", "db/charts/pool", "db", "edge", "free", "queue"), "the top chart's tags.pooling: true wins over db's own default tags.pooling: false"},
 	} {
 		args := []string{"template"}
 		for _, s := range c.sets {
@@ -1074,6 +1201,19 @@ data:
 		if len(c.sets) == 1 && c.sets[0] == "db.enabled=false" && !strings.Contains(res.Stdout, `  db: '{"enabled":false,"port":6543}'`+"\n") {
 			return fmt.Errorf("with db switched off, shop's .Values.db is only what shop's values say, since db's defaults and globals are never merged in; expected\n  db: '{\"enabled\":false,\"port\":6543}'\ngot:\n%s", tail(res.Stdout))
 		}
+	}
+
+	files["Chart.yaml"] += "  - name: ghost\n    version: 1.0.0\n    condition: ghost.enabled\n"
+	files["values.yaml"] += "ghost:\n  enabled: false\n"
+	res, err := w.run("template", "web", w.chart("ghost", files))
+	if err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("Chart.yaml lists ghost, which charts/ does not hold, and Helm refuses that even with ghost switched off: %w", err)
+	}
+	if s := "found in Chart.yaml, but missing in charts/ directory: ghost"; !strings.Contains(res.Stderr, s) {
+		return fmt.Errorf("the error should say, as Helm's does, %q; stderr was:\n%s", s, tail(res.Stderr))
 	}
 	return nil
 }
@@ -1126,6 +1266,8 @@ image:
 `
 	files["charts/db/values.schema.json"] = `{"type": "object", "properties": {"port": {"type": "integer", "maximum": 65535}}}
 `
+	files["charts/db/charts/pool/values.schema.json"] = `{"type": "object", "properties": {"size": {"type": "integer", "maximum": 10}}}
+`
 	files["templates/app.yaml"] = `apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1164,6 +1306,7 @@ data:
 		{[]string{"--set", "replicas=null"}, []string{"shop", "replicas"}, "the null deletes replicas, which the schema requires"},
 		{[]string{"--set", "image.pullPolicy=Never"}, []string{"shop", "/image/pullPolicy"}, "pullPolicy must be Always or IfNotPresent"},
 		{[]string{"--set", "db.port=70000"}, []string{"db", "/port"}, "db's own schema caps port at 65535"},
+		{[]string{"--set", "db.pool.size=50"}, []string{"pool", "/size"}, "pool, db's subchart, caps size at 10 in its own schema"},
 		{[]string{"--set", "image.tag=5", "--set", "replicas=0"}, []string{"/replicas", "/image/tag"}, "both values are wrong, and every failure is reported, not only the first"},
 	} {
 		res, err := w.run(append(append([]string{"template"}, c.args...), "web", dir)...)
@@ -1411,6 +1554,51 @@ metadata:
 	}
 	if strings.Contains(res.Stdout, "# Source:") {
 		return fmt.Errorf("a file that does not parse stops the whole render, but stdout was:\n%s", tail(res.Stdout))
+	}
+
+	// Twenty documents of two kinds: more than sort.Slice sorts by insertion,
+	// so only a stable sort keeps each kind in file order.
+	var many []string
+	for i := 0; i < 20; i++ {
+		kind := "ConfigMap"
+		if i%2 == 1 {
+			kind = "Secret"
+		}
+		many = append(many, fmt.Sprintf("apiVersion: v1\nkind: %s\nmetadata:\n  name: d%02d", kind, i))
+	}
+	manyDir := w.chart("many", map[string]string{
+		"Chart.yaml":                "apiVersion: v2\nname: many\nversion: 1.0.0\n",
+		"templates/many.yaml":       strings.Join(many, "\n---\n") + "\n",
+		"templates/svc.yaml":        "apiVersion: v1\nkind: Service\nmetadata:\n  name: svc\n",
+		"templates/sub/pod.yaml":    "apiVersion: v1\nkind: Pod\nmetadata:\n  name: pod\n",
+		"charts/k/Chart.yaml":       "apiVersion: v2\nname: k\nversion: 0.1.0\n",
+		"charts/k/templates/x.yaml": "apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: role\n",
+	})
+	odd, even := "d01 d03 d05 d07 d09 d11 d13 d15 d17 d19", "d00 d02 d04 d06 d08 d10 d12 d14 d16 d18"
+	for _, c := range []struct {
+		show []string
+		want string
+		why  string
+	}{
+		{nil, odd + " " + even + " role svc pod", "twenty Secrets and ConfigMaps from one file keep their file order within each kind"},
+		{[]string{"-s", "templates/*.yaml"}, odd + " " + even + " svc", "the glob templates/*.yaml matches many.yaml and svc.yaml, not sub/pod.yaml or the subchart's"},
+		{[]string{"-s", "charts/k/templates/x.yaml"}, "role", "a subchart's template is named from the top chart, charts/k/templates/x.yaml"},
+	} {
+		if res, err = w.run(append(append([]string{"template"}, c.show...), "r", manyDir)...); err != nil {
+			return err
+		}
+		if err := wantExit(res, 0); err != nil {
+			return err
+		}
+		var names []string
+		for _, l := range strings.Split(res.Stdout, "\n") {
+			if n, ok := strings.CutPrefix(l, "  name: "); ok {
+				names = append(names, n)
+			}
+		}
+		if got := strings.Join(names, " "); got != c.want {
+			return fmt.Errorf("template %s r many: %s; expected documents named, in order:\n  %s\ngot:\n  %s", strings.Join(c.show, " "), c.why, c.want, got)
+		}
 	}
 
 	// Every kind in Helm's table, written in reverse, plus two it does not

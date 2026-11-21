@@ -113,6 +113,9 @@ func run(cmd string, args []string) error {
 		if err != nil {
 			return err
 		}
+		if err := missingDeps(c); err != nil {
+			return err
+		}
 		user, err := userValues(files, sets)
 		if err != nil {
 			return err
@@ -185,7 +188,9 @@ type Chart struct {
 	Files     Files
 }
 
-// Files is every chart file that is not a template, Chart.yaml or values.yaml.
+// Files is every chart file Helm does not read itself: not a template,
+// Chart.yaml, Chart.lock, values.yaml, values.schema.json or requirements.*,
+// and nothing under charts/ but its .prov files.
 type Files map[string][]byte
 
 // Get is .Files.Get in a template: the file's contents, or "" if it is absent.
@@ -270,6 +275,19 @@ func load(dir string) (*Chart, error) {
 		return nil, err
 	}
 	for _, e := range entries {
+		// Helm ignores entries starting with . or _, and keeps provenance
+		// files as plain files of the parent.
+		if strings.HasPrefix(e.Name(), ".") || strings.HasPrefix(e.Name(), "_") {
+			continue
+		}
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".prov") {
+			data, err := os.ReadFile(filepath.Join(dir, "charts", e.Name()))
+			if err != nil {
+				return nil, err
+			}
+			c.Files["charts/"+e.Name()] = data
+			continue
+		}
 		if !e.IsDir() {
 			return nil, fmt.Errorf("error unpacking subchart %s in %s: not a chart directory", e.Name(), c.Metadata.Name)
 		}
@@ -341,12 +359,13 @@ func mergeMaps(dst, src map[string]any) {
 
 // coalesce overlays the user's values onto the chart's defaults, where a null
 // deletes the default instead of setting it, and stays a null where there is
-// no default to delete.
-func coalesce(dst, src map[string]any) map[string]any {
+// no default to delete. keepNull keeps every null, for values bound for a
+// subchart, whose own merge deletes its defaults with them.
+func coalesce(dst, src map[string]any, keepNull bool) map[string]any {
 	for k, v := range src {
 		switch sv := v.(type) {
 		case nil:
-			if _, ok := dst[k]; ok {
+			if _, ok := dst[k]; ok && !keepNull {
 				delete(dst, k)
 			} else {
 				dst[k] = nil
@@ -356,7 +375,7 @@ func coalesce(dst, src map[string]any) map[string]any {
 			if !ok {
 				dv = map[string]any{}
 			}
-			dst[k] = coalesce(dv, sv)
+			dst[k] = coalesce(dv, sv, keepNull)
 		default:
 			dst[k] = v
 		}
@@ -368,23 +387,29 @@ func coalesce(dst, src map[string]any) map[string]any {
 // same for each subchart under its name, after handing it the parent's
 // globals. The result is stored back, so the parent sees the merged subchart.
 func chartValues(c *Chart, user map[string]any) map[string]any {
-	v := coalesce(copyMap(c.Values), user)
+	subs := map[string]bool{}
+	for _, sub := range c.Subcharts {
+		subs[sub.Metadata.Name] = true
+	}
+	v := copyMap(c.Values)
+	for k, uv := range user {
+		coalesce(v, map[string]any{k: uv}, subs[k])
+	}
 	for _, sub := range c.Subcharts {
 		sv, _ := v[sub.Metadata.Name].(map[string]any)
 		if sv == nil {
 			sv = map[string]any{}
 		}
-		if g, ok := v["global"].(map[string]any); ok {
-			sg, _ := sv["global"].(map[string]any)
-			if sg == nil {
-				sg = map[string]any{}
-			}
-			// ponytail: whole keys, parent wins; Helm merges nested global maps key by key.
-			for k, val := range g {
-				sg[k] = val
-			}
-			sv["global"] = sg
+		sg, _ := sv["global"].(map[string]any)
+		if sg == nil {
+			sg = map[string]any{}
 		}
+		g, _ := v["global"].(map[string]any)
+		// ponytail: whole keys, parent wins; Helm merges nested global maps key by key.
+		for k, val := range g {
+			sg[k] = val
+		}
+		sv["global"] = sg
 		v[sub.Metadata.Name] = chartValues(sub, sv)
 	}
 	return v
@@ -400,14 +425,24 @@ func enabledValues(c *Chart, user map[string]any) map[string]any {
 	return chartValues(c, user)
 }
 
-// prune removes disabled subcharts, at every level. Tags always come from the
-// top chart's values.
+// prune removes disabled subcharts, at every level. Tags come from the top
+// chart's values, and a subchart's own tags: defaults fill in for its
+// dependencies.
 func prune(c *Chart, vals, tags map[string]any) {
 	var keep []*Chart
 	for _, sub := range c.Subcharts {
 		if enabled(c.Metadata.Dependencies, sub.Metadata.Name, vals, tags) {
 			sv, _ := vals[sub.Metadata.Name].(map[string]any)
-			prune(sub, sv, tags)
+			st := map[string]any{}
+			if own, ok := sub.Values["tags"].(map[string]any); ok {
+				for k, v := range own {
+					st[k] = v
+				}
+			}
+			for k, v := range tags {
+				st[k] = v
+			}
+			prune(sub, sv, st)
 			keep = append(keep, sub)
 		}
 	}
@@ -423,8 +458,8 @@ func enabled(deps []Dependency, name string, vals, tags map[string]any) bool {
 		if d.Name != name {
 			continue
 		}
-		for _, p := range strings.Split(d.Condition, ",") {
-			if b, ok := pathValue(vals, strings.TrimSpace(p)).(bool); ok {
+		for _, p := range strings.Split(strings.TrimSpace(d.Condition), ",") {
+			if b, ok := pathValue(vals, p).(bool); ok {
 				return b
 			}
 		}
@@ -440,6 +475,25 @@ func enabled(deps []Dependency, name string, vals, tags map[string]any) bool {
 		return on
 	}
 	return true
+}
+
+// missingDeps refuses a chart whose Chart.yaml lists a dependency that
+// charts/ does not hold, switched off or not.
+func missingDeps(c *Chart) error {
+	have := map[string]bool{}
+	for _, sub := range c.Subcharts {
+		have[sub.Metadata.Name] = true
+	}
+	var missing []string
+	for _, d := range c.Metadata.Dependencies {
+		if !have[d.Name] {
+			missing = append(missing, d.Name)
+		}
+	}
+	if missing == nil {
+		return nil
+	}
+	return fmt.Errorf("An error occurred while checking for chart dependencies. You may need to run `helm dependency build` to fetch missing dependencies: found in Chart.yaml, but missing in charts/ directory: %s", strings.Join(missing, ", "))
 }
 
 // pathValue reads a dotted path such as db.enabled, or nil if it is not there.
@@ -514,6 +568,9 @@ func typedVal(v string) any {
 // results in path order. All files are parsed into one set so that any of them
 // can call a template another defines.
 func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
+	if c.Metadata.Type == "library" {
+		return nil, errors.New("library charts are not installable")
+	}
 	// Every chart's templates, named by their path from the top chart, each
 	// with the data its chart's templates see.
 	var all []File
@@ -522,6 +579,10 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 	walk = func(c *Chart, prefix string, vals map[string]any) {
 		top := map[string]any{"Values": vals, "Release": rel, "Chart": c.Metadata, "Files": c.Files, "BasePath": prefix + "/templates"}
 		for _, f := range c.Templates {
+			// A library chart lends its defines and renders nothing.
+			if c.Metadata.Type == "library" && !strings.HasPrefix(filepath.Base(f.Name), "_") {
+				continue
+			}
 			all = append(all, File{Name: prefix + "/" + f.Name, Data: f.Data})
 			data[prefix+"/"+f.Name] = top
 		}
@@ -533,27 +594,8 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 	walk(c, c.Metadata.Name, vals)
 	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
 
-	t := template.New("gotpl").Option("missingkey=zero")
-	fm := funcMap()
-	// include and tpl close over the set, so they see every define in the chart.
-	fm["include"] = func(name string, data any) (string, error) {
-		var b strings.Builder
-		err := t.ExecuteTemplate(&b, name, data)
-		return b.String(), err
-	}
-	fm["tpl"] = func(text string, data any) (string, error) {
-		c, err := t.Clone()
-		if err != nil {
-			return "", err
-		}
-		if c, err = c.New("gotpl").Parse(text); err != nil {
-			return "", err
-		}
-		var b strings.Builder
-		err = c.Execute(&b, data)
-		return b.String(), err
-	}
-	t.Funcs(fm)
+	t := template.New("gotpl").Option("missingkey=zero").Funcs(funcMap())
+	bindIncludes(t, map[string]int{})
 	for _, f := range parseOrder(all) {
 		if _, err := t.New(f.Name).Parse(string(f.Data)); err != nil {
 			return nil, err
@@ -562,7 +604,7 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 	var out []File
 	for _, f := range all {
 		base := filepath.Base(f.Name)
-		if strings.HasPrefix(base, "_") || strings.HasSuffix(base, "NOTES.txt") {
+		if strings.HasPrefix(base, "_") {
 			continue
 		}
 		name, top := f.Name, data[f.Name]
@@ -579,7 +621,9 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 		}
 		// missingkey=zero prints a missing map key as "<no value>"; Helm blanks it.
 		text := strings.TrimSpace(strings.ReplaceAll(b.String(), "<no value>", ""))
-		if text != "" {
+		// NOTES.txt renders like any template, so its errors count, but it is
+		// not a manifest.
+		if text != "" && !strings.HasSuffix(base, "NOTES.txt") {
 			out = append(out, File{Name: name, Data: []byte(text)})
 		}
 	}
@@ -599,6 +643,38 @@ func parseOrder(files []File) []File {
 		return a > b
 	})
 	return out
+}
+
+// bindIncludes gives a template set its include and tpl, closing over that
+// set: tpl's clone is bound again, so a define made inside tpl text can be
+// included. depth counts nested includes of each name, which Helm caps at 1000.
+func bindIncludes(t *template.Template, depth map[string]int) *template.Template {
+	return t.Funcs(template.FuncMap{
+		"include": func(name string, data any) (string, error) {
+			if depth[name] > 1000 {
+				return "", fmt.Errorf("rendering template has a nested reference name: %s: unable to execute template", name)
+			}
+			depth[name]++
+			defer func() { depth[name]-- }()
+			var b strings.Builder
+			err := t.ExecuteTemplate(&b, name, data)
+			return b.String(), err
+		},
+		"tpl": func(text string, data any) (string, error) {
+			c, err := t.Clone()
+			if err != nil {
+				return "", err
+			}
+			if c, err = bindIncludes(c, depth).New("gotpl").Parse(text); err != nil {
+				return "", err
+			}
+			var b strings.Builder
+			if err := c.Execute(&b, data); err != nil {
+				return "", err
+			}
+			return strings.ReplaceAll(b.String(), "<no value>", ""), nil
+		},
+	})
 }
 
 // funcMap is sprig's text functions with Helm's changes: nothing that reads
