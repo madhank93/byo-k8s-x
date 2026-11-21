@@ -62,6 +62,7 @@ func init() {
 	register(Stage{Slug: "release-storage", Run: stageReleaseStorage})
 	register(Stage{Slug: "list-status", Run: stageListStatus})
 	register(Stage{Slug: "history", Run: stageHistory})
+	register(Stage{Slug: "upgrade-3way-merge", Run: stageUpgrade})
 }
 
 const chartYAML = `apiVersion: v2
@@ -2529,4 +2530,322 @@ func stageHistory(ctx context.Context, env *kube.Env, bin string) error {
 		}
 	}
 	return nil
+}
+
+// upChart is the chart the upgrade stages move between: a ConfigMap whose
+// "changing" key differs by version, one identical in every version, and a
+// third that only one version has.
+func upChart(version, changing, third string) map[string]string {
+	cm := func(name, data string) string {
+		return "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-" + name + "\ndata:\n" + data
+	}
+	return map[string]string{
+		"Chart.yaml":          "apiVersion: v2\nname: up\nversion: " + version + "\n",
+		"values.yaml":         "color: red\nsize: small\n",
+		"templates/NOTES.txt": "color={{ .Values.color }} size={{ .Values.size }}\n",
+		"templates/cm.yaml": cm("main", "  steady: \"same\"\n  changing: \""+changing+"\"\n  color: {{ .Values.color | quote }}\n  size: {{ .Values.size | quote }}\n") +
+			"---\n" + cm("untouched", "  k: \"v\"\n") + "---\n" + cm(third, "  k: \"v\"\n"),
+	}
+}
+
+// upCharts writes version 1 (with -dropped), version 2 (with -fresh instead)
+// and a broken version 3: version 2 plus an object the API server rejects.
+func upCharts(w *work) (v1, v2, bad string) {
+	b := upChart("3.0.0", "new", "fresh")
+	delete(b, "templates/NOTES.txt")
+	b["templates/cm.yaml"] += "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-Invalid_Name\ndata:\n  k: \"v\"\n"
+	return w.chart("up-v1", upChart("1.0.0", "old", "dropped")), w.chart("up-v2", upChart("2.0.0", "new", "fresh")), w.chart("up-bad", b)
+}
+
+// editConfigMap changes a live ConfigMap the way a person with kubectl would.
+func editConfigMap(ctx context.Context, env *kube.Env, name string, data, labels map[string]string) error {
+	cms := env.Client.CoreV1().ConfigMaps(env.Namespace)
+	cm, err := cms.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("ConfigMap %s, which the install should have created: %w", name, err)
+	}
+	for k, v := range data {
+		cm.Data[k] = v
+	}
+	for k, v := range labels {
+		cm.Labels[k] = v
+	}
+	if _, err := cms.Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("edit ConfigMap %s: %w", name, err)
+	}
+	return nil
+}
+
+func wantData(ctx context.Context, env *kube.Env, name string, want map[string]string, why string) error {
+	cm, err := env.ConfigMap(ctx, name)
+	if err != nil {
+		return fmt.Errorf("ConfigMap %s should exist %s: %w", name, why, err)
+	}
+	if !reflect.DeepEqual(cm.Data, want) {
+		return fmt.Errorf("ConfigMap %s should hold %v %s, got %v", name, want, why, cm.Data)
+	}
+	return nil
+}
+
+func wantGone(ctx context.Context, env *kube.Env, name, why string) error {
+	if _, err := env.ConfigMap(ctx, name); !apierrors.IsNotFound(err) {
+		return fmt.Errorf("ConfigMap %s should not exist %s (err: %v)", name, why, err)
+	}
+	return nil
+}
+
+// wantStep runs one command of the program and wants it to exit 0.
+func wantStep(w *work, args ...string) (*runner.Result, error) {
+	res, err := w.run(args...)
+	if err != nil {
+		return nil, err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return nil, fmt.Errorf("%s: %w", strings.Join(args, " "), err)
+	}
+	return res, nil
+}
+
+// wantHelmHistory reads a release with the real helm and wants each revision's
+// status and description; a description ending in "*" is a prefix.
+func wantHelmHistory(w *work, name string, want [][2]string) error {
+	res, err := w.helm("history", "-o", "json", name)
+	if err != nil {
+		return err
+	}
+	var h []struct {
+		Revision    int    `json:"revision"`
+		Status      string `json:"status"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal([]byte(res.Stdout), &h); err != nil {
+		return fmt.Errorf("helm history %s, run by the real helm against your records: %v\n%s", name, err, tail(res.Stderr))
+	}
+	var got, exp []string
+	for i, r := range h {
+		d := r.Description
+		if i < len(want) {
+			if p, ok := strings.CutSuffix(want[i][1], "*"); ok && strings.HasPrefix(d, p) {
+				d = want[i][1]
+			}
+		}
+		got = append(got, fmt.Sprintf("%d %s %q", r.Revision, r.Status, d))
+	}
+	for i, r := range want {
+		exp = append(exp, fmt.Sprintf("%d %s %q", i+1, r[0], r[1]))
+	}
+	if strings.Join(got, "\n") != strings.Join(exp, "\n") {
+		return fmt.Errorf("helm history %s, run by the real helm against your records, should list (revision, status, description; * ends a prefix):\n  %s\ngot:\n  %s", name, strings.Join(exp, "\n  "), strings.Join(got, "\n  "))
+	}
+	return nil
+}
+
+// stageUpgrade — upgrade records the next revision and patches the cluster
+// with Helm's three-way merge: what the chart declares is reset, what only the
+// cluster knows survives, dropped objects go and new ones are created. Values
+// carry over only when none are given, a failed upgrade leaves the deployed
+// revision deployed, and an unowned object in the way records nothing.
+func stageUpgrade(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := needHelm(w); err != nil {
+		return err
+	}
+	ns := env.Namespace
+	v1, v2, bad := upCharts(w)
+	summary := func(first string, rev int, notes string) string {
+		return first + "NAME: up-web\nLAST DEPLOYED: *\nNAMESPACE: " + ns + "\nSTATUS: deployed\nREVISION: " + strconv.Itoa(rev) + "\nNOTES:\n" + notes + "\n"
+	}
+	upgraded := "Release \"up-web\" has been upgraded. Happy Helming!\n"
+
+	if _, err := wantStep(w, "install", "--set", "color=blue", "up-web", v1); err != nil {
+		return err
+	}
+	start := time.Now().Add(-time.Second)
+	if err := editConfigMap(ctx, env, "up-web-main", map[string]string{"steady": "edited-live", "changing": "edited-live", "liveadded": "yes"}, map[string]string{"live": "label"}); err != nil {
+		return err
+	}
+	if err := editConfigMap(ctx, env, "up-web-untouched", map[string]string{"k": "edited-live", "extra": "live"}, nil); err != nil {
+		return err
+	}
+	res, err := wantStep(w, "upgrade", "up-web", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantSummary(res.Stdout, summary(upgraded, 2, "color=blue size=small"), "upgrade up-web to version 2 with no values given: the last revision's color=blue carries over"); err != nil {
+		return err
+	}
+	why := "after the upgrade: keys the chart declares take the chart's value, even where the chart did not change them, and keys only the cluster has survive"
+	if err := wantData(ctx, env, "up-web-main", map[string]string{"steady": "same", "changing": "new", "color": "blue", "size": "small", "liveadded": "yes"}, why); err != nil {
+		return err
+	}
+	if err := wantData(ctx, env, "up-web-untouched", map[string]string{"k": "v", "extra": "live"}, why+" (web-untouched is the same in both versions, and still patched)"); err != nil {
+		return err
+	}
+	cm, err := env.ConfigMap(ctx, "up-web-main")
+	if err != nil {
+		return err
+	}
+	if cm.Labels["live"] != "label" {
+		return fmt.Errorf("the label live=label, added to up-web-main in the cluster, should survive the upgrade: the chart never mentions it. Labels are %v", cm.Labels)
+	}
+	if err := wantMarks(cm, "up-web", ns); err != nil {
+		return err
+	}
+	if err := wantGone(ctx, env, "up-web-dropped", "after the upgrade: version 2 of the chart no longer has it"); err != nil {
+		return err
+	}
+	fresh, err := env.ConfigMap(ctx, "up-web-fresh")
+	if err != nil {
+		return fmt.Errorf("the upgrade should create up-web-fresh, new in version 2: %w", err)
+	}
+	if err := wantMarks(fresh, "up-web", ns); err != nil {
+		return err
+	}
+	r1, err := wantRecord(ctx, env, "up-web", 1, "superseded", start.Add(-time.Minute), time.Now().Add(time.Second))
+	if err != nil {
+		return fmt.Errorf("%w (an upgrade supersedes the revision it replaces)", err)
+	}
+	r2, err := wantRecord(ctx, env, "up-web", 2, "deployed", start, time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	for _, c := range []struct {
+		path      string
+		got, want any
+	}{
+		{"info.description", dig(r2, "info", "description"), "Upgrade complete"},
+		{"info.first_deployed (the install's)", dig(r2, "info", "first_deployed"), dig(r1, "info", "first_deployed")},
+		{"chart.metadata.version", dig(r2, "chart", "metadata", "version"), "2.0.0"},
+		{"config (the last revision's, since none were given)", r2["config"], map[string]any{"color": "blue"}},
+		{"manifest (what template prints for version 2)", strings.Contains(fmt.Sprint(r2["manifest"]), "name: up-web-fresh") && !strings.Contains(fmt.Sprint(r2["manifest"]), "up-web-dropped"), true},
+	} {
+		if !reflect.DeepEqual(c.got, c.want) {
+			return fmt.Errorf("revision 2's %s should be %s, got %s", c.path, jsonText(c.want), jsonText(c.got))
+		}
+	}
+
+	// Values carry over only when none are given, unless asked.
+	for _, c := range []struct {
+		args   []string
+		rev    int
+		notes  string
+		config any
+		what   string
+	}{
+		{[]string{"--set", "size=big"}, 3, "color=red size=big", map[string]any{"size": "big"}, "--set size=big: any value given replaces the last revision's, so color is the chart's again"},
+		{[]string{"--reuse-values", "--set", "color=green"}, 4, "color=green size=big", map[string]any{"color": "green", "size": "big"}, "--reuse-values --set color=green: the new values over the last revision's"},
+		{nil, 5, "color=green size=big", map[string]any{"color": "green", "size": "big"}, "no values: the last revision's again"},
+		{[]string{"--reset-values"}, 6, "color=red size=small", nil, "--reset-values: the chart's defaults only, and no user values recorded"},
+	} {
+		args := append(append([]string{"upgrade"}, c.args...), "up-web", v2)
+		res, err := wantStep(w, args...)
+		if err != nil {
+			return err
+		}
+		if err := wantSummary(res.Stdout, summary(upgraded, c.rev, c.notes), "upgrade "+c.what); err != nil {
+			return err
+		}
+		rec, err := wantRecord(ctx, env, "up-web", c.rev, "deployed", start, time.Now().Add(time.Second))
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(rec["config"], c.config) {
+			return fmt.Errorf("upgrade %s\nrevision %d's config should be %s, got %s", c.what, c.rev, jsonText(c.config), jsonText(rec["config"]))
+		}
+	}
+
+	if res, err = w.run("upgrade", "up-nosuch", v2); err != nil {
+		return err
+	}
+	if err := wantRefusal(res, `UPGRADE FAILED: "up-nosuch" has no deployed releases`, "upgrade up-nosuch, a release that does not exist"); err != nil {
+		return err
+	}
+	if err := wantRevisions(ctx, env, "up-nosuch", 0); err != nil {
+		return err
+	}
+	res, err = wantStep(w, "upgrade", "--install", "up-via", v2)
+	if err != nil {
+		return err
+	}
+	if err := wantSummary(strings.ReplaceAll(res.Stdout, "up-via", "up-web"), summary("Release \"up-web\" does not exist. Installing it now.\n", 1, "color=red size=small"), "upgrade --install up-via, which does not exist yet (up-via written as up-web here)"); err != nil {
+		return err
+	}
+	rec, err := wantRecord(ctx, env, "up-via", 1, "deployed", start, time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	if d := dig(rec, "info", "description"); d != "Install complete" {
+		return fmt.Errorf("upgrade --install of a new release is an install: revision 1's description should be \"Install complete\", got %v", d)
+	}
+	if res, err = wantStep(w, "upgrade", "-i", "up-via", v2); err != nil {
+		return err
+	}
+	if !strings.HasPrefix(res.Stdout, "Release \"up-via\" has been upgraded. Happy Helming!\n") {
+		return fmt.Errorf("upgrade -i up-via, which exists now, is a plain upgrade, printing Release \"up-via\" has been upgraded. Happy Helming! first; got:\n%s", tail(res.Stdout))
+	}
+
+	// A failed upgrade is recorded, and the deployed revision stays deployed.
+	if res, err = w.run("upgrade", "up-web", bad); err != nil {
+		return err
+	}
+	if err := wantRefusal(res, "Error: UPGRADE FAILED: failed to create resource: ", "upgrade up-web to a chart with the invalid name up-web-Invalid_Name"); err != nil {
+		return err
+	}
+	rec, err = wantRecord(ctx, env, "up-web", 7, "failed", start, time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	if d, _ := dig(rec, "info", "description").(string); !strings.HasPrefix(d, `Upgrade "up-web" failed: failed to create resource: `) || !strings.Contains(d, "is invalid") {
+		return fmt.Errorf(`a failed upgrade's info.description is Upgrade "up-web" failed: <the error>, got %q`, d)
+	}
+	if _, err := wantRecord(ctx, env, "up-web", 6, "deployed", start, time.Now().Add(time.Second)); err != nil {
+		return fmt.Errorf("%w (a failed upgrade supersedes nothing)", err)
+	}
+	// The next upgrade starts from revision 6, the deployed one, whose
+	// up-web-fresh is already gone from the cluster.
+	if err := env.Client.CoreV1().ConfigMaps(ns).Delete(ctx, "up-web-fresh", metav1.DeleteOptions{}); err != nil {
+		return err
+	}
+	if res, err = wantStep(w, "upgrade", "up-web", v1); err != nil {
+		return fmt.Errorf("%w\n(up-web-fresh, which version 1 drops, was already deleted by hand: deleting what is not there is not an error)", err)
+	}
+	if err := wantSummary(res.Stdout, summary(upgraded, 8, "color=red size=small"), "upgrade up-web back to version 1 after the failed revision 7"); err != nil {
+		return err
+	}
+	if err := wantData(ctx, env, "up-web-dropped", map[string]string{"k": "v"}, "again: version 1 has it"); err != nil {
+		return err
+	}
+	if err := wantHelmHistory(w, "up-web", [][2]string{
+		{"superseded", "Install complete"}, {"superseded", "Upgrade complete"}, {"superseded", "Upgrade complete"},
+		{"superseded", "Upgrade complete"}, {"superseded", "Upgrade complete"}, {"superseded", "Upgrade complete"},
+		{"failed", `Upgrade "up-web" failed: failed to create resource: *`}, {"deployed", "Upgrade complete"},
+	}); err != nil {
+		return fmt.Errorf("%w\n(revision 8 supersedes the deployed revision 6; the failed 7 stays failed)", err)
+	}
+
+	// An object new to the release, in the way and unowned, refuses the
+	// upgrade before anything is recorded or touched.
+	if _, err := wantStep(w, "install", "up-own", v1); err != nil {
+		return err
+	}
+	if err := seedConfigMap(ctx, env, "up-own-fresh", nil, nil); err != nil {
+		return err
+	}
+	if res, err = w.run("upgrade", "up-own", v2); err != nil {
+		return err
+	}
+	if err := wantRefusal(res, `UPGRADE FAILED: Unable to continue with update: ConfigMap "up-own-fresh" in namespace "`+ns+`" exists and cannot be imported into the current release: invalid ownership metadata; label validation error: missing key "app.kubernetes.io/managed-by": must be set to "Helm"`, "upgrade up-own to version 2, whose up-own-fresh exists unowned"); err != nil {
+		return err
+	}
+	if err := wantRevisions(ctx, env, "up-own", 1); err != nil {
+		return fmt.Errorf("%w: the ownership check refuses before a revision is recorded", err)
+	}
+	if err := wantData(ctx, env, "up-own-dropped", map[string]string{"k": "v"}, "after the refused upgrade: nothing is touched"); err != nil {
+		return err
+	}
+	return wantData(ctx, env, "up-own-fresh", nil, "after the refused upgrade, as it was seeded: empty")
 }

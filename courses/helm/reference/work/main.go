@@ -42,6 +42,10 @@
 //
 // Stage 14: `history [--max N] NAME` and `get manifest|values|notes
 // [--revision N] NAME` read any revision.
+//
+// Stage 15: `upgrade [-i] [--reuse-values|--reset-values] NAME DIR` adds a
+// revision, patching live objects with a three-way merge of the old manifest,
+// the new one and what is in the cluster.
 
 package main
 
@@ -72,10 +76,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/jsonmergepatch"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/yaml"
@@ -122,6 +130,11 @@ func run(cmd string, args []string) error {
 	fs.BoolVar(&short, "short", false, "print release names only")
 	histMax := fs.Int("max", 256, "maximum number of revisions in the history")
 	revision := fs.Int("revision", 0, "the revision to get, 0 for the latest")
+	var up upgradeOpts
+	fs.BoolVar(&up.install, "i", false, "install the release if it does not exist")
+	fs.BoolVar(&up.install, "install", false, "install the release if it does not exist")
+	fs.BoolVar(&up.reuse, "reuse-values", false, "merge the new values over the last release's")
+	fs.BoolVar(&up.reset, "reset-values", false, "use only the new values and the chart's defaults")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -191,6 +204,11 @@ func run(cmd string, args []string) error {
 			return fmt.Errorf("INSTALLATION FAILED: %w", err)
 		}
 		return nil
+	case "upgrade":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: upgrade [-n NS] [-i] [-f FILE]... [--set k=v]... NAME DIR")
+		}
+		return upgrade(args[0], args[1], namespace, files, sets, up)
 	case "list":
 		if len(args) != 0 {
 			return fmt.Errorf(`"helm list" accepts no arguments`)
@@ -998,6 +1016,16 @@ type Rendered struct {
 // renderRelease is the whole pipeline for a release: load, merge and check
 // the values, render, split and order.
 func renderRelease(dir string, files, sets []string, rel Release) (*Rendered, error) {
+	user, err := userValues(files, sets)
+	if err != nil {
+		return nil, err
+	}
+	return renderWith(dir, user, rel)
+}
+
+// renderWith renders a chart for a release with the user's values already
+// decided, as upgrade does after choosing whether to reuse the last ones.
+func renderWith(dir string, user map[string]any, rel Release) (*Rendered, error) {
 	if !releaseName.MatchString(rel.Name) || len(rel.Name) > 53 {
 		return nil, fmt.Errorf("release name %q: invalid release name, must match regex %s and the length must not be longer than 53", rel.Name, releaseName)
 	}
@@ -1006,10 +1034,6 @@ func renderRelease(dir string, files, sets []string, rel Release) (*Rendered, er
 		return nil, err
 	}
 	if err := missingDeps(c); err != nil {
-		return nil, err
-	}
-	user, err := userValues(files, sets)
-	if err != nil {
 		return nil, err
 	}
 	vals, err := checkedValues(c, user)
@@ -1476,4 +1500,230 @@ func history(ns, name string, limit int) error {
 	}
 	printTable(rows)
 	return nil
+}
+
+type upgradeOpts struct{ install, reuse, reset bool }
+
+// upgrade renders the chart as the release's next revision and moves the live
+// objects from the deployed revision's manifest to the new one.
+func upgrade(name, dir, ns string, files, sets []string, opts upgradeOpts) error {
+	k, err := connect()
+	if err != nil {
+		return err
+	}
+	h, err := k.history(ns, name)
+	if err != nil {
+		return err
+	}
+	if len(h) == 0 && opts.install {
+		fmt.Printf("Release %q does not exist. Installing it now.\n", name)
+		return install(name, dir, ns, files, sets)
+	}
+	if err := upgradeRelease(k, h, name, dir, ns, files, sets, opts); err != nil {
+		return fmt.Errorf("UPGRADE FAILED: %w", err)
+	}
+	return nil
+}
+
+func upgradeRelease(k *kube, h []*Record, name, dir, ns string, files, sets []string, opts upgradeOpts) error {
+	if len(h) == 0 {
+		return fmt.Errorf("%q has no deployed releases", name)
+	}
+	last := h[len(h)-1]
+	// The patch starts from the deployed revision; with none, from the last.
+	current := last
+	for _, r := range h {
+		if r.Info.Status == "deployed" {
+			current = r
+		}
+	}
+	user, err := userValues(files, sets)
+	if err != nil {
+		return err
+	}
+	switch {
+	case opts.reset:
+	case opts.reuse:
+		under(user, current.Config)
+	case len(user) == 0:
+		user = current.Config
+	}
+	rel := Release{Name: name, Namespace: ns, Revision: last.Version + 1, IsUpgrade: true, Service: "Helm"}
+	r, err := renderWith(dir, user, rel)
+	if err != nil {
+		return err
+	}
+	target, err := k.objects(r.Manifests, ns)
+	if err != nil {
+		return err
+	}
+	old, err := k.objects(parseManifest(current.Manifest), ns)
+	if err != nil {
+		return err
+	}
+	// Only objects the release does not have yet are checked for ownership.
+	orig := map[string]*unstructured.Unstructured{}
+	for _, o := range old {
+		orig[objectKey(o.obj)] = o.obj
+	}
+	for _, o := range target {
+		if orig[objectKey(o.obj)] != nil {
+			continue
+		}
+		live, err := k.get(o)
+		if err != nil {
+			return err
+		}
+		if live != nil {
+			if err := owned(live, name, ns); err != nil {
+				return fmt.Errorf("Unable to continue with update: %w", err)
+			}
+		}
+	}
+	rec := &Record{
+		Name: name, Namespace: ns, Version: rel.Revision,
+		Info: &Info{FirstDeployed: current.Info.FirstDeployed, LastDeployed: Time{time.Now()},
+			Status: "pending-upgrade", Description: "Preparing upgrade", Notes: r.Notes},
+		Chart:    storedChart(r.Chart),
+		Config:   user,
+		Manifest: manifestText(r.Manifests),
+	}
+	if err := k.saveRecord(rec, false); err != nil {
+		return err
+	}
+	if err := k.update(old, target, name, ns); err != nil {
+		rec.Info.Status = "failed"
+		rec.Info.Description = fmt.Sprintf("Upgrade %q failed: %s", name, err)
+		if serr := k.saveRecord(rec, true); serr != nil {
+			return serr
+		}
+		return err
+	}
+	current.Info.Status = "superseded"
+	if err := k.saveRecord(current, true); err != nil {
+		return err
+	}
+	rec.Info.Status, rec.Info.Description = "deployed", "Upgrade complete"
+	if err := k.saveRecord(rec, true); err != nil {
+		return err
+	}
+	fmt.Printf("Release %q has been upgraded. Happy Helming!\n", name)
+	printRelease(rec)
+	return nil
+}
+
+// under fills dst with the keys of src it lacks, merging nested maps; what dst
+// already says wins.
+func under(dst, src map[string]any) {
+	for k, v := range src {
+		dv, ok := dst[k]
+		if !ok {
+			dst[k] = v
+			continue
+		}
+		dm, dok := dv.(map[string]any)
+		sm, sok := v.(map[string]any)
+		if dok && sok {
+			under(dm, sm)
+		}
+	}
+}
+
+// parseManifest splits a recorded manifest back into its documents.
+func parseManifest(text string) []File {
+	var out []File
+	for _, d := range docSep.Split(strings.TrimSpace(text), -1) {
+		if strings.TrimSpace(d) != "" {
+			out = append(out, File{Name: "manifest", Data: []byte(d)})
+		}
+	}
+	return out
+}
+
+func objectKey(o *unstructured.Unstructured) string {
+	return o.GroupVersionKind().GroupKind().String() + "/" + o.GetNamespace() + "/" + o.GetName()
+}
+
+// update moves the cluster from the old objects to the target ones: creates
+// what is missing, patches what exists with a three-way merge, then deletes
+// what the target no longer has.
+func (k *kube) update(old, target []object, name, ns string) error {
+	orig := map[string]*unstructured.Unstructured{}
+	for _, o := range old {
+		orig[objectKey(o.obj)] = o.obj
+	}
+	keep := map[string]bool{}
+	for _, o := range target {
+		keep[objectKey(o.obj)] = true
+		mark(o.obj, name, ns)
+		live, err := k.get(o)
+		if err != nil {
+			return err
+		}
+		if live == nil {
+			if _, err := o.res.Create(k.ctx, o.obj, metav1.CreateOptions{FieldManager: "helm"}); err != nil {
+				return fmt.Errorf("failed to create resource: %w", err)
+			}
+			continue
+		}
+		// An object the release adopts starts from what is live.
+		original := orig[objectKey(o.obj)]
+		if original == nil {
+			original = live
+		}
+		if err := k.patch(o, original, live); err != nil {
+			return fmt.Errorf("cannot patch %q with kind %s: %w", o.obj.GetName(), o.obj.GetKind(), err)
+		}
+	}
+	for _, o := range old {
+		if keep[objectKey(o.obj)] {
+			continue
+		}
+		if err := o.res.Delete(k.ctx, o.obj.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// patch is Helm's three-way merge: the change from the old manifest to the new
+// one, computed against the live object, so that a field only the cluster
+// knows survives while a field the chart declares is reset to the chart's
+// value. Built-in kinds get a strategic merge patch, anything else a JSON
+// merge patch.
+func (k *kube) patch(o object, original, live *unstructured.Unstructured) error {
+	oj, err := json.Marshal(original.Object)
+	if err != nil {
+		return err
+	}
+	mj, err := json.Marshal(o.obj.Object)
+	if err != nil {
+		return err
+	}
+	lj, err := json.Marshal(live.Object)
+	if err != nil {
+		return err
+	}
+	var p []byte
+	pt := types.StrategicMergePatchType
+	if typed, err := scheme.Scheme.New(o.obj.GroupVersionKind()); err == nil {
+		meta, err := strategicpatch.NewPatchMetaFromStruct(typed)
+		if err != nil {
+			return err
+		}
+		p, err = strategicpatch.CreateThreeWayMergePatch(oj, mj, lj, meta, true)
+		if err != nil {
+			return err
+		}
+	} else {
+		pt = types.MergePatchType
+		if p, err = jsonmergepatch.CreateThreeWayJSONMergePatch(oj, mj, lj); err != nil {
+			return err
+		}
+	}
+	if string(p) == "{}" {
+		return nil
+	}
+	_, err = o.res.Patch(k.ctx, o.obj.GetName(), pt, p, metav1.PatchOptions{FieldManager: "helm"})
+	return err
 }
