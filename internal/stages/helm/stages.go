@@ -63,6 +63,7 @@ func init() {
 	register(Stage{Slug: "list-status", Run: stageListStatus})
 	register(Stage{Slug: "history", Run: stageHistory})
 	register(Stage{Slug: "upgrade-3way-merge", Run: stageUpgrade})
+	register(Stage{Slug: "rollback", Run: stageRollback})
 }
 
 const chartYAML = `apiVersion: v2
@@ -2848,4 +2849,157 @@ func stageUpgrade(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	return wantData(ctx, env, "up-own-fresh", nil, "after the refused upgrade, as it was seeded: empty")
+}
+
+// stageRollback — a rollback is a new revision copying an old one's chart,
+// values, notes and manifest, reached with the same three-way patch as an
+// upgrade. No revision means the one below the latest, whatever its status;
+// a failed rollback is recorded, and supersedes the revision it started from.
+func stageRollback(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := needHelm(w); err != nil {
+		return err
+	}
+	ns := env.Namespace
+	v1, v2, bad := upCharts(w)
+	start := time.Now().Add(-time.Second)
+	if _, err := wantStep(w, "install", "--set", "color=blue", "rb", v1); err != nil {
+		return err
+	}
+	if _, err := wantStep(w, "upgrade", "--set", "size=big", "rb", v2); err != nil {
+		return err
+	}
+	if err := editConfigMap(ctx, env, "rb-main", map[string]string{"steady": "edited", "liveadded": "yes"}, nil); err != nil {
+		return err
+	}
+	success := "Rollback was a success! Happy Helming!\n"
+	res, err := wantStep(w, "rollback", "rb", "1")
+	if err != nil {
+		return err
+	}
+	if err := wantExact(res.Stdout, success, "rollback rb 1"); err != nil {
+		return err
+	}
+	why := "after rollback rb 1: revision 1's manifest and values, patched three ways like an upgrade"
+	if err := wantData(ctx, env, "rb-main", map[string]string{"steady": "same", "changing": "old", "color": "blue", "size": "small", "liveadded": "yes"}, why); err != nil {
+		return err
+	}
+	if err := wantGone(ctx, env, "rb-fresh", why+": revision 1 does not have it"); err != nil {
+		return err
+	}
+	dropped, err := env.ConfigMap(ctx, "rb-dropped")
+	if err != nil {
+		return fmt.Errorf("rb-dropped should be created again %s: %w", why, err)
+	}
+	if err := wantMarks(dropped, "rb", ns); err != nil {
+		return err
+	}
+	r1, err := wantRecord(ctx, env, "rb", 1, "superseded", start, time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	if _, err := wantRecord(ctx, env, "rb", 2, "superseded", start, time.Now().Add(time.Second)); err != nil {
+		return fmt.Errorf("%w (the rollback supersedes the deployed revision)", err)
+	}
+	r3, err := wantRecord(ctx, env, "rb", 3, "deployed", start, time.Now().Add(time.Second))
+	if err != nil {
+		return fmt.Errorf("%w (a rollback adds a revision; it never rewinds to an old one)", err)
+	}
+	for _, c := range []struct {
+		path      string
+		got, want any
+	}{
+		{"info.description", dig(r3, "info", "description"), "Rollback to 1"},
+		{"info.notes (revision 1's)", dig(r3, "info", "notes"), "color=blue size=small\n"},
+		{"info.first_deployed (the install's)", dig(r3, "info", "first_deployed"), dig(r1, "info", "first_deployed")},
+		{"chart.metadata.version (revision 1's chart)", dig(r3, "chart", "metadata", "version"), "1.0.0"},
+		{"config (revision 1's values)", r3["config"], map[string]any{"color": "blue"}},
+		{"manifest (revision 1's)", r3["manifest"], r1["manifest"]},
+	} {
+		if !reflect.DeepEqual(c.got, c.want) {
+			return fmt.Errorf("after rollback rb 1, revision 3's %s should be %s, got %s", c.path, jsonText(c.want), jsonText(c.got))
+		}
+	}
+
+	// No revision, or 0, is the one below the latest.
+	for _, args := range [][]string{{"rollback", "rb"}, {"rollback", "rb", "0"}, {"rollback", "rb", "4"}} {
+		if res, err = wantStep(w, args...); err != nil {
+			return err
+		}
+		if err := wantExact(res.Stdout, success, strings.Join(args, " ")); err != nil {
+			return err
+		}
+	}
+	r4, err := wantRecord(ctx, env, "rb", 4, "superseded", start, time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	if got, want := dig(r4, "info", "first_deployed"), dig(r1, "info", "first_deployed"); got != want {
+		return fmt.Errorf("revision 4, rollback rb to revision 2, should keep the install's info.first_deployed %v, got %v", want, got)
+	}
+	if err := wantGone(ctx, env, "rb-dropped", "after rollback rb 4: revision 4, a rollback to 2, holds version 2 of the chart"); err != nil {
+		return err
+	}
+
+	if _, err := wantStep(w, "install", "rb-solo", v1); err != nil {
+		return err
+	}
+	for _, c := range []struct {
+		args []string
+		text string
+	}{
+		{[]string{"rollback", "rb", "99"}, "Error: release has no 99 version"},
+		{[]string{"rollback", "rb-solo"}, "Error: release has no 0 version"},
+		{[]string{"rollback", "rb-nosuch", "1"}, "Error: release: not found"},
+		{[]string{"rollback", "rb-nosuch"}, "Error: release: not found"},
+		{[]string{"rollback", "rb", "abc"}, `Error: could not convert revision to a number: strconv.Atoi: parsing "abc": invalid syntax`},
+	} {
+		if res, err = w.run(c.args...); err != nil {
+			return err
+		}
+		if err := wantRefusal(res, c.text, strings.Join(c.args, " ")); err != nil {
+			return err
+		}
+	}
+	if err := wantRevisions(ctx, env, "rb", 6); err != nil {
+		return fmt.Errorf("%w: a refused rollback records nothing", err)
+	}
+
+	// Rolling back from a failed upgrade goes to the revision below it.
+	if res, err = w.run("upgrade", "rb", bad); err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("upgrade rb to a chart with the invalid name rb-Invalid_Name: %w", err)
+	}
+	if res, err = wantStep(w, "rollback", "rb"); err != nil {
+		return err
+	}
+	// Revision 7's manifest is invalid, so rolling back to it fails.
+	if res, err = w.run("rollback", "rb", "7"); err != nil {
+		return err
+	}
+	if err := wantRefusal(res, "Error: failed to create resource: ", "rollback rb 7, whose manifest has the invalid name rb-Invalid_Name"); err != nil {
+		return err
+	}
+	if strings.Contains(res.Stderr, "FAILED") {
+		return fmt.Errorf("a failed rollback prints the error alone, with no ROLLBACK FAILED in front, as Helm does; stderr was:\n%s", tail(res.Stderr))
+	}
+	if err := wantHelmHistory(w, "rb", [][2]string{
+		{"superseded", "Install complete"}, {"superseded", "Upgrade complete"}, {"superseded", "Rollback to 1"},
+		{"superseded", "Rollback to 2"}, {"superseded", "Rollback to 3"}, {"superseded", "Rollback to 4"},
+		{"failed", `Upgrade "rb" failed: failed to create resource: *`}, {"superseded", "Rollback to 6"},
+		{"failed", `Rollback "rb" failed: failed to create resource: *`},
+	}); err != nil {
+		return fmt.Errorf("%w\n(rollback rb after the failed 7 is Rollback to 6; the failed rollback to 7 supersedes 8, leaving nothing deployed)", err)
+	}
+	res, err = w.helm("get", "values", "rb", "--revision", "8")
+	if err != nil {
+		return err
+	}
+	return wantExact(res.Stdout, "USER-SUPPLIED VALUES:\nsize: big\n", "helm get values rb --revision 8, run by the real helm: a rollback to 6 holds revision 6's values, which go back through 4 to revision 2's")
 }

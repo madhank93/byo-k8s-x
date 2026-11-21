@@ -46,6 +46,9 @@
 // Stage 15: `upgrade [-i] [--reuse-values|--reset-values] NAME DIR` adds a
 // revision, patching live objects with a three-way merge of the old manifest,
 // the new one and what is in the cluster.
+//
+// Stage 16: `rollback NAME [REVISION]` records a new revision holding an old
+// one's chart, values and manifest, and moves the cluster to it.
 
 package main
 
@@ -209,6 +212,19 @@ func run(cmd string, args []string) error {
 			return fmt.Errorf("usage: upgrade [-n NS] [-i] [-f FILE]... [--set k=v]... NAME DIR")
 		}
 		return upgrade(args[0], args[1], namespace, files, sets, up)
+	case "rollback":
+		if len(args) != 1 && len(args) != 2 {
+			return fmt.Errorf("usage: rollback [-n NS] NAME [REVISION]")
+		}
+		to := 0
+		if len(args) == 2 {
+			n, err := strconv.Atoi(args[1])
+			if err != nil {
+				return fmt.Errorf("could not convert revision to a number: %w", err)
+			}
+			to = n
+		}
+		return rollback(args[0], namespace, to)
 	case "list":
 		if len(args) != 0 {
 			return fmt.Errorf(`"helm list" accepts no arguments`)
@@ -1726,4 +1742,79 @@ func (k *kube) patch(o object, original, live *unstructured.Unstructured) error 
 	}
 	_, err = o.res.Patch(k.ctx, o.obj.GetName(), pt, p, metav1.PatchOptions{FieldManager: "helm"})
 	return err
+}
+
+// rollback records the next revision as a copy of revision to (the one below
+// the latest when to is 0) and moves the cluster from the latest revision's
+// manifest to it.
+func rollback(name, ns string, to int) error {
+	k, err := connect()
+	if err != nil {
+		return err
+	}
+	h, err := k.history(ns, name)
+	if err != nil {
+		return err
+	}
+	if len(h) == 0 {
+		return errNotFound
+	}
+	current := h[len(h)-1]
+	if to == 0 {
+		to = current.Version - 1
+	}
+	var prev *Record
+	for _, r := range h {
+		if r.Version == to {
+			prev = r
+		}
+	}
+	if prev == nil {
+		return fmt.Errorf("release has no %d version", to)
+	}
+	rec := &Record{
+		Name: name, Namespace: ns, Version: current.Version + 1,
+		Info: &Info{FirstDeployed: current.Info.FirstDeployed, LastDeployed: Time{time.Now()},
+			Status: "pending-rollback", Description: fmt.Sprintf("Rollback to %d", to), Notes: prev.Info.Notes},
+		Chart:    prev.Chart,
+		Config:   prev.Config,
+		Manifest: prev.Manifest,
+	}
+	if err := k.saveRecord(rec, false); err != nil {
+		return err
+	}
+	old, err := k.objects(parseManifest(current.Manifest), ns)
+	if err != nil {
+		return err
+	}
+	target, err := k.objects(parseManifest(prev.Manifest), ns)
+	if err != nil {
+		return err
+	}
+	if err := k.update(old, target, name, ns); err != nil {
+		// Unlike a failed upgrade, a failed rollback supersedes the latest.
+		current.Info.Status = "superseded"
+		rec.Info.Status = "failed"
+		rec.Info.Description = fmt.Sprintf("Rollback %q failed: %s", name, err)
+		for _, r := range []*Record{current, rec} {
+			if serr := k.saveRecord(r, true); serr != nil {
+				return serr
+			}
+		}
+		return err
+	}
+	for _, r := range h {
+		if r.Info.Status == "deployed" {
+			r.Info.Status = "superseded"
+			if err := k.saveRecord(r, true); err != nil {
+				return err
+			}
+		}
+	}
+	rec.Info.Status = "deployed"
+	if err := k.saveRecord(rec, true); err != nil {
+		return err
+	}
+	fmt.Println("Rollback was a success! Happy Helming!")
+	return nil
 }
