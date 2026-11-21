@@ -23,10 +23,14 @@
 // slice of the values plus the parent's globals.
 //
 // Stage 8: Chart.yaml's dependency conditions and tags switch subcharts off.
+//
+// Stage 9: merged values are validated against each chart's
+// values.schema.json before anything renders.
 
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -40,6 +44,7 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/Masterminds/sprig/v3"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	"sigs.k8s.io/yaml"
 )
 
@@ -99,7 +104,11 @@ func run(cmd string, args []string) error {
 		if err != nil {
 			return err
 		}
-		out, err := yaml.Marshal(enabledValues(c, user))
+		vals, err := checkedValues(c, user)
+		if err != nil {
+			return err
+		}
+		out, err := yaml.Marshal(vals)
 		if err != nil {
 			return err
 		}
@@ -118,7 +127,11 @@ func run(cmd string, args []string) error {
 			return err
 		}
 		rel := Release{Name: args[0], Namespace: namespace, Revision: 1, IsInstall: true, Service: "Helm"}
-		docs, err := render(c, enabledValues(c, user), rel)
+		vals, err := checkedValues(c, user)
+		if err != nil {
+			return err
+		}
+		docs, err := render(c, vals, rel)
 		if err != nil {
 			return err
 		}
@@ -182,6 +195,7 @@ type Chart struct {
 	Values    map[string]any
 	Templates []File
 	Subcharts []*Chart
+	Schema    []byte // values.schema.json, if the chart has one
 	Files     Files
 }
 
@@ -215,6 +229,11 @@ func load(dir string) (*Chart, error) {
 		c.Metadata.APIVersion = "v1"
 	}
 	if err := validate(c.Metadata); err != nil {
+		return nil, err
+	}
+	if raw, err := os.ReadFile(filepath.Join(dir, "values.schema.json")); err == nil {
+		c.Schema = raw
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	c.Values = map[string]any{}
@@ -398,6 +417,54 @@ func enabledValues(c *Chart, user map[string]any) map[string]any {
 	tags, _ := all["tags"].(map[string]any)
 	prune(c, all, tags)
 	return chartValues(c, user)
+}
+
+// checkedValues is the values a render sees, refused when any chart's schema
+// rejects its part of them.
+func checkedValues(c *Chart, user map[string]any) (map[string]any, error) {
+	vals := enabledValues(c, user)
+	if msg := schemaErrors(c, vals); msg != "" {
+		return nil, fmt.Errorf("values don't meet the specifications of the schema(s) in the following chart(s):\n%s", msg)
+	}
+	return vals, nil
+}
+
+// schemaErrors validates each chart's values against its own schema, the
+// subcharts' against their slice, and lists the failures under chart names.
+func schemaErrors(c *Chart, vals map[string]any) string {
+	var b strings.Builder
+	if c.Schema != nil {
+		if err := validateSchema(c.Schema, vals); err != nil {
+			fmt.Fprintf(&b, "%s:\n%s\n", c.Metadata.Name, err)
+		}
+	}
+	for _, sub := range c.Subcharts {
+		sv, _ := vals[sub.Metadata.Name].(map[string]any)
+		b.WriteString(schemaErrors(sub, sv))
+	}
+	return b.String()
+}
+
+// validateSchema uses the library and the resource name Helm does, so the
+// messages match Helm's: "- at '/replicas': minimum: got 0, want 1".
+func validateSchema(schemaJSON []byte, vals map[string]any) error {
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(schemaJSON))
+	if err != nil {
+		return err
+	}
+	const url = "file:///values.schema.json"
+	comp := jsonschema.NewCompiler()
+	if err := comp.AddResource(url, doc); err != nil {
+		return err
+	}
+	sch, err := comp.Compile(url)
+	if err != nil {
+		return err
+	}
+	if err := sch.Validate(vals); err != nil {
+		return errors.New(strings.TrimPrefix(err.Error(), "jsonschema validation failed with '"+url+"#'\n"))
+	}
+	return nil
 }
 
 // prune removes disabled subcharts, at every level. Tags always come from the

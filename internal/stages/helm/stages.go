@@ -44,6 +44,7 @@ func init() {
 	register(Stage{Slug: "named-templates", Run: stageNamedTemplates})
 	register(Stage{Slug: "subcharts", Run: stageSubcharts})
 	register(Stage{Slug: "conditions", Run: stageConditions})
+	register(Stage{Slug: "values-schema", Run: stageValuesSchema})
 }
 
 const chartYAML = `apiVersion: v2
@@ -1066,6 +1067,114 @@ data:
 		}
 		if len(c.sets) == 1 && c.sets[0] == "db.enabled=false" && !strings.Contains(res.Stdout, `  db: '{"enabled":false,"port":6543}'`+"\n") {
 			return fmt.Errorf("with db switched off, shop's .Values.db is only what shop's values say, since db's defaults and globals are never merged in; expected\n  db: '{\"enabled\":false,\"port\":6543}'\ngot:\n%s", tail(res.Stdout))
+		}
+	}
+	return nil
+}
+
+// stageValuesSchema — merged values are checked against values.schema.json
+// before anything renders, each subchart's slice against its own schema and
+// a disabled subchart's not at all; a failure names the chart and the path.
+func stageValuesSchema(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	files := shopChart()
+	files["Chart.yaml"] = `apiVersion: v2
+name: shop
+version: 1.0.0
+dependencies:
+  - name: db
+    version: 0.3.0
+    condition: db.enabled
+`
+	files["values.yaml"] = `global:
+  env: prod
+  region: eu
+db:
+  port: 6543
+  extra:
+    added: yes
+cache:
+  enabled: true
+replicas: 2
+image:
+  tag: "1.0"
+  pullPolicy: IfNotPresent
+`
+	files["values.schema.json"] = `{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["replicas"],
+  "properties": {
+    "replicas": {"type": "integer", "minimum": 1},
+    "image": {
+      "type": "object",
+      "properties": {"tag": {"type": "string"}, "pullPolicy": {"enum": ["Always", "IfNotPresent"]}}
+    }
+  }
+}
+`
+	files["charts/db/values.schema.json"] = `{"type": "object", "properties": {"port": {"type": "integer", "maximum": 65535}}}
+`
+	files["templates/app.yaml"] = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}
+data:
+  replicas: {{ .Values.replicas | quote }}
+`
+	dir := w.chart("shop", files)
+
+	for _, sets := range [][]string{nil, {"db.enabled=false", "db.port=70000"}} {
+		args := []string{"template"}
+		for _, s := range sets {
+			args = append(args, "--set", s)
+		}
+		res, err := w.run(append(args, "web", dir)...)
+		if err != nil {
+			return err
+		}
+		if err := wantExit(res, 0); err != nil {
+			if sets != nil {
+				return fmt.Errorf("db is switched off, so its schema does not apply, and db.port=70000 is no error: %w", err)
+			}
+			return fmt.Errorf("the chart's own values fit its schemas: %w", err)
+		}
+	}
+
+	float := w.file("float.yaml", "replicas: 2.5\n")
+	for _, c := range []struct {
+		args []string
+		want []string
+		why  string
+	}{
+		{[]string{"--set", "replicas=0"}, []string{"shop", "/replicas"}, "shop's schema says replicas has a minimum of 1"},
+		{[]string{"--set", "replicas=two"}, []string{"shop", "/replicas"}, "replicas must be an integer, not a string"},
+		{[]string{"-f", float}, []string{"shop", "/replicas"}, "2.5 is a number but not an integer"},
+		{[]string{"--set", "replicas=null"}, []string{"shop", "replicas"}, "the null deletes replicas, which the schema requires"},
+		{[]string{"--set", "image.pullPolicy=Never"}, []string{"shop", "/image/pullPolicy"}, "pullPolicy must be Always or IfNotPresent"},
+		{[]string{"--set", "db.port=70000"}, []string{"db", "/port"}, "db's own schema caps port at 65535"},
+		{[]string{"--set", "image.tag=5", "--set", "replicas=0"}, []string{"/replicas", "/image/tag"}, "both values are wrong, and every failure is reported, not only the first"},
+	} {
+		res, err := w.run(append(append([]string{"template"}, c.args...), "web", dir)...)
+		if err != nil {
+			return err
+		}
+		what := strings.Join(c.args, " ")
+		if err := wantError(res); err != nil {
+			return fmt.Errorf("%s: %s: %w", what, c.why, err)
+		}
+		if strings.Contains(res.Stdout, "# Source:") {
+			return fmt.Errorf("%s: %s, so nothing should render, but stdout was:\n%s", what, c.why, tail(res.Stdout))
+		}
+		for _, s := range c.want {
+			if !strings.Contains(res.Stderr, s) {
+				return fmt.Errorf("%s: %s; the error should name %q, but stderr was:\n%s", what, c.why, s, tail(res.Stderr))
+			}
 		}
 	}
 	return nil
