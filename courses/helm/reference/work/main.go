@@ -15,6 +15,9 @@
 //
 // Stage 5: templates call Helm's functions: sprig's, less env and expandenv,
 // plus toYaml and required.
+//
+// Stage 6: templates define named templates and call them with template,
+// include and tpl.
 
 package main
 
@@ -394,8 +397,28 @@ func typedVal(v string) any {
 // results in path order. All files are parsed into one set so that any of them
 // can call a template another defines.
 func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
-	t := template.New("gotpl").Option("missingkey=zero").Funcs(funcMap())
-	for _, f := range c.Templates {
+	t := template.New("gotpl").Option("missingkey=zero")
+	fm := funcMap()
+	// include and tpl close over the set, so they see every define in the chart.
+	fm["include"] = func(name string, data any) (string, error) {
+		var b strings.Builder
+		err := t.ExecuteTemplate(&b, name, data)
+		return b.String(), err
+	}
+	fm["tpl"] = func(text string, data any) (string, error) {
+		c, err := t.Clone()
+		if err != nil {
+			return "", err
+		}
+		if c, err = c.New("gotpl").Parse(text); err != nil {
+			return "", err
+		}
+		var b strings.Builder
+		err = c.Execute(&b, data)
+		return b.String(), err
+	}
+	t.Funcs(fm)
+	for _, f := range parseOrder(c.Templates) {
 		if _, err := t.New(c.Metadata.Name + "/" + f.Name).Parse(string(f.Data)); err != nil {
 			return nil, err
 		}
@@ -425,6 +448,21 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 		}
 	}
 	return out, nil
+}
+
+// parseOrder is the order Helm parses templates in: deepest paths first, and
+// within a depth in reverse. A later define replaces an earlier one, so the
+// shallowest, lexically first definition of a name wins.
+func parseOrder(files []File) []File {
+	out := append([]File(nil), files...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i].Name, out[j].Name
+		if da, db := strings.Count(a, "/"), strings.Count(b, "/"); da != db {
+			return da > db
+		}
+		return a > b
+	})
+	return out
 }
 
 // funcMap is sprig's text functions with Helm's changes: nothing that reads

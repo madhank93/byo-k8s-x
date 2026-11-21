@@ -41,6 +41,7 @@ func init() {
 	register(Stage{Slug: "template-engine", Run: stageTemplateEngine})
 	register(Stage{Slug: "builtin-objects", Run: stageBuiltinObjects})
 	register(Stage{Slug: "template-functions", Run: stageTemplateFunctions})
+	register(Stage{Slug: "named-templates", Run: stageNamedTemplates})
 }
 
 const chartYAML = `apiVersion: v2
@@ -654,6 +655,134 @@ data:
 		}
 	}
 	return nil
+}
+
+// stageNamedTemplates — define, template, include and tpl: named templates
+// from any file, partial or not, called with any data, piped through
+// functions, and template text taken from values that can itself include.
+func stageNamedTemplates(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	files := map[string]string{
+		"Chart.yaml": chartYAML,
+		"values.yaml": `labels:
+  tier: web
+greeting: "hello from {{ .Release.Name }} in {{ .Template.Name }}"
+nameRef: '{{ template "demo.fullname" . }}-ref'
+`,
+		"templates/_helpers.tpl": `{{/* The release-qualified name, cut to Kubernetes' limit. */}}
+{{- define "demo.fullname" -}}
+{{ printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" }}
+{{- end -}}
+
+{{- define "demo.labels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- range $k, $v := .Values.labels }}
+{{ $k }}: {{ $v }}
+{{- end }}
+{{- end -}}
+
+{{- define "demo.pair" -}}
+{{ .k }}={{ .v }}
+{{- end -}}
+`,
+		"templates/cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "demo.fullname" . }}
+  labels:
+    {{- include "demo.labels" . | nindent 4 }}
+data:
+  pair: {{ include "demo.pair" (dict "k" "color" "v" "blue") | quote }}
+  upper: {{ include "demo.fullname" . | upper }}
+  greeting: {{ tpl .Values.greeting . | quote }}
+  ref: {{ tpl .Values.nameRef . }}
+  local: {{ template "demo.local" . }}
+`,
+		"templates/other.yaml": `{{- define "demo.local" -}}
+defined-in-other-{{ .Chart.Version }}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "demo.fullname" . }}-other
+`,
+	}
+	res, err := w.run("template", "web", w.chart("demo", files))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := wantExact(res.Stdout, `---
+# Source: demo/templates/cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-demo
+  labels:
+    app.kubernetes.io/name: demo
+    app.kubernetes.io/instance: web
+    tier: web
+data:
+  pair: "color=blue"
+  upper: WEB-DEMO
+  greeting: "hello from web in demo/templates/cm.yaml"
+  ref: web-demo-ref
+  local: defined-in-other-1.2.3
+---
+# Source: demo/templates/other.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-demo-other
+`, "release web: named templates from _helpers.tpl and other.yaml, called with include, template and tpl"); err != nil {
+		return err
+	}
+
+	files["templates/missing.yaml"] = `name: {{ include "demo.nope" . }}` + "\n"
+	if res, err = w.run("template", "web", w.chart("missing", files)); err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return fmt.Errorf("templates/missing.yaml includes \"demo.nope\", which no file defines, so the render must fail, but the program exited 0 with:\n%s", tail(res.Stdout))
+	}
+	if !strings.Contains(res.Stderr, "demo.nope") {
+		return fmt.Errorf("an include of an undefined template failed, but the error should name it, \"demo.nope\"; stderr was:\n%s", tail(res.Stderr))
+	}
+
+	// Helm parses deepest paths first, then reverse lexical, and a later define
+	// replaces an earlier one: the shallowest, lexically first file wins.
+	dir := w.chart("precedence", map[string]string{
+		"Chart.yaml":             chartYAML,
+		"templates/_a.tpl":       `{{- define "x" }}from-_a{{ end }}` + "\n",
+		"templates/_b.tpl":       `{{- define "x" }}from-_b{{ end }}` + "\n" + `{{- define "y" }}shallow-_b{{ end }}` + "\n",
+		"templates/sub/_c.tpl":   `{{- define "x" }}from-sub{{ end }}` + "\n",
+		"templates/_a/_deep.tpl": `{{- define "y" }}deep-_a{{ end }}` + "\n",
+		"templates/cm.yaml":      "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ template \"x\" }}\ndata:\n  y: {{ include \"y\" . }}\n",
+	})
+	if res, err = w.run("template", "web", dir); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	return wantExact(res.Stdout, `---
+# Source: demo/templates/cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: from-_a
+data:
+  y: shallow-_b
+`, `"x" defined in _a.tpl, _b.tpl and sub/_c.tpl, and "y" in _b.tpl and _a/_deep.tpl:
+Helm keeps the define from the shallowest path, and at one depth the lexically first`)
 }
 
 // work is one stage's scratch space: a directory for charts and values files,
