@@ -125,7 +125,7 @@ func unlistableAPI(ctx context.Context, env *kube.Env) (string, func(), error) {
 	}
 	as := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apiregistration.k8s.io/v1", "kind": "APIService",
-		"metadata": map[string]any{"name": name},
+		"metadata": map[string]any{"name": name, "labels": map[string]any{kube.GraderAPILabel: "safe-apply-unlistable"}},
 		"spec": map[string]any{
 			"group": group, "version": "v1", "groupPriorityMinimum": int64(1000), "versionPriority": int64(15),
 			"caBundle": base64.StdEncoding.EncodeToString(ca),
