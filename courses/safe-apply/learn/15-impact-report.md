@@ -30,8 +30,9 @@ Every piece already exists; this stage puts them in one place:
   action      comes from
   ─────────   ──────────────────────────────────────────────────────
   create      live fetch found nothing                     (stage 2)
-  update      dry-run result differs from live             (stage 6)
-  unchanged   dry-run result is the same as live
+  update      dry-run result differs from live             (stage 6),
+              or apply would change what byok8s owns       (stage 8)
+  unchanged   the same, and byok8s already applied all of it
   delete      a leftover of the set, with --prune          (stage 12)
   kept        a leftover marked prune: disabled            (stage 13)
 ```
@@ -41,6 +42,13 @@ manifest that leaves out a defaulted field is not asking for a change, nor is
 one that writes a ResourceQuota's `cpu: 1000m` the server stores as `"1"`, and
 only the server knows what it would default or normalise. A kept leftover is
 named but not counted: it is not going anywhere.
+
+The comparison ignores `managedFields`, and that hides one kind of write. An
+object another client created with exactly the manifest's content looks the
+same before and after, but applying it still writes: byok8s takes ownership of
+its fields. So compare ownership too. If the dry-run's `Apply` entry for
+byok8s differs from live's, or live has none, the object is an `update`. Once
+byok8s has applied it, the two entries match and it is `unchanged`.
 
 The totals line comes last and always has all four counts, in that order. A
 refusal is reported the way `diff` reports it and the object is left out of
