@@ -45,6 +45,7 @@ func init() {
 	register(Stage{Slug: "subcharts", Run: stageSubcharts})
 	register(Stage{Slug: "conditions", Run: stageConditions})
 	register(Stage{Slug: "values-schema", Run: stageValuesSchema})
+	register(Stage{Slug: "manifest-split", Run: stageManifestSplit})
 }
 
 const chartYAML = `apiVersion: v2
@@ -1176,6 +1177,264 @@ data:
 				return fmt.Errorf("%s: %s; the error should name %q, but stderr was:\n%s", what, c.why, s, tail(res.Stderr))
 			}
 		}
+	}
+	return nil
+}
+
+// stageManifestSplit — rendered files split into documents, each under its
+// file's Source header, ordered as Helm installs: by Helm's kind table, then
+// unknown kinds alphabetically, and otherwise in path and document order.
+// --show-only picks templates; a document that is not YAML fails the render.
+func stageManifestSplit(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	files := map[string]string{
+		"Chart.yaml": "apiVersion: v2\nname: web\nversion: 1.0.0\n",
+		"templates/all.yaml": `# a leading comment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+---
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-b
+---
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w
+--- # trailing comment
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+`,
+		"templates/a-cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-a
+---
+apiVersion: example.com/v1
+kind: Gadget
+metadata:
+  name: g
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa
+`,
+		"templates/z-crd.yaml": `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: r
+---
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w0
+`,
+	}
+	dir := w.chart("web", files)
+	res, err := w.run("template", "r", dir)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := wantExact(res.Stdout, `---
+# Source: web/templates/all.yaml
+# trailing comment
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+# Source: web/templates/a-cm.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa
+---
+# Source: web/templates/a-cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-a
+---
+# Source: web/templates/all.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-b
+---
+# Source: web/templates/z-crd.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+---
+# Source: web/templates/z-crd.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: r
+---
+# Source: web/templates/all.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+---
+# Source: web/templates/all.yaml
+# a leading comment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+---
+# Source: web/templates/a-cm.yaml
+apiVersion: example.com/v1
+kind: Gadget
+metadata:
+  name: g
+---
+# Source: web/templates/all.yaml
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w
+---
+# Source: web/templates/z-crd.yaml
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w0
+`, `three files of several documents each, split on Helm's separator (which keeps
+"--- # trailing comment" as a comment line, and leaves the "---" of an empty
+document at the start of the next), sorted by kind`); err != nil {
+		return err
+	}
+
+	res, err = w.run("template", "-s", "templates/a-cm.yaml", "--show-only", "templates/z-crd.yaml", "r", dir)
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := wantExact(res.Stdout, `---
+# Source: web/templates/a-cm.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa
+---
+# Source: web/templates/a-cm.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-a
+---
+# Source: web/templates/a-cm.yaml
+apiVersion: example.com/v1
+kind: Gadget
+metadata:
+  name: g
+---
+# Source: web/templates/z-crd.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+---
+# Source: web/templates/z-crd.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: r
+---
+# Source: web/templates/z-crd.yaml
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w0
+`, "-s templates/a-cm.yaml --show-only templates/z-crd.yaml: each pattern's documents in turn, in kind order"); err != nil {
+		return err
+	}
+
+	res, err = w.run("template", "-s", "templates/nope.yaml", "r", dir)
+	if err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("--show-only templates/nope.yaml names no template in the chart: %w", err)
+	}
+	if !strings.Contains(res.Stderr, "templates/nope.yaml") {
+		return fmt.Errorf("--show-only templates/nope.yaml failed, but the error should name it; stderr was:\n%s", tail(res.Stderr))
+	}
+
+	files["templates/broken.yaml"] = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: [x\n"
+	if res, err = w.run("template", "r", w.chart("broken", files)); err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("templates/broken.yaml renders to YAML that does not parse, which Helm refuses before anything is printed: %w", err)
+	}
+	if !strings.Contains(res.Stderr, "web/templates/broken.yaml") {
+		return fmt.Errorf("the YAML parse error should name the file, web/templates/broken.yaml; stderr was:\n%s", tail(res.Stderr))
+	}
+	if strings.Contains(res.Stdout, "# Source:") {
+		return fmt.Errorf("a file that does not parse stops the whole render, but stdout was:\n%s", tail(res.Stdout))
+	}
+
+	// Every kind in Helm's table, written in reverse, plus two it does not
+	// know: the known ones come back in table order, the unknown after them.
+	kinds := []string{"PriorityClass", "Namespace", "NetworkPolicy", "ResourceQuota", "LimitRange", "PodSecurityPolicy", "PodDisruptionBudget", "ServiceAccount", "Secret", "SecretList", "ConfigMap", "StorageClass", "PersistentVolume", "PersistentVolumeClaim", "CustomResourceDefinition", "ClusterRole", "ClusterRoleList", "ClusterRoleBinding", "ClusterRoleBindingList", "Role", "RoleList", "RoleBinding", "RoleBindingList", "Service", "DaemonSet", "Pod", "ReplicationController", "ReplicaSet", "Deployment", "HorizontalPodAutoscaler", "StatefulSet", "Job", "CronJob", "IngressClass", "Ingress", "APIService"}
+	var docs []string
+	for i := len(kinds) - 1; i >= 0; i-- {
+		docs = append(docs, "kind: "+kinds[i]+"\nmetadata:\n  name: x")
+	}
+	docs = append(docs, "kind: Zeta\nmetadata:\n  name: x", "kind: Alpha\nmetadata:\n  name: x")
+	ordered := w.chart("kinds", map[string]string{
+		"Chart.yaml":         "apiVersion: v2\nname: kinds\nversion: 1.0.0\n",
+		"templates/all.yaml": strings.Join(docs, "\n---\n") + "\n",
+	})
+	if res, err = w.run("template", "r", ordered); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	var got []string
+	for _, l := range strings.Split(res.Stdout, "\n") {
+		if k, ok := strings.CutPrefix(l, "kind: "); ok {
+			got = append(got, k)
+		}
+	}
+	want := append(append([]string{}, kinds...), "Alpha", "Zeta")
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		return fmt.Errorf("documents of every kind Helm orders, given in reverse, plus the unknown kinds Zeta and Alpha:\nexpected kinds in this order:\n  %s\ngot:\n  %s", strings.Join(want, " "), strings.Join(got, " "))
 	}
 	return nil
 }

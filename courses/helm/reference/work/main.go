@@ -26,6 +26,9 @@
 //
 // Stage 9: merged values are validated against each chart's
 // values.schema.json before anything renders.
+//
+// Stage 10: rendered files split into documents, ordered by kind as Helm
+// installs them; --show-only picks templates.
 
 package main
 
@@ -37,6 +40,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,6 +77,9 @@ func run(cmd string, args []string) error {
 	fs.StringVar(&namespace, "namespace", "default", "release namespace")
 	fs.Var(&files, "f", "values file (repeatable)")
 	fs.Var(&sets, "set", "key=value (repeatable)")
+	var show multi
+	fs.Var(&show, "s", "only show manifests from this template (repeatable)")
+	fs.Var(&show, "show-only", "only show manifests from this template (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -135,8 +142,17 @@ func run(cmd string, args []string) error {
 		if err != nil {
 			return err
 		}
-		for _, d := range docs {
-			fmt.Printf("---\n# Source: %s\n%s\n", d.Name, d.Data)
+		ms, err := manifests(docs)
+		if err != nil {
+			return err
+		}
+		if len(show) > 0 {
+			if ms, err = showOnly(ms, show); err != nil {
+				return err
+			}
+		}
+		for _, m := range ms {
+			fmt.Printf("---\n# Source: %s\n%s\n", m.Name, m.Data)
 		}
 		return nil
 	}
@@ -666,6 +682,93 @@ func parseOrder(files []File) []File {
 		return a > b
 	})
 	return out
+}
+
+// installOrder is Helm's InstallOrder: the kinds a release creates first.
+var installOrder = []string{
+	"PriorityClass", "Namespace", "NetworkPolicy", "ResourceQuota", "LimitRange",
+	"PodSecurityPolicy", "PodDisruptionBudget", "ServiceAccount", "Secret",
+	"SecretList", "ConfigMap", "StorageClass", "PersistentVolume",
+	"PersistentVolumeClaim", "CustomResourceDefinition", "ClusterRole",
+	"ClusterRoleList", "ClusterRoleBinding", "ClusterRoleBindingList", "Role",
+	"RoleList", "RoleBinding", "RoleBindingList", "Service", "DaemonSet", "Pod",
+	"ReplicationController", "ReplicaSet", "Deployment", "HorizontalPodAutoscaler",
+	"StatefulSet", "Job", "CronJob", "IngressClass", "Ingress", "APIService",
+}
+
+// docSep is Helm's document separator, kept exact: it also decides what
+// whitespace and comments stay with each document.
+var docSep = regexp.MustCompile("(?:^|\\s*\n)---\\s*")
+
+// manifests splits rendered files into documents, each named by its file,
+// and orders them by kind: known kinds by installOrder, then unknown kinds
+// alphabetically, and within a kind in file-path and document order.
+func manifests(files []File) ([]File, error) {
+	rank := map[string]int{}
+	for i, k := range installOrder {
+		rank[k] = i
+	}
+	var out []File
+	var kinds []string
+	for _, f := range files {
+		for _, d := range docSep.Split(strings.TrimSpace(string(f.Data)), -1) {
+			if d == "" {
+				continue
+			}
+			d = strings.TrimSpace(d)
+			var head struct {
+				Kind string `json:"kind"`
+			}
+			if err := yaml.Unmarshal([]byte(d), &head); err != nil {
+				return nil, fmt.Errorf("YAML parse error on %s: %w", f.Name, err)
+			}
+			out = append(out, File{Name: f.Name, Data: []byte(d)})
+			kinds = append(kinds, head.Kind)
+		}
+	}
+	idx := make([]int, len(out))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(i, j int) bool {
+		a, b := kinds[idx[i]], kinds[idx[j]]
+		ra, aok := rank[a]
+		rb, bok := rank[b]
+		switch {
+		case !aok && !bok:
+			return a < b
+		case !aok || !bok:
+			return aok
+		}
+		return ra < rb
+	})
+	sorted := make([]File, len(out))
+	for i, j := range idx {
+		sorted[i] = out[j]
+	}
+	return sorted, nil
+}
+
+// showOnly keeps the manifests whose template path, without the chart name,
+// matches each pattern in turn; a pattern matching nothing is an error.
+// ponytail: matches documents directly; Helm re-splits its printed output,
+// which differs only for a document that itself begins with "---".
+func showOnly(ms []File, patterns []string) ([]File, error) {
+	var out []File
+	for _, p := range patterns {
+		found := false
+		for _, m := range ms {
+			_, rel, _ := strings.Cut(m.Name, "/")
+			if ok, _ := filepath.Match(filepath.ToSlash(p), rel); ok {
+				out = append(out, m)
+				found = true
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("could not find template %s in chart", p)
+		}
+	}
+	return out, nil
 }
 
 // funcMap is sprig's text functions with Helm's changes: nothing that reads
