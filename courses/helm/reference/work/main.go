@@ -21,6 +21,8 @@
 //
 // Stage 7: charts under charts/ render with the parent, each seeing its own
 // slice of the values plus the parent's globals.
+//
+// Stage 8: Chart.yaml's dependency conditions and tags switch subcharts off.
 
 package main
 
@@ -97,7 +99,7 @@ func run(cmd string, args []string) error {
 		if err != nil {
 			return err
 		}
-		out, err := yaml.Marshal(chartValues(c, user))
+		out, err := yaml.Marshal(enabledValues(c, user))
 		if err != nil {
 			return err
 		}
@@ -116,7 +118,7 @@ func run(cmd string, args []string) error {
 			return err
 		}
 		rel := Release{Name: args[0], Namespace: namespace, Revision: 1, IsInstall: true, Service: "Helm"}
-		docs, err := render(c, chartValues(c, user), rel)
+		docs, err := render(c, enabledValues(c, user), rel)
 		if err != nil {
 			return err
 		}
@@ -384,6 +386,71 @@ func chartValues(c *Chart, user map[string]any) map[string]any {
 			sv["global"] = sg
 		}
 		v[sub.Metadata.Name] = chartValues(sub, sv)
+	}
+	return v
+}
+
+// enabledValues drops the subcharts that conditions and tags switch off, then
+// merges the values of the ones left. Conditions are judged against values
+// merged with every subchart present, so a subchart's own defaults count.
+func enabledValues(c *Chart, user map[string]any) map[string]any {
+	all := chartValues(c, user)
+	tags, _ := all["tags"].(map[string]any)
+	prune(c, all, tags)
+	return chartValues(c, user)
+}
+
+// prune removes disabled subcharts, at every level. Tags always come from the
+// top chart's values.
+func prune(c *Chart, vals, tags map[string]any) {
+	var keep []*Chart
+	for _, sub := range c.Subcharts {
+		if enabled(c.Metadata.Dependencies, sub.Metadata.Name, vals, tags) {
+			sv, _ := vals[sub.Metadata.Name].(map[string]any)
+			prune(sub, sv, tags)
+			keep = append(keep, sub)
+		}
+	}
+	c.Subcharts = keep
+}
+
+// enabled applies Helm's rule: the first condition path holding a boolean
+// decides; failing that, any listed tag set true enables and a false one
+// disables; with neither, the subchart stays on.
+// ponytail: dependencies match by name; alias arrives with dependency build.
+func enabled(deps []Dependency, name string, vals, tags map[string]any) bool {
+	for _, d := range deps {
+		if d.Name != name {
+			continue
+		}
+		for _, p := range strings.Split(d.Condition, ",") {
+			if b, ok := pathValue(vals, strings.TrimSpace(p)).(bool); ok {
+				return b
+			}
+		}
+		on := true
+		for _, t := range d.Tags {
+			if b, ok := tags[t].(bool); ok {
+				if b {
+					return true
+				}
+				on = false
+			}
+		}
+		return on
+	}
+	return true
+}
+
+// pathValue reads a dotted path such as db.enabled, or nil if it is not there.
+func pathValue(vals map[string]any, path string) any {
+	var v any = vals
+	for _, k := range strings.Split(path, ".") {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return nil
+		}
+		v = m[k]
 	}
 	return v
 }

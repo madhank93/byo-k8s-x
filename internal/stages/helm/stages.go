@@ -43,6 +43,7 @@ func init() {
 	register(Stage{Slug: "template-functions", Run: stageTemplateFunctions})
 	register(Stage{Slug: "named-templates", Run: stageNamedTemplates})
 	register(Stage{Slug: "subcharts", Run: stageSubcharts})
+	register(Stage{Slug: "conditions", Run: stageConditions})
 }
 
 const chartYAML = `apiVersion: v2
@@ -959,6 +960,112 @@ values are what shop's own templates see under .Values.db`); err != nil {
 		}
 		if err := wantError(res); err != nil {
 			return fmt.Errorf("%s is not a chart, and Helm loads everything in charts/ as one: %w", file, err)
+		}
+	}
+	return nil
+}
+
+// stageConditions — Chart.yaml's dependencies switch subcharts off: the first
+// condition path holding a boolean decides, then tags, where any true tag
+// enables and a false one disables; a disabled subchart renders nothing and
+// its defaults never reach the parent's values.
+func stageConditions(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+
+	files := shopChart()
+	files["Chart.yaml"] = `apiVersion: v2
+name: shop
+version: 1.0.0
+dependencies:
+  - name: db
+    version: 0.3.0
+    condition: db.enabled
+  - name: cache
+    version: 0.1.0
+    condition: cache.enabled,global.cache
+    tags: [frontend]
+  - name: queue
+    version: 0.1.0
+    condition: queue.enabled
+    tags: [backend]
+  - name: metrics
+    version: 0.1.0
+    tags: [backend, ops]
+`
+	files["values.yaml"] = `global:
+  env: prod
+db:
+  port: 6543
+cache:
+  enabled: "yes"
+tags:
+  backend: false
+`
+	files["templates/app.yaml"] = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app
+data:
+  db: {{ toJson .Values.db | squote }}
+`
+	for _, sub := range []string{"queue", "metrics"} {
+		files["charts/"+sub+"/Chart.yaml"] = "apiVersion: v2\nname: " + sub + "\nversion: 0.1.0\n"
+		files["charts/"+sub+"/templates/cm.yaml"] = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " + sub + "\n"
+	}
+	files["charts/queue/values.yaml"] = "enabled: true\n"
+	dir := w.chart("shop", files)
+
+	src := func(subs ...string) []string {
+		var out []string
+		for _, s := range subs {
+			out = append(out, "# Source: shop/charts/"+s+"/templates/cm.yaml")
+		}
+		return append(out, "# Source: shop/templates/app.yaml")
+	}
+	for _, c := range []struct {
+		sets []string
+		want []string
+		why  string
+	}{
+		{nil, src("cache", "db", "queue"),
+			`cache.enabled is "yes", not a boolean, so it is skipped and cache stays on; queue's own default queue.enabled: true beats tags.backend: false; metrics has only tags, and backend is false`},
+		{[]string{"db.enabled=false"}, src("cache", "queue"), "db.enabled is false"},
+		{[]string{"tags.ops=true"}, src("cache", "db", "metrics", "queue"), "metrics is tagged backend and ops, and one true tag is enough"},
+		{[]string{"tags.backend=true", "queue.enabled=false"}, src("cache", "db", "metrics"), "queue.enabled: false is a condition, and a condition beats tags"},
+		{[]string{"global.cache=false"}, src("db", "queue"), "cache's condition is cache.enabled,global.cache: the first is not a boolean, the second is false"},
+		{[]string{"cache.enabled=false", "tags.frontend=true"}, src("db", "queue"), "cache.enabled: false decides before the frontend tag is looked at"},
+	} {
+		args := []string{"template"}
+		for _, s := range c.sets {
+			args = append(args, "--set", s)
+		}
+		res, err := w.run(append(args, "web", dir)...)
+		if err != nil {
+			return err
+		}
+		if err := wantExit(res, 0); err != nil {
+			return err
+		}
+		var got []string
+		for _, l := range strings.Split(res.Stdout, "\n") {
+			if strings.HasPrefix(l, "# Source: ") {
+				got = append(got, l)
+			}
+		}
+		if strings.Join(got, "\n") != strings.Join(c.want, "\n") {
+			what := "the chart's values"
+			if c.sets != nil {
+				what = "--set " + strings.Join(c.sets, " --set ")
+			}
+			return fmt.Errorf("with %s: %s; expected these documents:\n  %s\ngot:\n  %s",
+				what, c.why, strings.Join(c.want, "\n  "), strings.Join(got, "\n  "))
+		}
+		if len(c.sets) == 1 && c.sets[0] == "db.enabled=false" && !strings.Contains(res.Stdout, `  db: '{"enabled":false,"port":6543}'`+"\n") {
+			return fmt.Errorf("with db switched off, shop's .Values.db is only what shop's values say, since db's defaults and globals are never merged in; expected\n  db: '{\"enabled\":false,\"port\":6543}'\ngot:\n%s", tail(res.Stdout))
 		}
 	}
 	return nil
