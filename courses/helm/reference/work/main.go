@@ -29,11 +29,16 @@
 //
 // Stage 10: rendered files split into documents, ordered by kind as Helm
 // installs them; --show-only picks templates.
+//
+// Stage 11: `install [-n NS] [-f FILE]... [--set k=v]... NAME DIR` creates the
+// rendered objects in the cluster, marked as the release's, and refuses to take
+// over objects it does not own. The namespace defaults to the kubeconfig's.
 
 package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -45,10 +50,20 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/Masterminds/sprig/v3"
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/restmapper"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/yaml"
 )
 
@@ -73,8 +88,8 @@ func run(cmd string, args []string) error {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	var files, sets multi
 	var namespace string
-	fs.StringVar(&namespace, "n", "default", "release namespace")
-	fs.StringVar(&namespace, "namespace", "default", "release namespace")
+	fs.StringVar(&namespace, "n", "", "release namespace")
+	fs.StringVar(&namespace, "namespace", "", "release namespace")
 	fs.Var(&files, "f", "values file (repeatable)")
 	fs.Var(&sets, "set", "key=value (repeatable)")
 	var show multi
@@ -84,6 +99,9 @@ func run(cmd string, args []string) error {
 		return err
 	}
 	args = fs.Args()
+	if namespace == "" {
+		namespace = kubeNamespace()
+	}
 
 	switch cmd {
 	case "chart":
@@ -125,27 +143,12 @@ func run(cmd string, args []string) error {
 		if len(args) != 2 {
 			return fmt.Errorf("usage: template [-f FILE]... [--set k=v]... NAME DIR")
 		}
-		c, err := load(args[1])
-		if err != nil {
-			return err
-		}
-		user, err := userValues(files, sets)
-		if err != nil {
-			return err
-		}
 		rel := Release{Name: args[0], Namespace: namespace, Revision: 1, IsInstall: true, Service: "Helm"}
-		vals, err := checkedValues(c, user)
+		r, err := renderRelease(args[1], files, sets, rel)
 		if err != nil {
 			return err
 		}
-		docs, err := render(c, vals, rel)
-		if err != nil {
-			return err
-		}
-		ms, err := manifests(docs)
-		if err != nil {
-			return err
-		}
+		ms := r.Manifests
 		if len(show) > 0 {
 			if ms, err = showOnly(ms, show); err != nil {
 				return err
@@ -153,6 +156,14 @@ func run(cmd string, args []string) error {
 		}
 		for _, m := range ms {
 			fmt.Printf("---\n# Source: %s\n%s\n", m.Name, m.Data)
+		}
+		return nil
+	case "install":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: install [-n NS] [-f FILE]... [--set k=v]... NAME DIR")
+		}
+		if err := install(args[0], args[1], namespace, files, sets); err != nil {
+			return fmt.Errorf("INSTALLATION FAILED: %w", err)
 		}
 		return nil
 	}
@@ -596,7 +607,7 @@ func typedVal(v string) any {
 // render executes every template of the chart and returns the non-empty
 // results in path order. All files are parsed into one set so that any of them
 // can call a template another defines.
-func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
+func render(c *Chart, vals map[string]any, rel Release) ([]File, string, error) {
 	// Every chart's templates, named by their path from the top chart, each
 	// with the data its chart's templates see.
 	var all []File
@@ -639,13 +650,16 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 	t.Funcs(fm)
 	for _, f := range parseOrder(all) {
 		if _, err := t.New(f.Name).Parse(string(f.Data)); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	}
 	var out []File
+	var notes string
+	notesFile := c.Metadata.Name + "/templates/NOTES.txt"
 	for _, f := range all {
 		base := filepath.Base(f.Name)
-		if strings.HasPrefix(base, "_") || strings.HasSuffix(base, "NOTES.txt") {
+		// Only the top chart's notes are rendered; a subchart's are dropped.
+		if strings.HasPrefix(base, "_") || strings.HasSuffix(base, "NOTES.txt") && f.Name != notesFile {
 			continue
 		}
 		name, top := f.Name, data[f.Name]
@@ -658,15 +672,19 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, error) {
 		}
 		var b strings.Builder
 		if err := t.ExecuteTemplate(&b, name, d); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		// missingkey=zero prints a missing map key as "<no value>"; Helm blanks it.
-		text := strings.TrimSpace(strings.ReplaceAll(b.String(), "<no value>", ""))
-		if text != "" {
+		text := strings.ReplaceAll(b.String(), "<no value>", "")
+		if name == notesFile {
+			notes = text
+			continue
+		}
+		if text = strings.TrimSpace(text); text != "" {
 			out = append(out, File{Name: name, Data: []byte(text)})
 		}
 	}
-	return out, nil
+	return out, notes, nil
 }
 
 // parseOrder is the order Helm parses templates in: deepest paths first, and
@@ -799,4 +817,225 @@ func required(msg string, v any) (any, error) {
 		return v, errors.New(msg)
 	}
 	return v, nil
+}
+
+// kubeNamespace is the kubeconfig context's namespace, as kubectl picks it,
+// or "default" when there is no kubeconfig or the context names none.
+func kubeNamespace() string {
+	ns, _, err := kubeConfig().Namespace()
+	if err != nil || ns == "" {
+		return "default"
+	}
+	return ns
+}
+
+func kubeConfig() clientcmd.ClientConfig {
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
+}
+
+// releaseName is Helm's rule: a DNS subdomain of at most 53 characters, so
+// that names built from it still fit Kubernetes' limits.
+var releaseName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+
+// Rendered is a chart rendered for one release.
+type Rendered struct {
+	Chart     *Chart
+	Config    map[string]any // the user's values, before the chart's defaults
+	Manifests []File         // in install order
+	Notes     string
+}
+
+// renderRelease is the whole pipeline for a release: load, merge and check
+// the values, render, split and order.
+func renderRelease(dir string, files, sets []string, rel Release) (*Rendered, error) {
+	if !releaseName.MatchString(rel.Name) || len(rel.Name) > 53 {
+		return nil, fmt.Errorf("release name %q: invalid release name, must match regex %s and the length must not be longer than 53", rel.Name, releaseName)
+	}
+	c, err := load(dir)
+	if err != nil {
+		return nil, err
+	}
+	user, err := userValues(files, sets)
+	if err != nil {
+		return nil, err
+	}
+	vals, err := checkedValues(c, user)
+	if err != nil {
+		return nil, err
+	}
+	docs, notes, err := render(c, vals, rel)
+	if err != nil {
+		return nil, err
+	}
+	ms, err := manifests(docs)
+	if err != nil {
+		return nil, err
+	}
+	return &Rendered{Chart: c, Config: user, Manifests: ms, Notes: notes}, nil
+}
+
+// The marks that say which release an object belongs to.
+const (
+	managedBy      = "app.kubernetes.io/managed-by"
+	releaseNameKey = "meta.helm.sh/release-name"
+	releaseNSKey   = "meta.helm.sh/release-namespace"
+)
+
+func install(name, dir, ns string, files, sets []string) error {
+	rel := Release{Name: name, Namespace: ns, Revision: 1, IsInstall: true, Service: "Helm"}
+	r, err := renderRelease(dir, files, sets, rel)
+	if err != nil {
+		return err
+	}
+	k, err := connect()
+	if err != nil {
+		return err
+	}
+	objs, err := k.objects(r.Manifests, ns)
+	if err != nil {
+		return err
+	}
+	// Every object is checked before any is created, so a refusal leaves
+	// nothing behind.
+	for _, o := range objs {
+		live, err := k.get(o)
+		if err != nil {
+			return err
+		}
+		if live != nil {
+			if err := owned(live, name, ns); err != nil {
+				return fmt.Errorf("Unable to continue with install: %w", err)
+			}
+			// ponytail: an object already marked as this release's is not adopted; create fails on it.
+		}
+	}
+	for _, o := range objs {
+		mark(o.obj, name, ns)
+		if _, err := o.res.Create(k.ctx, o.obj, metav1.CreateOptions{FieldManager: "helm"}); err != nil {
+			return fmt.Errorf("failed to create resource: %w", err)
+		}
+	}
+	printRelease(name, ns, "deployed", 1, r.Notes, time.Now())
+	return nil
+}
+
+// printRelease is the summary install prints.
+func printRelease(name, ns, status string, revision int, notes string, deployed time.Time) {
+	fmt.Printf("NAME: %s\n", name)
+	fmt.Printf("LAST DEPLOYED: %s\n", deployed.Format(time.ANSIC))
+	fmt.Printf("NAMESPACE: %s\n", ns)
+	fmt.Printf("STATUS: %s\n", status)
+	fmt.Printf("REVISION: %d\n", revision)
+	fmt.Println("TEST SUITE: None")
+	if notes != "" {
+		fmt.Printf("NOTES:\n%s\n", strings.TrimSpace(notes))
+	}
+}
+
+// mark labels and annotates an object as the release's.
+func mark(o *unstructured.Unstructured, name, ns string) {
+	l := o.GetLabels()
+	if l == nil {
+		l = map[string]string{}
+	}
+	l[managedBy] = "Helm"
+	o.SetLabels(l)
+	a := o.GetAnnotations()
+	if a == nil {
+		a = map[string]string{}
+	}
+	a[releaseNameKey] = name
+	a[releaseNSKey] = ns
+	o.SetAnnotations(a)
+}
+
+// owned refuses an object that does not carry the release's marks, listing
+// every mark that is missing or wrong, as Helm does.
+func owned(live *unstructured.Unstructured, name, ns string) error {
+	var errs []string
+	check := func(what string, m map[string]string, key, want string) {
+		got, ok := m[key]
+		switch {
+		case !ok:
+			errs = append(errs, fmt.Sprintf("%s validation error: missing key %q: must be set to %q", what, key, want))
+		case got != want:
+			errs = append(errs, fmt.Sprintf("%s validation error: key %q must equal %q: current value is %q", what, key, want, got))
+		}
+	}
+	check("label", live.GetLabels(), managedBy, "Helm")
+	check("annotation", live.GetAnnotations(), releaseNameKey, name)
+	check("annotation", live.GetAnnotations(), releaseNSKey, ns)
+	if errs == nil {
+		return nil
+	}
+	return fmt.Errorf("%s %q in namespace %q exists and cannot be imported into the current release: invalid ownership metadata; %s",
+		live.GetKind(), live.GetName(), live.GetNamespace(), strings.Join(errs, "; "))
+}
+
+// kube reaches any kind: a dynamic client, and a mapper from kinds to the
+// resources that serve them.
+type kube struct {
+	ctx    context.Context
+	dyn    dynamic.Interface
+	mapper meta.RESTMapper
+}
+
+func connect() (*kube, error) {
+	cfg, err := kubeConfig().ClientConfig()
+	if err != nil {
+		return nil, err
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &kube{ctx: context.Background(), dyn: dyn,
+		mapper: restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))}, nil
+}
+
+// object is one manifest parsed, with the endpoint that serves it.
+type object struct {
+	obj *unstructured.Unstructured
+	res dynamic.ResourceInterface
+}
+
+// objects parses manifests. A namespaced object that names no namespace goes
+// in the release's; a cluster-scoped one never has one.
+func (k *kube) objects(ms []File, ns string) ([]object, error) {
+	var out []object
+	for _, m := range ms {
+		o := &unstructured.Unstructured{}
+		if err := yaml.Unmarshal(m.Data, &o.Object); err != nil {
+			return nil, fmt.Errorf("%s: %w", m.Name, err)
+		}
+		gvk := o.GroupVersionKind()
+		mapping, err := k.mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+		if err != nil {
+			return nil, fmt.Errorf("%s: resource mapping not found for name: %q kind: %q: %w", m.Name, o.GetName(), gvk.Kind, err)
+		}
+		if mapping.Scope.Name() != meta.RESTScopeNameNamespace {
+			o.SetNamespace("")
+			out = append(out, object{o, k.dyn.Resource(mapping.Resource)})
+			continue
+		}
+		if o.GetNamespace() == "" {
+			o.SetNamespace(ns)
+		}
+		out = append(out, object{o, k.dyn.Resource(mapping.Resource).Namespace(o.GetNamespace())})
+	}
+	return out, nil
+}
+
+// get is the live object, or nil when there is none.
+func (k *kube) get(o object) (*unstructured.Unstructured, error) {
+	live, err := o.res.Get(k.ctx, o.obj.GetName(), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	return live, err
 }

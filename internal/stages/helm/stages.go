@@ -14,7 +14,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
@@ -46,6 +50,7 @@ func init() {
 	register(Stage{Slug: "conditions", Run: stageConditions})
 	register(Stage{Slug: "values-schema", Run: stageValuesSchema})
 	register(Stage{Slug: "manifest-split", Run: stageManifestSplit})
+	register(Stage{Slug: "install", Run: stageInstall})
 }
 
 const chartYAML = `apiVersion: v2
@@ -1435,6 +1440,201 @@ metadata:
 	want := append(append([]string{}, kinds...), "Alpha", "Zeta")
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		return fmt.Errorf("documents of every kind Helm orders, given in reverse, plus the unknown kinds Zeta and Alpha:\nexpected kinds in this order:\n  %s\ngot:\n  %s", strings.Join(want, " "), strings.Join(got, " "))
+	}
+	return nil
+}
+
+// webChart is the chart the release stages install: two ConfigMaps and a
+// Service from the top chart, notes that read values, and a subchart whose
+// notes Helm leaves out.
+func webChart(msg string) map[string]string {
+	return map[string]string{
+		"Chart.yaml":  "apiVersion: v2\nname: web\nversion: 1.0.0\nappVersion: \"2.1\"\n",
+		"values.yaml": "msg: " + msg + "\nport: 8080\n",
+		"templates/config.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+data:
+  msg: {{ .Values.msg }}
+  namespace: {{ .Release.Namespace }}
+`,
+		"templates/svc.yaml": `apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-svc
+spec:
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+  - name: http
+    port: 80
+    targetPort: {{ .Values.port }}
+`,
+		"templates/NOTES.txt":             "Installed {{ .Release.Name }} into {{ .Release.Namespace }}.\nSay {{ .Values.msg }}.\n",
+		"charts/side/Chart.yaml":          "apiVersion: v2\nname: side\nversion: 0.1.0\n",
+		"charts/side/templates/NOTES.txt": "SUBCHART NOTES\n",
+		"charts/side/templates/cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-side
+`,
+	}
+}
+
+// stageInstall — install creates every rendered object in the release's
+// namespace, the kubeconfig's by default, marked with Helm's ownership label
+// and annotations, prints Helm's summary, and refuses before creating
+// anything when an object it would create exists without the release's marks.
+func stageInstall(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	ns := env.Namespace
+
+	res, err := w.run("install", "--set", "msg=hi", "first", w.chart("web", webChart("hello")))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if err := wantSummary(res.Stdout, `NAME: first
+LAST DEPLOYED: *
+NAMESPACE: `+ns+`
+STATUS: deployed
+REVISION: 1
+NOTES:
+Installed first into `+ns+`.
+Say hi.
+`, "install first, with no -n: the kubeconfig's namespace, and only the top chart's NOTES.txt"); err != nil {
+		return err
+	}
+	cm, err := env.ConfigMap(ctx, "first-config")
+	if err != nil {
+		return fmt.Errorf("install first should have created ConfigMap first-config in %s, the kubeconfig's namespace: %w", ns, err)
+	}
+	if cm.Data["msg"] != "hi" || cm.Data["namespace"] != ns {
+		return fmt.Errorf("ConfigMap first-config should hold msg=hi (from --set) and namespace=%s, got %v", ns, cm.Data)
+	}
+	svc, err := env.Client.CoreV1().Services(ns).Get(ctx, "first-svc", metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("install first should have created Service first-svc: %w", err)
+	}
+	side, err := env.ConfigMap(ctx, "first-side")
+	if err != nil {
+		return fmt.Errorf("install first should have created the subchart's ConfigMap first-side: %w", err)
+	}
+	for _, o := range []metav1.Object{cm, svc, side} {
+		if err := wantMarks(o, "first", ns); err != nil {
+			return err
+		}
+	}
+
+	res, err = w.run("install", "Bad_Name", w.chart("web", webChart("hello")))
+	if err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("Bad_Name is not a valid release name (lowercase DNS names only): %w", err)
+	}
+
+	// A Secret installs before a ConfigMap, so a program that creates as it
+	// checks would leave grab-token behind.
+	if err := seedConfigMap(ctx, env, "taken", nil, nil); err != nil {
+		return err
+	}
+	grab := w.chart("grab", map[string]string{
+		"Chart.yaml":           "apiVersion: v2\nname: grab\nversion: 1.0.0\n",
+		"templates/token.yaml": "apiVersion: v1\nkind: Secret\nmetadata:\n  name: grab-token\nstringData:\n  k: v\n",
+		"templates/taken.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: taken\ndata:\n  k: chart\n",
+	})
+	if res, err = w.run("install", "grab", grab); err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("ConfigMap taken already exists and no release owns it, so Helm refuses the install: %w", err)
+	}
+	for _, s := range []string{`ConfigMap "taken" in namespace "` + ns + `" exists and cannot be imported into the current release`, `missing key "app.kubernetes.io/managed-by": must be set to "Helm"`} {
+		if !strings.Contains(res.Stderr, s) {
+			return fmt.Errorf("the refusal should say, as Helm does:\n  %s\nstderr was:\n%s", s, tail(res.Stderr))
+		}
+	}
+	if _, err := env.Client.CoreV1().Secrets(ns).Get(ctx, "grab-token", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		return fmt.Errorf("the refused install created Secret grab-token: every object is checked before any is created, so a refusal leaves nothing behind")
+	}
+	if cm, err := env.ConfigMap(ctx, "taken"); err != nil || cm.Data["k"] != "" || len(cm.Labels) != 0 {
+		return fmt.Errorf("the refused install should leave ConfigMap taken as it was (no data, no labels), got %v", cm)
+	}
+
+	if err := seedConfigMap(ctx, env, "theirs",
+		map[string]string{"app.kubernetes.io/managed-by": "Helm"},
+		map[string]string{"meta.helm.sh/release-name": "other", "meta.helm.sh/release-namespace": ns}); err != nil {
+		return err
+	}
+	mine := w.chart("mine", map[string]string{
+		"Chart.yaml":           "apiVersion: v2\nname: mine\nversion: 1.0.0\n",
+		"templates/cm.yaml":    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: theirs\n",
+		"templates/other.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: mine-other\n",
+	})
+	if res, err = w.run("install", "--namespace", ns, "mine", mine); err != nil {
+		return err
+	}
+	if err := wantError(res); err != nil {
+		return fmt.Errorf("ConfigMap theirs belongs to release other, so installing release mine over it is refused: %w", err)
+	}
+	if s := `key "meta.helm.sh/release-name" must equal "mine": current value is "other"`; !strings.Contains(res.Stderr, s) {
+		return fmt.Errorf("the refusal should say, as Helm does:\n  %s\nstderr was:\n%s", s, tail(res.Stderr))
+	}
+	if _, err := env.ConfigMap(ctx, "mine-other"); !apierrors.IsNotFound(err) {
+		return fmt.Errorf("the refused install of mine created ConfigMap mine-other")
+	}
+	return nil
+}
+
+// wantMarks checks the label and annotations Helm puts on every object it
+// creates, which are how a later install knows who owns what.
+func wantMarks(o metav1.Object, release, ns string) error {
+	if got := o.GetLabels()["app.kubernetes.io/managed-by"]; got != "Helm" {
+		return fmt.Errorf("%s should be labelled app.kubernetes.io/managed-by=Helm, labels are %v", o.GetName(), o.GetLabels())
+	}
+	a := o.GetAnnotations()
+	if a["meta.helm.sh/release-name"] != release || a["meta.helm.sh/release-namespace"] != ns {
+		return fmt.Errorf("%s should be annotated meta.helm.sh/release-name=%s and meta.helm.sh/release-namespace=%s, annotations are %v", o.GetName(), release, ns, a)
+	}
+	return nil
+}
+
+func seedConfigMap(ctx context.Context, env *kube.Env, name string, labels, annotations map[string]string) error {
+	_, err := env.Client.CoreV1().ConfigMaps(env.Namespace).Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels, Annotations: annotations},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("seed ConfigMap %s: %w", name, err)
+	}
+	return nil
+}
+
+// wantSummary compares a release summary, as install and status print it,
+// line by line. A want line "LAST DEPLOYED: *" accepts any time in Helm's
+// format, and TEST SUITE is not judged.
+func wantSummary(got, want, what string) error {
+	var norm []string
+	for _, l := range strings.Split(strings.TrimRight(got, "\n"), "\n") {
+		if strings.HasPrefix(l, "TEST SUITE:") {
+			continue
+		}
+		if v, ok := strings.CutPrefix(l, "LAST DEPLOYED: "); ok {
+			if _, err := time.Parse(time.ANSIC, v); err == nil {
+				l = "LAST DEPLOYED: *"
+			}
+		}
+		norm = append(norm, l)
+	}
+	if strings.Join(norm, "\n")+"\n" != want {
+		return fmt.Errorf("for %s, expected (LAST DEPLOYED as Go's time.ANSIC, TEST SUITE not judged):\n-----\n%s-----\ngot:\n-----\n%s\n-----", what, want, strings.TrimRight(got, "\n"))
 	}
 	return nil
 }
