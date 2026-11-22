@@ -1,0 +1,64 @@
+slug: kustomize
+name: Build your own kustomize
+language: go
+entrypoint: main.go
+# No cluster: kustomize renders offline, and every stage is graded against the
+# kustomize built into the pinned kubectl (`kubectl kustomize`).
+stages:
+  - slug: kustomization-load
+    name: Read a kustomization
+    difficulty: easy
+  - slug: resources
+    name: Gather the resources
+    difficulty: medium
+  - slug: namespace
+    name: Put everything in one namespace
+    difficulty: medium
+  - slug: name-prefix
+    name: Prefix and suffix the names
+    difficulty: easy
+  - slug: common-labels
+    name: Label everything, selectors too
+    difficulty: medium
+  - slug: common-annotations
+    name: Annotate everything
+    difficulty: easy
+  - slug: images
+    name: Swap the images
+    difficulty: medium
+  - slug: replicas
+    name: Set the replica counts
+    difficulty: easy
+  - slug: configmap-generator
+    name: Generate a ConfigMap
+    difficulty: medium
+  - slug: secret-generator
+    name: Generate a Secret
+    difficulty: medium
+  - slug: name-hash
+    name: Name a generated object by its content
+    difficulty: medium
+  - slug: name-references
+    name: Keep the references wired up
+    difficulty: hard
+  - slug: strategic-merge-patch
+    name: Patch by example
+    difficulty: hard
+  - slug: json6902-patch
+    name: Patch by operation
+    difficulty: medium
+  - slug: patch-targets
+    name: Aim a patch at many resources
+    difficulty: medium
+  - slug: overlays
+    name: Build on a base
+    difficulty: hard
+  - slug: components
+    name: Mix in a component
+    difficulty: medium
+  - slug: replacements
+    name: Copy a field into others
+    difficulty: hard
+  - slug: kustomize-parity
+    name: Agree with kustomize
+    difficulty: hard
