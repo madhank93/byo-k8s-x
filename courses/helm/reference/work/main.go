@@ -49,6 +49,10 @@
 //
 // Stage 16: `rollback NAME [REVISION]` records a new revision holding an old
 // one's chart, values and manifest, and moves the cluster to it.
+//
+// Stage 17: documents annotated helm.sh/hook are kept out of the manifest
+// and run around install, upgrade and rollback, each waited on and deleted
+// as its delete policy says.
 
 package main
 
@@ -65,6 +69,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -138,6 +143,7 @@ func run(cmd string, args []string) error {
 	fs.BoolVar(&up.install, "install", false, "install the release if it does not exist")
 	fs.BoolVar(&up.reuse, "reuse-values", false, "merge the new values over the last release's")
 	fs.BoolVar(&up.reset, "reset-values", false, "use only the new values and the chart's defaults")
+	fs.DurationVar(&hookTimeout, "timeout", 5*time.Minute, "how long to wait for each hook")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -198,6 +204,9 @@ func run(cmd string, args []string) error {
 			}
 		}
 		fmt.Print(manifestText(ms))
+		if len(show) == 0 {
+			fmt.Print(hookText(r.Hooks))
+		}
 		return nil
 	case "install":
 		if len(args) != 2 {
@@ -1025,7 +1034,8 @@ var releaseName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9](
 type Rendered struct {
 	Chart     *Chart
 	Config    map[string]any // the user's values, before the chart's defaults
-	Manifests []File         // in install order
+	Manifests []File         // in install order, hooks left out
+	Hooks     []*Hook
 	Notes     string
 }
 
@@ -1064,7 +1074,8 @@ func renderWith(dir string, user map[string]any, rel Release) (*Rendered, error)
 	if err != nil {
 		return nil, err
 	}
-	return &Rendered{Chart: c, Config: user, Manifests: ms, Notes: notes}, nil
+	ms, hooks := splitHooks(ms)
+	return &Rendered{Chart: c, Config: user, Manifests: ms, Hooks: hooks, Notes: notes}, nil
 }
 
 // The marks that say which release an object belongs to.
@@ -1116,21 +1127,30 @@ func install(name, dir, ns string, files, sets []string) error {
 		Chart:    storedChart(r.Chart),
 		Config:   r.Config,
 		Manifest: manifestText(r.Manifests),
+		Hooks:    r.Hooks,
 	}
 	if err := k.saveRecord(rec, false); err != nil {
 		return err
 	}
+	fail := func(err error) error {
+		rec.Info.Status = "failed"
+		rec.Info.Description = fmt.Sprintf("Release %q failed: %s", name, err)
+		if serr := k.saveRecord(rec, true); serr != nil {
+			return serr
+		}
+		return err
+	}
+	if err := k.execHooks(rec, "pre-install"); err != nil {
+		return fail(fmt.Errorf("failed pre-install: %s", err))
+	}
 	for _, o := range objs {
 		mark(o.obj, name, ns)
 		if _, err := o.res.Create(k.ctx, o.obj, metav1.CreateOptions{FieldManager: "helm"}); err != nil {
-			err = fmt.Errorf("failed to create resource: %w", err)
-			rec.Info.Status = "failed"
-			rec.Info.Description = fmt.Sprintf("Release %q failed: %s", name, err)
-			if serr := k.saveRecord(rec, true); serr != nil {
-				return serr
-			}
-			return err
+			return fail(fmt.Errorf("failed to create resource: %w", err))
 		}
+	}
+	if err := k.execHooks(rec, "post-install"); err != nil {
+		return fail(fmt.Errorf("failed post-install: %s", err))
 	}
 	rec.Info.Status, rec.Info.Description = "deployed", "Install complete"
 	if err := k.saveRecord(rec, true); err != nil {
@@ -1170,6 +1190,7 @@ type Record struct {
 	Chart     *StoredChart   `json:"chart,omitempty"`
 	Config    map[string]any `json:"config,omitempty"`
 	Manifest  string         `json:"manifest,omitempty"`
+	Hooks     []*Hook        `json:"hooks,omitempty"`
 	Version   int            `json:"version,omitempty"`
 	Namespace string         `json:"namespace,omitempty"`
 }
@@ -1603,17 +1624,27 @@ func upgradeRelease(k *kube, h []*Record, name, dir, ns string, files, sets []st
 		Chart:    storedChart(r.Chart),
 		Config:   user,
 		Manifest: manifestText(r.Manifests),
+		Hooks:    r.Hooks,
 	}
 	if err := k.saveRecord(rec, false); err != nil {
 		return err
 	}
-	if err := k.update(old, target, name, ns); err != nil {
+	fail := func(err error) error {
 		rec.Info.Status = "failed"
 		rec.Info.Description = fmt.Sprintf("Upgrade %q failed: %s", name, err)
 		if serr := k.saveRecord(rec, true); serr != nil {
 			return serr
 		}
 		return err
+	}
+	if err := k.execHooks(rec, "pre-upgrade"); err != nil {
+		return fail(fmt.Errorf("pre-upgrade hooks failed: %s", err))
+	}
+	if err := k.update(old, target, name, ns); err != nil {
+		return fail(err)
+	}
+	if err := k.execHooks(rec, "post-upgrade"); err != nil {
+		return fail(fmt.Errorf("post-upgrade hooks failed: %s", err))
 	}
 	current.Info.Status = "superseded"
 	if err := k.saveRecord(current, true); err != nil {
@@ -1780,6 +1811,11 @@ func rollback(name, ns string, to int) error {
 		Config:   prev.Config,
 		Manifest: prev.Manifest,
 	}
+	// The target's stored hooks run again, not a fresh render of them.
+	for _, h := range prev.Hooks {
+		c := *h
+		rec.Hooks = append(rec.Hooks, &c)
+	}
 	if err := k.saveRecord(rec, false); err != nil {
 		return err
 	}
@@ -1789,6 +1825,10 @@ func rollback(name, ns string, to int) error {
 	}
 	target, err := k.objects(parseManifest(prev.Manifest), ns)
 	if err != nil {
+		return err
+	}
+	// ponytail: a failed rollback hook leaves the revision pending-rollback, as Helm does.
+	if err := k.execHooks(rec, "pre-rollback"); err != nil {
 		return err
 	}
 	if err := k.update(old, target, name, ns); err != nil {
@@ -1801,6 +1841,9 @@ func rollback(name, ns string, to int) error {
 				return serr
 			}
 		}
+		return err
+	}
+	if err := k.execHooks(rec, "post-rollback"); err != nil {
 		return err
 	}
 	for _, r := range h {
@@ -1817,4 +1860,223 @@ func rollback(name, ns string, to int) error {
 	}
 	fmt.Println("Rollback was a success! Happy Helming!")
 	return nil
+}
+
+// Hook is Helm's release.Hook: one document annotated helm.sh/hook.
+type Hook struct {
+	Name           string        `json:"name,omitempty"`
+	Kind           string        `json:"kind,omitempty"`
+	Path           string        `json:"path,omitempty"`
+	Manifest       string        `json:"manifest,omitempty"`
+	Events         []string      `json:"events,omitempty"`
+	LastRun        HookExecution `json:"last_run"`
+	Weight         int           `json:"weight,omitempty"`
+	DeletePolicies []string      `json:"delete_policies,omitempty"`
+}
+
+type HookExecution struct {
+	StartedAt   Time   `json:"started_at"`
+	CompletedAt Time   `json:"completed_at"`
+	Phase       string `json:"phase"`
+}
+
+var hookEvents = map[string]string{
+	"pre-install": "pre-install", "post-install": "post-install",
+	"pre-delete": "pre-delete", "post-delete": "post-delete",
+	"pre-upgrade": "pre-upgrade", "post-upgrade": "post-upgrade",
+	"pre-rollback": "pre-rollback", "post-rollback": "post-rollback",
+	"test": "test", "test-success": "test",
+}
+
+// hookTimeout bounds the wait for each hook to be ready.
+var hookTimeout time.Duration
+
+// splitHooks takes the hooks out of ordered manifests, keeping both in that
+// order. A document naming an event Helm does not know is dropped entirely.
+func splitHooks(ms []File) ([]File, []*Hook) {
+	var plain []File
+	var hooks []*Hook
+	for _, m := range ms {
+		var head struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name        string            `json:"name"`
+				Annotations map[string]string `json:"annotations"`
+			} `json:"metadata"`
+		}
+		yaml.Unmarshal(m.Data, &head)
+		a := head.Metadata.Annotations
+		events, ok := a["helm.sh/hook"]
+		if !ok {
+			plain = append(plain, m)
+			continue
+		}
+		h := &Hook{Name: head.Metadata.Name, Kind: head.Kind, Path: m.Name, Manifest: string(m.Data)}
+		for _, e := range strings.Split(events, ",") {
+			if ev, ok := hookEvents[strings.ToLower(strings.TrimSpace(e))]; ok {
+				h.Events = append(h.Events, ev)
+			} else {
+				h = nil
+				break
+			}
+		}
+		if h == nil {
+			fmt.Fprintf(os.Stderr, "info: skipping unknown hook: %q\n", events)
+			continue
+		}
+		// Helm ignores a weight that is not an integer.
+		h.Weight, _ = strconv.Atoi(a["helm.sh/hook-weight"])
+		if p, ok := a["helm.sh/hook-delete-policy"]; ok {
+			for _, v := range strings.Split(p, ",") {
+				h.DeletePolicies = append(h.DeletePolicies, strings.ToLower(strings.TrimSpace(v)))
+			}
+		}
+		hooks = append(hooks, h)
+	}
+	return plain, hooks
+}
+
+func hookText(hs []*Hook) string {
+	var b strings.Builder
+	for _, h := range hs {
+		fmt.Fprintf(&b, "---\n# Source: %s\n%s\n", h.Path, h.Manifest)
+	}
+	return b.String()
+}
+
+// oneError is the multierror text Helm wraps a single hook error in.
+func oneError(err error) error {
+	return fmt.Errorf("1 error occurred:\n\t* %s\n\n", err)
+}
+
+// execHooks runs a release's hooks for one event, lowest weight first, then
+// by name, each created without ownership marks and waited on. Every hook
+// that runs is recorded in rec, which the caller saves.
+func (k *kube) execHooks(rec *Record, event string) error {
+	var hs []*Hook
+	for _, h := range rec.Hooks {
+		if slices.Contains(h.Events, event) {
+			hs = append(hs, h)
+		}
+	}
+	sort.SliceStable(hs, func(i, j int) bool {
+		if hs[i].Weight != hs[j].Weight {
+			return hs[i].Weight < hs[j].Weight
+		}
+		return hs[i].Name < hs[j].Name
+	})
+	for _, h := range hs {
+		if len(h.DeletePolicies) == 0 {
+			h.DeletePolicies = []string{"before-hook-creation"}
+		}
+		if err := k.deleteHook(rec.Namespace, h, "before-hook-creation"); err != nil {
+			return err
+		}
+		objs, err := k.objects([]File{{Name: h.Path, Data: []byte(h.Manifest)}}, rec.Namespace)
+		if err != nil {
+			return fmt.Errorf("unable to build kubernetes object for %s hook %s: %w", event, h.Path, err)
+		}
+		h.LastRun = HookExecution{StartedAt: Time{time.Now()}, Phase: "Running"}
+		if _, err := objs[0].res.Create(k.ctx, objs[0].obj, metav1.CreateOptions{FieldManager: "helm"}); err != nil {
+			h.LastRun.CompletedAt, h.LastRun.Phase = Time{time.Now()}, "Failed"
+			return fmt.Errorf("warning: Hook %s %s failed: %w", event, h.Path, oneError(err))
+		}
+		err = k.waitHook(objs[0])
+		h.LastRun.CompletedAt = Time{time.Now()}
+		if err != nil {
+			h.LastRun.Phase = "Failed"
+			k.deleteHook(rec.Namespace, h, "hook-failed")
+			return oneError(err)
+		}
+		h.LastRun.Phase = "Succeeded"
+	}
+	for i := len(hs) - 1; i >= 0; i-- {
+		if err := k.deleteHook(rec.Namespace, hs[i], "hook-succeeded"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// waitHook waits for a Job to complete or a Pod to succeed; any other kind is
+// ready once created.
+func (k *kube) waitHook(o object) error {
+	deadline := time.Now().Add(hookTimeout)
+	for {
+		live, err := o.res.Get(k.ctx, o.obj.GetName(), metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		switch o.obj.GetKind() {
+		case "Job":
+			conds, _, _ := unstructured.NestedSlice(live.Object, "status", "conditions")
+			for _, c := range conds {
+				c, _ := c.(map[string]any)
+				if c["status"] != "True" {
+					continue
+				}
+				switch c["type"] {
+				case "Complete":
+					return nil
+				case "Failed":
+					return fmt.Errorf("job %s failed: %s", o.obj.GetName(), c["reason"])
+				}
+			}
+		case "Pod":
+			switch phase, _, _ := unstructured.NestedString(live.Object, "status", "phase"); phase {
+			case "Succeeded":
+				return nil
+			case "Failed":
+				return fmt.Errorf("pod %s failed", o.obj.GetName())
+			}
+		default:
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for the condition")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// deleteHook deletes a hook's object if the hook has this delete policy, and
+// waits for it to be gone so that the next create does not collide with it.
+func (k *kube) deleteHook(ns string, h *Hook, policy string) error {
+	if h.Kind == "CustomResourceDefinition" || !slices.Contains(h.DeletePolicies, policy) {
+		return nil
+	}
+	// The object is decoded the way the API server would, so a value the
+	// chart left untyped, such as an unquoted weight, fails here.
+	j, err := yaml.YAMLToJSON([]byte(h.Manifest))
+	if err == nil {
+		var typed struct {
+			Metadata metav1.ObjectMeta `json:"metadata"`
+		}
+		err = json.Unmarshal(j, &typed)
+	}
+	if err != nil {
+		return fmt.Errorf("unable to build kubernetes object for deleting hook %s: unable to decode \"\": %w", h.Path, err)
+	}
+	objs, err := k.objects([]File{{Name: h.Path, Data: []byte(h.Manifest)}}, ns)
+	if err != nil {
+		return fmt.Errorf("unable to build kubernetes object for deleting hook %s: %w", h.Path, err)
+	}
+	o := objs[0]
+	bg := metav1.DeletePropagationBackground
+	if err := o.res.Delete(k.ctx, o.obj.GetName(), metav1.DeleteOptions{PropagationPolicy: &bg}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	deadline := time.Now().Add(hookTimeout)
+	for {
+		if live, err := k.get(o); err != nil || live == nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for the condition")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }

@@ -64,6 +64,7 @@ func init() {
 	register(Stage{Slug: "history", Run: stageHistory})
 	register(Stage{Slug: "upgrade-3way-merge", Run: stageUpgrade})
 	register(Stage{Slug: "rollback", Run: stageRollback})
+	register(Stage{Slug: "hooks", Run: stageHooks})
 }
 
 const chartYAML = `apiVersion: v2
@@ -3002,4 +3003,281 @@ func stageRollback(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	return wantExact(res.Stdout, "USER-SUPPLIED VALUES:\nsize: big\n", "helm get values rb --revision 8, run by the real helm: a rollback to 6 holds revision 6's values, which go back through 4 to revision 2's")
+}
+
+// hookCM is a ConfigMap hook that records the revision it was rendered for.
+func hookCM(name, events, policy string) string {
+	p := ""
+	if policy != "" {
+		p = "\n    \"helm.sh/hook-delete-policy\": " + policy
+	}
+	return "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-" + name + "\n  annotations:\n    \"helm.sh/hook\": " + events + p + "\ndata:\n  revision: {{ .Release.Revision | quote }}\n"
+}
+
+// hookJob is a Job hook in busybox, as small as a pod gets.
+func hookJob(name, events, policy, script string) string {
+	p := ""
+	if policy != "" {
+		p = "\n    \"helm.sh/hook-delete-policy\": " + policy
+	}
+	return `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-` + name + `
+  annotations:
+    "helm.sh/hook": ` + events + p + `
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: c
+          image: busybox:1.36
+          command: ["sh", "-c", "` + script + `"]
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {cpu: 10m, memory: 16Mi}
+`
+}
+
+// hkChart has a ConfigMap hook per install, upgrade and rollback event, a
+// pre-install Job that takes a few seconds, a hook deleted once it succeeds,
+// one for an event Helm does not know, and, switched on by values, a failing
+// Job and a pre-upgrade hook with no before-hook-creation policy.
+func hkChart() map[string]string {
+	f := map[string]string{
+		"Chart.yaml":            "apiVersion: v2\nname: hk\nversion: 1.0.0\n",
+		"values.yaml":           "fail: false\nstrict: false\n",
+		"templates/main.yaml":   "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-main\ndata:\n  k: v\n",
+		"templates/wait.yaml":   "{{- if not .Values.fail }}\n" + hookJob("wait", "pre-install", "", "sleep 2") + "{{- end }}\n",
+		"templates/gone.yaml":   hookCM("gone", "post-install", "hook-succeeded"),
+		"templates/bogus.yaml":  hookCM("bogus", "pre-foo", ""),
+		"templates/fail.yaml":   "{{- if .Values.fail }}\n" + hookJob("fail", "pre-install", "hook-failed", "exit 3") + "{{- end }}\n",
+		"templates/strict.yaml": "{{- if .Values.strict }}\n" + hookCM("strict", "pre-upgrade", "hook-succeeded") + "{{- end }}\n",
+	}
+	for _, e := range []string{"pre-install", "post-install", "pre-upgrade", "post-upgrade", "pre-rollback", "post-rollback"} {
+		f["templates/cm-"+e+".yaml"] = hookCM(e, e, "")
+	}
+	return f
+}
+
+// wantHookRevision checks a hook ConfigMap: there, carrying the revision it
+// was rendered for, and without the marks of a release's own objects.
+func wantHookRevision(ctx context.Context, env *kube.Env, name, rev, why string) error {
+	cm, err := env.ConfigMap(ctx, name)
+	if err != nil {
+		return fmt.Errorf("hook ConfigMap %s should exist %s: %w", name, why, err)
+	}
+	if !reflect.DeepEqual(cm.Data, map[string]string{"revision": rev}) {
+		return fmt.Errorf("hook ConfigMap %s should hold revision=%q %s, got %v", name, rev, why, cm.Data)
+	}
+	_, l := cm.Labels["app.kubernetes.io/managed-by"]
+	_, a := cm.Annotations["meta.helm.sh/release-name"]
+	if l || a {
+		return fmt.Errorf("hook ConfigMap %s carries the release's ownership marks; Helm creates hooks without them (the release does not own its hooks). Labels %v, annotations %v", name, cm.Labels, cm.Annotations)
+	}
+	return nil
+}
+
+// stageHooks — hooks stay out of the manifest and are recorded with the
+// release; they run around install, upgrade and rollback, unmarked and
+// unchecked for ownership, each waited on until ready, deleted as their
+// policy says, and a rollback replays the target revision's stored hooks.
+func stageHooks(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := needHelm(w); err != nil {
+		return err
+	}
+	ns := env.Namespace
+	jobs := env.Client.BatchV1().Jobs(ns)
+	defer func() {
+		bg := metav1.DeletePropagationBackground
+		for _, j := range []string{"hk-web-wait", "hk-fail-fail"} {
+			jobs.Delete(context.WithoutCancel(ctx), j, metav1.DeleteOptions{PropagationPolicy: &bg})
+		}
+	}()
+	files := hkChart()
+	hk := w.chart("hk", files)
+
+	// A hook skips the ownership check, and before-hook-creation, the
+	// default policy, replaces whatever has its name.
+	if err := seedConfigMap(ctx, env, "hk-web-pre-install", nil, nil); err != nil {
+		return err
+	}
+	res, err := wantStep(w, "install", "hk-web", hk)
+	if err != nil {
+		return err
+	}
+	if err := wantSummary(res.Stdout, "NAME: hk-web\nLAST DEPLOYED: *\nNAMESPACE: "+ns+"\nSTATUS: deployed\nREVISION: 1\n", "install hk-web"); err != nil {
+		return err
+	}
+	job, err := jobs.Get(ctx, "hk-web-wait", metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("install hk-web should leave the pre-install Job hk-web-wait (its default policy deletes it only before the next creation): %w", err)
+	}
+	if job.Status.Succeeded != 1 || job.Status.CompletionTime == nil {
+		return fmt.Errorf("install hk-web returned before its pre-install Job hk-web-wait completed: a Job hook is waited on until it completes. Job status: %+v", job.Status)
+	}
+	main, err := env.ConfigMap(ctx, "hk-web-main")
+	if err != nil {
+		return fmt.Errorf("install hk-web should create hk-web-main: %w", err)
+	}
+	if main.CreationTimestamp.Before(job.Status.CompletionTime) {
+		return fmt.Errorf("hk-web-main was created at %s, before the pre-install Job hk-web-wait completed at %s: pre-install hooks finish before the release's objects are created", main.CreationTimestamp.UTC(), job.Status.CompletionTime.UTC())
+	}
+	for _, h := range []string{"pre-install", "post-install"} {
+		if err := wantHookRevision(ctx, env, "hk-web-"+h, "1", "after install"); err != nil {
+			return err
+		}
+	}
+	for _, c := range []struct{ name, why string }{
+		{"hk-web-gone", "after install: its policy hook-succeeded deletes it once its event's hooks succeed"},
+		{"hk-web-bogus", "at all: its hook event pre-foo is unknown, and Helm drops such a document, neither hook nor object"},
+		{"hk-web-pre-upgrade", "after install: it is an upgrade hook"},
+		{"hk-web-pre-rollback", "after install: it is a rollback hook"},
+	} {
+		if err := wantGone(ctx, env, c.name, c.why); err != nil {
+			return err
+		}
+	}
+	rec, err := wantRecord(ctx, env, "hk-web", 1, "deployed", time.Now().Add(-time.Minute), time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	if m := fmt.Sprint(rec["manifest"]); strings.Contains(m, "helm.sh/hook") || !strings.Contains(m, "name: hk-web-main") {
+		return fmt.Errorf("the record's manifest should hold hk-web-main and none of the hooks, got:\n%s", indent(m))
+	}
+	render := strings.NewReplacer(`{{ .Release.Name }}`, "hk-web", `{{ .Release.Revision | quote }}`, `"1"`)
+	type hookWant struct {
+		file, kind string
+		events     []any
+		policies   any
+		phase      string
+	}
+	ran := []any{"before-hook-creation"}
+	// Stored order: by kind as Helm installs them, then by path.
+	want := []hookWant{
+		{"cm-post-install", "ConfigMap", []any{"post-install"}, ran, "Succeeded"},
+		{"cm-post-rollback", "ConfigMap", []any{"post-rollback"}, nil, ""},
+		{"cm-post-upgrade", "ConfigMap", []any{"post-upgrade"}, nil, ""},
+		{"cm-pre-install", "ConfigMap", []any{"pre-install"}, ran, "Succeeded"},
+		{"cm-pre-rollback", "ConfigMap", []any{"pre-rollback"}, nil, ""},
+		{"cm-pre-upgrade", "ConfigMap", []any{"pre-upgrade"}, nil, ""},
+		{"gone", "ConfigMap", []any{"post-install"}, []any{"hook-succeeded"}, "Succeeded"},
+		{"wait", "Job", []any{"pre-install"}, ran, "Succeeded"},
+	}
+	hooks, _ := rec["hooks"].([]any)
+	var got, exp []string
+	for _, h := range hooks {
+		got = append(got, jsonText(map[string]any{"name": dig(h, "name"), "kind": dig(h, "kind"), "path": dig(h, "path"), "events": dig(h, "events"),
+			"delete_policies": dig(h, "delete_policies"), "phase": dig(h, "last_run", "phase"), "weight": dig(h, "weight")}))
+	}
+	for _, h := range want {
+		exp = append(exp, jsonText(map[string]any{"name": "hk-web-" + strings.TrimPrefix(h.file, "cm-"), "kind": h.kind, "path": "hk/templates/" + h.file + ".yaml", "events": h.events,
+			"delete_policies": h.policies, "phase": h.phase, "weight": nil}))
+	}
+	if strings.Join(got, "\n") != strings.Join(exp, "\n") {
+		return fmt.Errorf("revision 1's hooks should be, in this order (kind, then path), with a hook that ran given the default delete policy:\n  %s\ngot:\n  %s", strings.Join(exp, "\n  "), strings.Join(got, "\n  "))
+	}
+	for i, h := range want {
+		body := files["templates/"+h.file+".yaml"]
+		if h.kind == "Job" {
+			body = strings.TrimSuffix(strings.TrimPrefix(body, "{{- if not .Values.fail }}\n"), "{{- end }}\n")
+		}
+		if m := dig(hooks[i], "manifest"); m != strings.TrimSpace(render.Replace(body)) {
+			return fmt.Errorf("hook %s's manifest should be the rendered document alone, no --- or # Source line:\n%s\ngot:\n%s", h.file, indent(strings.TrimSpace(render.Replace(body))), indent(fmt.Sprint(m)))
+		}
+		started, _ := dig(hooks[i], "last_run", "started_at").(string)
+		if _, err := time.Parse(time.RFC3339Nano, started); (err == nil) != (h.phase != "") {
+			return fmt.Errorf("hook %s's last_run.started_at should be the time it ran, or \"\" when it never has, got %q", h.file, started)
+		}
+	}
+	if res, err = w.helm("status", "hk-web"); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("helm status hk-web, run by the real helm against your record with hooks: %w", err)
+	}
+
+	// Upgrade hooks are rendered for their revision; before-hook-creation
+	// clears the last one's.
+	for _, rev := range []string{"2", "3"} {
+		if _, err := wantStep(w, "upgrade", "hk-web", hk); err != nil {
+			return err
+		}
+		for _, h := range []string{"pre-upgrade", "post-upgrade"} {
+			if err := wantHookRevision(ctx, env, "hk-web-"+h, rev, "after the upgrade to revision "+rev); err != nil {
+				return err
+			}
+		}
+	}
+	if err := wantHookRevision(ctx, env, "hk-web-pre-install", "1", "after the upgrades: install hooks do not run on upgrade"); err != nil {
+		return err
+	}
+	if _, err := wantStep(w, "rollback", "hk-web", "1"); err != nil {
+		return err
+	}
+	for _, h := range []string{"pre-rollback", "post-rollback"} {
+		if err := wantHookRevision(ctx, env, "hk-web-"+h, "1", "after rollback hk-web 1: a rollback runs the hooks stored with revision 1, not a fresh render for revision 4"); err != nil {
+			return err
+		}
+	}
+
+	// A hook with no before-hook-creation policy fails on an object in its way.
+	if err := seedConfigMap(ctx, env, "hk-web-strict", nil, nil); err != nil {
+		return err
+	}
+	if res, err = w.run("upgrade", "--set", "strict=true", "hk-web", hk); err != nil {
+		return err
+	}
+	for _, s := range []string{"Error: UPGRADE FAILED: pre-upgrade hooks failed: warning: Hook pre-upgrade hk/templates/strict.yaml failed: ", `configmaps "hk-web-strict" already exists`} {
+		if err := wantRefusal(res, s, "upgrade hk-web with its hook hk-web-strict (policy hook-succeeded only) already in the cluster"); err != nil {
+			return err
+		}
+	}
+	rec, err = wantRecord(ctx, env, "hk-web", 5, "failed", time.Now().Add(-time.Minute), time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	if d, _ := dig(rec, "info", "description").(string); !strings.HasPrefix(d, `Upgrade "hk-web" failed: pre-upgrade hooks failed: `) {
+		return fmt.Errorf(`the failed upgrade's description should start Upgrade "hk-web" failed: pre-upgrade hooks failed: , got %q`, d)
+	}
+	if _, err := wantRecord(ctx, env, "hk-web", 4, "deployed", time.Now().Add(-time.Minute), time.Now().Add(time.Second)); err != nil {
+		return err
+	}
+
+	// A failing pre-install Job fails the install before any object exists.
+	if res, err = w.run("install", "--set", "fail=true", "hk-fail", hk); err != nil {
+		return err
+	}
+	for _, s := range []string{"Error: INSTALLATION FAILED: failed pre-install: ", "job hk-fail-fail failed: BackoffLimitExceeded"} {
+		if err := wantRefusal(res, s, "install hk-fail, whose pre-install Job exits 3 with backoffLimit 0"); err != nil {
+			return err
+		}
+	}
+	rec, err = wantRecord(ctx, env, "hk-fail", 1, "failed", time.Now().Add(-time.Minute), time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	if d, _ := dig(rec, "info", "description").(string); !strings.HasPrefix(d, `Release "hk-fail" failed: failed pre-install: `) {
+		return fmt.Errorf(`the failed install's description should start Release "hk-fail" failed: failed pre-install: , got %q`, d)
+	}
+	if err := wantGone(ctx, env, "hk-fail-main", "after its pre-install hook failed: the release's objects come after the pre-install hooks"); err != nil {
+		return err
+	}
+	if _, err := jobs.Get(ctx, "hk-fail-fail", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		return fmt.Errorf("Job hk-fail-fail should be deleted once it failed, as its policy hook-failed says (err: %v)", err)
+	}
+	for _, h := range rec["hooks"].([]any) {
+		if dig(h, "name") == "hk-fail-fail" && dig(h, "last_run", "phase") != "Failed" {
+			return fmt.Errorf("the failed Job hook's last_run.phase should be Failed, got %v", dig(h, "last_run", "phase"))
+		}
+	}
+	return nil
 }
