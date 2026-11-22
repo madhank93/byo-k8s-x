@@ -59,6 +59,11 @@
 //
 // Stage 19: `test [--filter [!]name=N]... [--logs] NAME` runs the latest
 // revision's test hooks and records how they went, which status then shows.
+//
+// Stage 20: `uninstall [--keep-history] [--ignore-not-found] [--dry-run]
+// NAME...` deletes a release's objects, bar those whose resource policy is
+// keep, runs its delete hooks, and drops its records or marks the last one
+// uninstalled; `install --replace` and `upgrade -i` reuse such a name.
 
 package main
 
@@ -146,6 +151,12 @@ func run(cmd string, args []string) error {
 	histMax := fs.Int("max", 256, "maximum number of revisions in the history")
 	revision := fs.Int("revision", 0, "the revision to get, 0 for the latest")
 	var up upgradeOpts
+	var keepHistory, ignoreNotFound, dryRun, replace, uninstalled bool
+	fs.BoolVar(&keepHistory, "keep-history", false, "keep the release's records, marked uninstalled")
+	fs.BoolVar(&ignoreNotFound, "ignore-not-found", false, "treat a release that does not exist as uninstalled")
+	fs.BoolVar(&dryRun, "dry-run", false, "change nothing")
+	fs.BoolVar(&replace, "replace", false, "reuse the name of an uninstalled or failed release")
+	fs.BoolVar(&uninstalled, "uninstalled", false, "list uninstalled releases only")
 	fs.BoolVar(&up.install, "i", false, "install the release if it does not exist")
 	fs.BoolVar(&up.install, "install", false, "install the release if it does not exist")
 	fs.BoolVar(&up.reuse, "reuse-values", false, "merge the new values over the last release's")
@@ -222,7 +233,7 @@ func run(cmd string, args []string) error {
 		if len(args) != 2 {
 			return fmt.Errorf("usage: install [-n NS] [-f FILE]... [--set k=v]... NAME DIR")
 		}
-		if err := install(args[0], args[1], namespace, files, sets); err != nil {
+		if err := install(args[0], args[1], namespace, files, sets, replace); err != nil {
 			return fmt.Errorf("INSTALLATION FAILED: %w", err)
 		}
 		return nil
@@ -256,7 +267,12 @@ func run(cmd string, args []string) error {
 		if allNamespaces {
 			namespace = ""
 		}
-		return list(namespace, all, short)
+		return list(namespace, all, short, uninstalled)
+	case "uninstall":
+		if len(args) == 0 {
+			return fmt.Errorf(`"helm uninstall" requires at least 1 argument`)
+		}
+		return uninstall(args, namespace, keepHistory, ignoreNotFound, dryRun)
 	case "status":
 		if len(args) != 1 {
 			return fmt.Errorf(`"helm status" requires 1 argument`)
@@ -1102,16 +1118,23 @@ const (
 	releaseNSKey   = "meta.helm.sh/release-namespace"
 )
 
-func install(name, dir, ns string, files, sets []string) error {
+func install(name, dir, ns string, files, sets []string, replace bool) error {
 	k, err := connect()
 	if err != nil {
 		return err
 	}
-	// Any revision at all, whatever its status, holds the name.
-	if h, err := k.history(ns, name); err != nil {
+	// Any revision at all, whatever its status, holds the name, unless
+	// replace reuses an uninstalled or failed one.
+	h, err := k.history(ns, name)
+	if err != nil {
 		return err
-	} else if len(h) > 0 {
-		return errors.New("cannot re-use a name that is still in use")
+	}
+	var last *Record
+	if len(h) > 0 {
+		last = h[len(h)-1]
+		if st := last.Info.Status; !replace || (st != "uninstalled" && st != "failed") {
+			return errors.New("cannot re-use a name that is still in use")
+		}
 	}
 	rel := Release{Name: name, Namespace: ns, Revision: 1, IsInstall: true, Service: "Helm"}
 	r, err := renderRelease(dir, files, sets, rel)
@@ -1133,12 +1156,21 @@ func install(name, dir, ns string, files, sets []string) error {
 			if err := owned(live, name, ns); err != nil {
 				return fmt.Errorf("Unable to continue with install: %w", err)
 			}
-			// ponytail: an object already marked as this release's is not adopted; create fails on it.
 		}
 	}
 	now := time.Now()
+	version := 1
+	if last != nil {
+		version = last.Version + 1
+		if last.Info.Status != "failed" {
+			last.Info.Status, last.Info.Description = "superseded", "superseded by new release"
+			if err := k.saveRecord(last, true); err != nil {
+				return err
+			}
+		}
+	}
 	rec := &Record{
-		Name: name, Namespace: ns, Version: 1,
+		Name: name, Namespace: ns, Version: version,
 		Info: &Info{FirstDeployed: Time{now}, LastDeployed: Time{now}, Status: "pending-install",
 			Description: "Initial install underway", Notes: r.Notes},
 		Chart:    storedChart(r.Chart),
@@ -1160,11 +1192,10 @@ func install(name, dir, ns string, files, sets []string) error {
 	if err := k.execHooks(rec, "pre-install"); err != nil {
 		return fail(fmt.Errorf("failed pre-install: %s", err))
 	}
-	for _, o := range objs {
-		mark(o.obj, name, ns)
-		if _, err := o.res.Create(k.ctx, o.obj, metav1.CreateOptions{FieldManager: "helm"}); err != nil {
-			return fail(fmt.Errorf("failed to create resource: %w", err))
-		}
+	// An object already marked as this release's, one an uninstall kept, is
+	// adopted.
+	if err := k.update(nil, objs, name, ns); err != nil {
+		return fail(err)
 	}
 	if err := k.execHooks(rec, "post-install"); err != nil {
 		return fail(fmt.Errorf("failed post-install: %s", err))
@@ -1469,7 +1500,7 @@ var errNotFound = errors.New("release: not found")
 // list prints the latest revision of every release in ns (every namespace
 // when ns is ""), sorted by name. Without all, only deployed and failed
 // releases are shown.
-func list(ns string, all, short bool) error {
+func list(ns string, all, short, uninstalled bool) error {
 	k, err := connect()
 	if err != nil {
 		return err
@@ -1492,7 +1523,8 @@ func list(ns string, all, short bool) error {
 	var shown []*Record
 	for _, key := range keys {
 		r := latest[key]
-		if all || r.Info.Status == "deployed" || r.Info.Status == "failed" {
+		st := r.Info.Status
+		if all || (uninstalled && st == "uninstalled") || (!uninstalled && (st == "deployed" || st == "failed")) {
 			shown = append(shown, r)
 		}
 	}
@@ -1584,9 +1616,9 @@ func upgrade(name, dir, ns string, files, sets []string, opts upgradeOpts) error
 	if err != nil {
 		return err
 	}
-	if len(h) == 0 && opts.install {
+	if opts.install && (len(h) == 0 || h[len(h)-1].Info.Status == "uninstalled") {
 		fmt.Printf("Release %q does not exist. Installing it now.\n", name)
-		return install(name, dir, ns, files, sets)
+		return install(name, dir, ns, files, sets, len(h) > 0)
 	}
 	if err := upgradeRelease(k, h, name, dir, ns, files, sets, opts); err != nil {
 		return fmt.Errorf("UPGRADE FAILED: %w", err)
@@ -1599,12 +1631,19 @@ func upgradeRelease(k *kube, h []*Record, name, dir, ns string, files, sets []st
 		return fmt.Errorf("%q has no deployed releases", name)
 	}
 	last := h[len(h)-1]
-	// The patch starts from the deployed revision; with none, from the last.
-	current := last
+	// The patch starts from the deployed revision; with none, from the last
+	// if it failed or was superseded.
+	var current *Record
 	for _, r := range h {
 		if r.Info.Status == "deployed" {
 			current = r
 		}
+	}
+	if current == nil {
+		if last.Info.Status != "failed" && last.Info.Status != "superseded" {
+			return fmt.Errorf("%q has no deployed releases", name)
+		}
+		current = last
 	}
 	user, err := userValues(files, sets)
 	if err != nil {
@@ -2179,4 +2218,154 @@ func releaseTest(name, ns string, filters []string, logs bool) error {
 		}
 	}
 	return runErr
+}
+
+// uninstallOrder is Helm's UninstallOrder, which is not quite installOrder
+// reversed: Services go before the workloads.
+var uninstallOrder = []string{
+	"APIService", "Ingress", "IngressClass", "Service", "CronJob", "Job",
+	"StatefulSet", "HorizontalPodAutoscaler", "Deployment", "ReplicaSet",
+	"ReplicationController", "Pod", "DaemonSet", "RoleBindingList",
+	"RoleBinding", "RoleList", "Role", "ClusterRoleBindingList",
+	"ClusterRoleBinding", "ClusterRoleList", "ClusterRole",
+	"CustomResourceDefinition", "PersistentVolumeClaim", "PersistentVolume",
+	"StorageClass", "ConfigMap", "SecretList", "Secret", "ServiceAccount",
+	"PodDisruptionBudget", "PodSecurityPolicy", "LimitRange", "ResourceQuota",
+	"NetworkPolicy", "Namespace", "PriorityClass",
+}
+
+// uninstall removes each release in turn, stopping at the first error.
+func uninstall(names []string, ns string, keepHistory, ignoreNotFound, dryRun bool) error {
+	k, err := connect()
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		h, err := k.history(ns, name)
+		if err != nil {
+			return err
+		}
+		switch {
+		case len(h) == 0 && dryRun:
+			return errNotFound
+		case len(h) == 0 && !ignoreNotFound:
+			return fmt.Errorf("uninstall: Release not loaded: %s: %w", name, errNotFound)
+		case len(h) > 0 && !dryRun:
+			kept, err := uninstallRelease(k, h, keepHistory)
+			if err != nil {
+				return err
+			}
+			if kept != "" {
+				fmt.Println("These resources were kept due to the resource policy:\n" + kept)
+			}
+		}
+		fmt.Printf("release %q uninstalled\n", name)
+	}
+	return nil
+}
+
+// uninstallRelease runs the latest revision's delete hooks around deleting
+// its objects, and returns the "[Kind] name" lines of those it kept.
+func uninstallRelease(k *kube, h []*Record, keepHistory bool) (string, error) {
+	rel := h[len(h)-1]
+	if rel.Info.Status == "uninstalled" {
+		if keepHistory {
+			return "", fmt.Errorf("the release named %q is already deleted", rel.Name)
+		}
+		return "", k.purge(h)
+	}
+	rel.Info.Status, rel.Info.Deleted = "uninstalling", Time{time.Now()}
+	rel.Info.Description = "Deletion in progress (or silently failed)"
+	if err := k.execHooks(rel, "pre-delete"); err != nil {
+		return "", err
+	}
+	if err := k.saveRecord(rel, true); err != nil {
+		return "", err
+	}
+
+	rank := map[string]int{}
+	for i, kind := range uninstallOrder {
+		rank[kind] = i
+	}
+	type doc struct {
+		kind, name, key, policy string
+		file                    File
+	}
+	var docs []doc
+	for i, m := range parseManifest(rel.Manifest) {
+		var head struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name        string            `json:"name"`
+				Annotations map[string]string `json:"annotations"`
+			} `json:"metadata"`
+		}
+		yaml.Unmarshal(m.Data, &head)
+		// Helm names the documents manifest-0, manifest-1, ... and orders
+		// those of one kind by that name, as text.
+		docs = append(docs, doc{head.Kind, head.Metadata.Name, fmt.Sprintf("manifest-%d", i),
+			strings.ToLower(strings.TrimSpace(head.Metadata.Annotations["helm.sh/resource-policy"])), m})
+	}
+	sort.SliceStable(docs, func(i, j int) bool {
+		a, b := docs[i], docs[j]
+		ra, aok := rank[a.kind]
+		rb, bok := rank[b.kind]
+		switch {
+		case a.kind == b.kind:
+			return a.key < b.key
+		case !aok && !bok:
+			return a.kind < b.kind
+		case !aok || !bok:
+			return aok
+		}
+		return ra < rb
+	})
+	var kept string
+	var doomed []File
+	for _, d := range docs {
+		if d.policy == "keep" {
+			kept += "[" + d.kind + "] " + d.name + "\n"
+		} else {
+			doomed = append(doomed, d.file)
+		}
+	}
+	objs, err := k.objects(doomed, rel.Namespace)
+	if err != nil {
+		return "", err
+	}
+	bg := metav1.DeletePropagationBackground
+	for _, o := range objs {
+		if err := o.res.Delete(k.ctx, o.obj.GetName(), metav1.DeleteOptions{PropagationPolicy: &bg}); err != nil && !apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("failed to delete release: %s", rel.Name)
+		}
+	}
+
+	var errs []string
+	if err := k.execHooks(rel, "post-delete"); err != nil {
+		errs = append(errs, err.Error())
+	}
+	rel.Info.Status, rel.Info.Description = "uninstalled", "Uninstallation complete"
+	if keepHistory {
+		err = k.saveRecord(rel, true)
+	} else {
+		err = k.purge(h)
+	}
+	if err != nil {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) > 0 {
+		return kept, fmt.Errorf("uninstallation completed with %d error(s): %s", len(errs), strings.Join(errs, "; "))
+	}
+	return kept, nil
+}
+
+// purge deletes the Secret of every revision.
+func (k *kube) purge(h []*Record) error {
+	for _, r := range h {
+		err := k.cs.CoreV1().Secrets(r.Namespace).Delete(k.ctx, fmt.Sprintf("sh.helm.release.v1.%s.v%d", r.Name, r.Version), metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
 }

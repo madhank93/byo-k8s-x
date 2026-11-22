@@ -67,6 +67,7 @@ func init() {
 	register(Stage{Slug: "hooks", Run: stageHooks})
 	register(Stage{Slug: "hook-weights", Run: stageHookWeights})
 	register(Stage{Slug: "test", Run: stageTest})
+	register(Stage{Slug: "uninstall", Run: stageUninstall})
 }
 
 const chartYAML = `apiVersion: v2
@@ -3667,4 +3668,277 @@ func stageTest(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	return wantRefusal(res, "Error: release: not found", "test nosuch, a release that does not exist")
+}
+
+// unObjects is the un chart's own objects: four kept by their resource
+// policy, one of them spelled " Keep ", across kinds whose uninstall order is
+// not their install order reversed.
+const unObjects = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-main
+data: {k: v}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-keep
+  annotations:
+    helm.sh/resource-policy: keep
+data: {k: v}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Release.Name }}-keep2
+  annotations:
+    helm.sh/resource-policy: keep
+stringData: {k: v}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-svc
+spec:
+  ports: [{port: 80}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-keep-svc
+  annotations:
+    helm.sh/resource-policy: " Keep "
+spec:
+  ports: [{port: 80}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-keep3
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  replicas: 0
+  selector: {matchLabels: {app: {{ .Release.Name }}-keep3}}
+  template:
+    metadata: {labels: {app: {{ .Release.Name }}-keep3}}
+    spec:
+      containers: [{name: c, image: busybox:1.36}]
+`
+
+// unChart has unObjects plus a ConfigMap hook for each delete event and,
+// with strict=true, a post-delete hook that cannot replace what is in its way.
+func unChart() map[string]string {
+	return map[string]string{
+		"Chart.yaml":            "apiVersion: v2\nname: un\nversion: 1.0.0\nappVersion: \"9.9\"\n",
+		"values.yaml":           "strict: false\n",
+		"templates/objs.yaml":   unObjects,
+		"templates/hooks.yaml":  hookCM("pre-delete", "pre-delete", "") + "---\n" + hookCM("post-delete", "post-delete", ""),
+		"templates/strict.yaml": "{{- if .Values.strict }}\n" + hookCM("strict", "post-delete", "hook-succeeded") + "{{- end }}\n",
+	}
+}
+
+// unKept is what uninstall prints for an un release, kept objects in
+// Helm's uninstall order.
+func unKept(name string) string {
+	return "These resources were kept due to the resource policy:\n[Service] " + name + "-keep-svc\n[Deployment] " + name + "-keep3\n[ConfigMap] " + name + "-keep\n[Secret] " + name + "-keep2\n\nrelease \"" + name + "\" uninstalled\n"
+}
+
+// stageUninstall — uninstall deletes a release's objects but those its
+// resource policy keeps, runs the delete hooks, and purges the records or,
+// with --keep-history, marks the last uninstalled; install --replace,
+// upgrade -i and rollback then reuse the name as helm does.
+func stageUninstall(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := needHelm(w); err != nil {
+		return err
+	}
+	ns := env.Namespace
+	core := env.Client.CoreV1()
+	un := w.chart("un", unChart())
+	uninstall := func(want string, args ...string) error {
+		res, err := wantStep(w, append([]string{"uninstall"}, args...)...)
+		if err != nil {
+			return err
+		}
+		return wantExact(res.Stdout, want, "uninstall "+strings.Join(args, " "))
+	}
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		if _, err := wantStep(w, "install", n, un); err != nil {
+			return err
+		}
+	}
+
+	// An object already gone is no error; kept ones keep the release's marks.
+	if err := core.Services(ns).Delete(ctx, "a-svc", metav1.DeleteOptions{}); err != nil {
+		return err
+	}
+	if err := uninstall(unKept("a"), "a"); err != nil {
+		return err
+	}
+	if err := wantGone(ctx, env, "a-main", "after uninstall a"); err != nil {
+		return err
+	}
+	if _, err := core.Services(ns).Get(ctx, "a-keep-svc", metav1.GetOptions{}); err != nil {
+		return fmt.Errorf("uninstall a should keep Service a-keep-svc, whose resource policy is \" Keep \" (Helm trims and lowercases it): %w", err)
+	}
+	keep, err := env.ConfigMap(ctx, "a-keep")
+	if err != nil {
+		return fmt.Errorf("uninstall a should keep ConfigMap a-keep, whose resource policy is keep: %w", err)
+	}
+	if err := wantMarks(keep, "a", ns); err != nil {
+		return fmt.Errorf("a kept object keeps the release's marks: %w", err)
+	}
+	if err := wantRevisions(ctx, env, "a", 0); err != nil {
+		return fmt.Errorf("uninstall a deletes every record of it: %w", err)
+	}
+	for _, h := range []string{"pre-delete", "post-delete"} {
+		if err := wantHookRevision(ctx, env, "a-"+h, "1", "after uninstall a: delete hooks run, and nothing deletes them"); err != nil {
+			return err
+		}
+	}
+	if err := sameAsHelm(w, []string{"status", "a"}, nil); err != nil {
+		return err
+	}
+	if _, err := wantStep(w, "install", "a", un); err != nil {
+		return fmt.Errorf("install a again, adopting the objects the uninstall kept, which carry a's marks: %w", err)
+	}
+
+	// --keep-history leaves the last record, uninstalled.
+	if _, err := wantStep(w, "upgrade", "b", un); err != nil {
+		return err
+	}
+	start := time.Now().Add(-time.Second)
+	if err := uninstall(unKept("b"), "--keep-history", "b"); err != nil {
+		return err
+	}
+	rec, err := wantRecord(ctx, env, "b", 2, "uninstalled", start, time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	if d := dig(rec, "info", "description"); d != "Uninstallation complete" {
+		return fmt.Errorf("after uninstall --keep-history b, revision 2's description should be \"Uninstallation complete\", got %v", d)
+	}
+	if t, err := time.Parse(time.RFC3339Nano, fmt.Sprint(dig(rec, "info", "deleted"))); err != nil || t.Before(start) {
+		return fmt.Errorf("after uninstall --keep-history b, revision 2's info.deleted should be when it was uninstalled, got %v", dig(rec, "info", "deleted"))
+	}
+	if _, err := wantRecord(ctx, env, "b", 1, "superseded", time.Now().Add(-5*time.Minute), time.Now().Add(time.Second)); err != nil {
+		return err
+	}
+	if err := wantGone(ctx, env, "b-main", "after uninstall --keep-history b"); err != nil {
+		return err
+	}
+	for _, args := range [][]string{{"list"}, {"list", "-a"}, {"list", "--uninstalled"}, {"status", "b"}, {"history", "b"}} {
+		if err := sameAsHelm(w, args, nil); err != nil {
+			return err
+		}
+	}
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"uninstall", "--keep-history", "b"}, `Error: the release named "b" is already deleted`},
+		{[]string{"install", "b", un}, "Error: INSTALLATION FAILED: cannot re-use a name that is still in use"},
+		{[]string{"upgrade", "b", un}, `Error: UPGRADE FAILED: "b" has no deployed releases`},
+		{[]string{"uninstall", "nosuch"}, "Error: uninstall: Release not loaded: nosuch: release: not found"},
+	} {
+		res, err := w.run(c.args...)
+		if err != nil {
+			return err
+		}
+		if err := wantRefusal(res, c.want, strings.Join(c.args, " ")); err != nil {
+			return err
+		}
+	}
+	if err := uninstall("release \"nosuch\" uninstalled\n", "--ignore-not-found", "nosuch"); err != nil {
+		return err
+	}
+	if _, err := wantStep(w, "install", "--replace", "b", un); err != nil {
+		return err
+	}
+	if err := sameAsHelm(w, []string{"history", "b"}, nil); err != nil {
+		return err
+	}
+	if _, err := wantRecord(ctx, env, "b", 3, "deployed", time.Now().Add(-time.Minute), time.Now().Add(time.Second)); err != nil {
+		return fmt.Errorf("install --replace b should install revision 3, after the uninstalled 2: %w", err)
+	}
+	if rec, err = wantRecord(ctx, env, "b", 2, "superseded", time.Now().Add(-time.Minute), time.Now().Add(time.Second)); err != nil {
+		return err
+	}
+	if d := dig(rec, "info", "description"); d != "superseded by new release" {
+		return fmt.Errorf("install --replace b should supersede revision 2 with description \"superseded by new release\", got %v", d)
+	}
+
+	// upgrade -i and rollback start again from an uninstalled release.
+	if err := uninstall(unKept("c"), "--keep-history", "c"); err != nil {
+		return err
+	}
+	res, err := wantStep(w, "upgrade", "-i", "c", un)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(res.Stdout, "Release \"c\" does not exist. Installing it now.\nNAME: c\n") {
+		return fmt.Errorf("upgrade -i c, whose last revision is uninstalled, should say Release \"c\" does not exist. Installing it now. and install it, got:\n%s", tail(res.Stdout))
+	}
+	if err := uninstall(unKept("d"), "--keep-history", "d"); err != nil {
+		return err
+	}
+	if _, err := wantStep(w, "rollback", "d", "1"); err != nil {
+		return err
+	}
+	if _, err := env.ConfigMap(ctx, "d-main"); err != nil {
+		return fmt.Errorf("rollback d 1, from an uninstalled revision 1, should create d-main again: %w", err)
+	}
+	for _, n := range []string{"c", "d"} {
+		if err := sameAsHelm(w, []string{"history", n}, nil); err != nil {
+			return err
+		}
+	}
+	if err := uninstall("release \"d\" uninstalled\n", "--dry-run", "d"); err != nil {
+		return err
+	}
+	if _, err := env.ConfigMap(ctx, "d-main"); err != nil {
+		return fmt.Errorf("uninstall --dry-run d should change nothing, yet d-main is gone: %w", err)
+	}
+	if err := wantRevisions(ctx, env, "d", 2); err != nil {
+		return fmt.Errorf("uninstall --dry-run d should change nothing: %w", err)
+	}
+	if err := uninstall(unKept("c")+unKept("d"), "c", "d"); err != nil {
+		return err
+	}
+
+	// Uninstalling a kept history purges it.
+	if err := uninstall(unKept("e"), "--keep-history", "e"); err != nil {
+		return err
+	}
+	if err := uninstall("release \"e\" uninstalled\n", "e"); err != nil {
+		return err
+	}
+	if err := wantRevisions(ctx, env, "e", 0); err != nil {
+		return fmt.Errorf("uninstall e, already uninstalled with its history kept, purges that history: %w", err)
+	}
+
+	// A failed post-delete hook fails the command, but the release is gone.
+	if _, err := wantStep(w, "install", "--set", "strict=true", "f", un); err != nil {
+		return err
+	}
+	if err := seedConfigMap(ctx, env, "f-strict", nil, nil); err != nil {
+		return err
+	}
+	if res, err = w.run("uninstall", "f"); err != nil {
+		return err
+	}
+	for _, s := range []string{"Error: uninstallation completed with 1 error(s): warning: Hook post-delete un/templates/strict.yaml failed: ", `configmaps "f-strict" already exists`} {
+		if err := wantRefusal(res, s, "uninstall f, whose post-delete hook f-strict (policy hook-succeeded only) is already in the cluster"); err != nil {
+			return err
+		}
+	}
+	if err := wantRevisions(ctx, env, "f", 0); err != nil {
+		return fmt.Errorf("uninstall f still deletes the release when a post-delete hook fails: %w", err)
+	}
+	return wantGone(ctx, env, "f-main", "after uninstall f")
 }
