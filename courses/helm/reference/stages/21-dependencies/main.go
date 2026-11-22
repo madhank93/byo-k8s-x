@@ -85,7 +85,10 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -412,13 +415,39 @@ type Release struct {
 }
 
 // load reads a chart directory, or a packaged chart when dir is a file.
+// A directory's .helmignore governs its whole tree, subcharts included.
 func load(dir string) (*Chart, error) {
 	if fi, err := os.Stat(dir); err == nil && !fi.IsDir() {
 		return loadArchive(dir)
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "Chart.yaml"))
+	rules, err := ignoreRules(dir)
 	if err != nil {
-		return nil, fmt.Errorf("%s is not a chart: %w", dir, err)
+		return nil, err
+	}
+	return loadDir(dir, "", rules)
+}
+
+// loadDir reads the chart in dir, which sits at prefix inside the directory
+// whose ignore rules apply; an archive's contents are loaded with none.
+func loadDir(dir, prefix string, rules []string) (*Chart, error) {
+	skip := func(rel string, isDir bool) bool { return ignored(rules, prefix+rel, isDir) }
+	// read is a file Helm reads itself, or nil when it is absent or ignored.
+	read := func(name string) ([]byte, error) {
+		if skip(name, false) {
+			return nil, nil
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return raw, err
+	}
+	raw, err := read("Chart.yaml")
+	if err != nil {
+		return nil, err
+	}
+	if raw == nil {
+		return nil, errors.New("Chart.yaml file is missing")
 	}
 	c := &Chart{Files: Files{}}
 	if err := yaml.Unmarshal(raw, &c.Metadata); err != nil {
@@ -431,31 +460,24 @@ func load(dir string) (*Chart, error) {
 	if err := validate(c.Metadata); err != nil {
 		return nil, err
 	}
-	if raw, err := os.ReadFile(filepath.Join(dir, "values.schema.json")); err == nil {
-		c.Schema = raw
-	} else if !errors.Is(err, fs.ErrNotExist) {
+	if c.Schema, err = read("values.schema.json"); err != nil {
 		return nil, err
 	}
-	if raw, err := os.ReadFile(filepath.Join(dir, "Chart.lock")); err == nil {
+	if raw, err := read("Chart.lock"); err != nil {
+		return nil, err
+	} else if raw != nil {
 		c.Lock = &Lock{}
 		if err := yaml.Unmarshal(raw, c.Lock); err != nil {
 			return nil, fmt.Errorf("cannot load Chart.lock: %w", err)
 		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
 	}
 	c.Values = map[string]any{}
-	if raw, err := os.ReadFile(filepath.Join(dir, "values.yaml")); err == nil {
-		c.Raw = raw
-		if err := yaml.Unmarshal(raw, &c.Values); err != nil {
+	if c.Raw, err = read("values.yaml"); err != nil {
+		return nil, err
+	} else if c.Raw != nil {
+		if err := yaml.Unmarshal(c.Raw, &c.Values); err != nil {
 			return nil, fmt.Errorf("cannot load values.yaml: %w", err)
 		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
-	ignore, err := ignoreRules(dir)
-	if err != nil {
-		return nil, err
 	}
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -466,17 +488,13 @@ func load(dir string) (*Chart, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if ignored(ignore, rel, d.IsDir()) {
+		if skip(rel, d.IsDir()) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if d.IsDir() {
-			return nil
-		}
-		// Helm never loads dotfiles directly under templates/.
-		if strings.HasPrefix(rel, "templates/.") {
 			return nil
 		}
 		// Files Helm reads itself, and subcharts, are not .Files.
@@ -505,14 +523,17 @@ func load(dir string) (*Chart, error) {
 	sort.Slice(c.Templates, func(i, j int) bool { return c.Templates[i].Name < c.Templates[j].Name })
 
 	// Helm loads every entry of charts/ as a chart, packaged or not.
-	entries, err := os.ReadDir(filepath.Join(dir, "charts"))
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
+	var entries []fs.DirEntry
+	if !skip("charts", true) {
+		entries, err = os.ReadDir(filepath.Join(dir, "charts"))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
 	}
 	for _, e := range entries {
 		// Helm ignores entries starting with . or _, and keeps provenance
 		// files as plain files of the parent.
-		if strings.HasPrefix(e.Name(), ".") || strings.HasPrefix(e.Name(), "_") {
+		if strings.HasPrefix(e.Name(), ".") || strings.HasPrefix(e.Name(), "_") || skip("charts/"+e.Name(), e.IsDir()) {
 			continue
 		}
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".prov") {
@@ -526,7 +547,13 @@ func load(dir string) (*Chart, error) {
 		if !e.IsDir() && !strings.HasSuffix(e.Name(), ".tgz") {
 			return nil, fmt.Errorf("error unpacking subchart %s in %s: not a chart directory", e.Name(), c.Metadata.Name)
 		}
-		sub, err := load(filepath.Join(dir, "charts", e.Name()))
+		p := filepath.Join(dir, "charts", e.Name())
+		var sub *Chart
+		if e.IsDir() {
+			sub, err = loadDir(p, prefix+"charts/"+e.Name()+"/", rules)
+		} else {
+			sub, err = loadArchive(p)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("error unpacking subchart %s in %s: %w", e.Name(), c.Metadata.Name, err)
 		}
@@ -2602,6 +2629,7 @@ func depUpdate(dir string, out io.Writer) error {
 	if err := checkRepos(dir, reqs); err != nil {
 		return err
 	}
+	updateRepos(reqs, out)
 	lock, err := resolveDeps(dir, reqs)
 	if err != nil {
 		return err
@@ -2629,6 +2657,9 @@ func depBuild(dir string, out io.Writer) error {
 	if c.Lock == nil {
 		return depUpdate(dir, out)
 	}
+	if err := checkRepos(dir, c.Metadata.Dependencies); err != nil {
+		return err
+	}
 	sum, err := hashDeps(c.Metadata.Dependencies, c.Lock.Dependencies)
 	if err != nil {
 		return err
@@ -2636,31 +2667,169 @@ func depBuild(dir string, out io.Writer) error {
 	if sum != c.Lock.Digest {
 		return errors.New("the lock file (Chart.lock) is out of sync with the dependencies file (Chart.yaml). Please update the dependencies")
 	}
-	if err := checkRepos(dir, c.Metadata.Dependencies); err != nil {
-		return err
-	}
-	return fetchDeps(dir, c.Lock.Dependencies, out)
-}
-
-// checkRepos insists every file:// repository exists. Chart repositories over
-// HTTP or OCI would need `helm repo add`, which this program has no store for.
-func checkRepos(dir string, reqs []Dependency) error {
+	// Build fetches only from repositories `helm repo add` knows, and this
+	// program keeps no such list, so a locked chart repository is refused.
 	var missing []string
-	for _, d := range reqs {
-		switch {
-		case d.Repository == "":
-		case strings.HasPrefix(d.Repository, "file://"):
-			if _, err := localPath(d.Repository, dir); err != nil {
-				return err
-			}
-		default:
+	for _, d := range c.Lock.Dependencies {
+		if d.Repository != "" && !strings.HasPrefix(d.Repository, "file://") && !strings.HasPrefix(d.Repository, "oci://") {
 			missing = append(missing, d.Repository)
 		}
 	}
 	if missing != nil {
 		return fmt.Errorf("no repository definition for %s. Please add the missing repos via 'helm repo add'", strings.Join(missing, ", "))
 	}
+	return fetchDeps(dir, c.Lock.Dependencies, out)
+}
+
+// checkRepos is Helm's first pass over the dependencies: a file://
+// repository must exist, and one that is not a URL names a repository
+// `helm repo add` would have to know, which this program keeps no list of.
+func checkRepos(dir string, reqs []Dependency) error {
+	var missing []string
+	note := false
+	for _, d := range reqs {
+		r := d.Repository
+		if r == "" {
+			continue
+		}
+		if strings.HasPrefix(r, "file://") {
+			if _, err := localPath(r, dir); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := url.ParseRequestURI(r); err == nil {
+			continue
+		}
+		missing = append(missing, r)
+		if !strings.Contains(r, "//") && !strings.HasPrefix(r, "@") && !strings.HasPrefix(r, "alias:") {
+			note = true
+		}
+	}
+	if missing == nil {
+		return nil
+	}
+	msg := fmt.Sprintf("no repository definition for %s. Please add them via 'helm repo add'", strings.Join(missing, ", "))
+	if note {
+		msg += `
+Note that repositories must be URLs or aliases. For example, to refer to the "example"
+repository, use "https://charts.example.com/" or "@example" instead of
+"example". Don't forget to add the repo, too ('helm repo add').`
+	}
+	return errors.New(msg)
+}
+
+func isRemote(repo string) bool {
+	return strings.HasPrefix(repo, "http://") || strings.HasPrefix(repo, "https://")
+}
+
+// Index is a chart repository's index.yaml: every version of every chart,
+// with the URLs its archive can be fetched from.
+type Index struct {
+	APIVersion string `json:"apiVersion"`
+	Entries    map[string][]struct {
+		Version string   `json:"version"`
+		URLs    []string `json:"urls"`
+	} `json:"entries"`
+}
+
+// repoCache is where Helm keeps downloaded repository indexes.
+func repoCache() string {
+	if d := os.Getenv("HELM_REPOSITORY_CACHE"); d != "" {
+		return d
+	}
+	if d := os.Getenv("HELM_CACHE_HOME"); d != "" {
+		return filepath.Join(d, "repository")
+	}
+	d, _ := os.UserCacheDir()
+	return filepath.Join(d, "helm", "repository")
+}
+
+// managerName is the name Helm files a repository it was never told about
+// under: helm-manager- and the sha256 of its URL as written.
+func managerName(repo string) string {
+	return fmt.Sprintf("helm-manager-%x", sha256.Sum256([]byte(repo)))
+}
+
+// fetch GETs a URL, wanting 200.
+func fetch(u string) ([]byte, error) {
+	resp, err := http.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch %s : %s", u, resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// updateRepos downloads the index of each dependency's chart repository into
+// the cache. A failure is reported and passed over: resolving the dependency
+// then finds no cached index. Helm fetches them in parallel, so the lines
+// come in no fixed order, and a dependency whose name an earlier one already
+// has is skipped.
+func updateRepos(reqs []Dependency, out io.Writer) {
+	var repos []string
+	seen := map[string]bool{}
+	for _, d := range reqs {
+		if isRemote(d.Repository) && !seen[d.Name] {
+			seen[d.Name] = true
+			repos = append(repos, d.Repository)
+		}
+	}
+	if repos == nil {
+		return
+	}
+	fmt.Fprintln(out, "Getting updates for unmanaged Helm repositories...")
+	for _, r := range repos {
+		data, err := fetch(strings.TrimSuffix(r, "/") + "/index.yaml")
+		if err == nil {
+			err = parseIndex(data, &Index{})
+		}
+		if err == nil {
+			err = os.MkdirAll(repoCache(), 0o755)
+		}
+		if err == nil {
+			err = os.WriteFile(filepath.Join(repoCache(), managerName(r)+"-index.yaml"), data, 0o644)
+		}
+		if err != nil {
+			fmt.Fprintf(out, "...Unable to get an update from the %q chart repository:\n\t%s\n", r, err)
+			continue
+		}
+		fmt.Fprintf(out, "...Successfully got an update from the %q chart repository\n", r)
+	}
+}
+
+// parseIndex reads an index, newest version of each chart first.
+func parseIndex(data []byte, idx *Index) error {
+	if err := yaml.Unmarshal(data, idx); err != nil {
+		return err
+	}
+	if idx.APIVersion == "" {
+		return errors.New("no API version specified")
+	}
+	for _, vs := range idx.Entries {
+		sort.SliceStable(vs, func(i, j int) bool {
+			a, errA := semver.NewVersion(vs[i].Version)
+			b, errB := semver.NewVersion(vs[j].Version)
+			return errA == nil && (errB != nil || a.GreaterThan(b))
+		})
+	}
 	return nil
+}
+
+// cachedIndex is a repository's index as the last update saved it.
+func cachedIndex(repo string) (*Index, error) {
+	name := managerName(repo)
+	data, err := os.ReadFile(filepath.Join(repoCache(), name+"-index.yaml"))
+	if err == nil {
+		idx := &Index{}
+		if err = parseIndex(data, idx); err == nil {
+			return idx, nil
+		}
+	}
+	return nil, fmt.Errorf("no cached repository for %s found. (try 'helm repo update'): %w", name, err)
 }
 
 // localPath resolves a file:// repository against the chart's directory.
@@ -2693,6 +2862,27 @@ func resolveDeps(dir string, reqs []Dependency) (*Lock, error) {
 				return nil, err
 			}
 			locked[i] = Dependency{Name: d.Name, Version: d.Version}
+			continue
+		}
+		if isRemote(d.Repository) {
+			idx, err := cachedIndex(d.Repository)
+			if err != nil {
+				return nil, err
+			}
+			vs, ok := idx.Entries[d.Name]
+			if !ok {
+				return nil, fmt.Errorf("%s chart not found in repo %s", d.Name, d.Repository)
+			}
+			locked[i] = Dependency{Name: d.Name, Repository: d.Repository}
+			for _, e := range vs {
+				if v, err := semver.NewVersion(e.Version); err == nil && len(e.URLs) > 0 && constraint.Check(v) {
+					locked[i].Version = v.Original()
+					break
+				}
+			}
+			if locked[i].Version == "" {
+				missing = append(missing, fmt.Sprintf("%q (repository %q, version %q)", d.Name, d.Repository, d.Version))
+			}
 			continue
 		}
 		p, err := localPath(d.Repository, dir)
@@ -2752,6 +2942,14 @@ func fetchDeps(dir string, deps []Dependency, out io.Writer) error {
 	fmt.Fprintf(out, "Saving %d charts\n", len(deps))
 	local := map[string]bool{}
 	for _, d := range deps {
+		if isRemote(d.Repository) {
+			fmt.Fprintf(out, "Downloading %s from repo %s\n", d.Name, d.Repository)
+			if err := fetchRemote(d, tmp); err != nil {
+				fmt.Fprintln(out, "Save error occurred: ", err)
+				return err
+			}
+			continue
+		}
 		if d.Repository != "" {
 			if err := fetchLocal(dir, d, tmp); err != nil {
 				fmt.Fprintln(out, "Save error occurred: ", err)
@@ -2806,6 +3004,38 @@ func fetchDeps(dir string, deps []Dependency, out io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// fetchRemote downloads a locked chart into dest, named as its URL ends. A
+// relative URL in the index is relative to the repository.
+func fetchRemote(d Dependency, dest string) error {
+	idx, err := cachedIndex(d.Repository)
+	if err != nil {
+		return err
+	}
+	var ref string
+	for _, e := range idx.Entries[d.Name] {
+		if e.Version == d.Version && len(e.URLs) > 0 {
+			ref = e.URLs[0]
+			break
+		}
+	}
+	if ref == "" {
+		return fmt.Errorf("chart %s version %s not found in repo %s", d.Name, d.Version, d.Repository)
+	}
+	base, err := url.Parse(strings.TrimSuffix(d.Repository, "/") + "/")
+	if err != nil {
+		return err
+	}
+	u, err := base.Parse(ref)
+	if err != nil {
+		return err
+	}
+	data, err := fetch(u.String())
+	if err != nil {
+		return fmt.Errorf("could not download %s: %w", u, err)
+	}
+	return os.WriteFile(filepath.Join(dest, path.Base(u.Path)), data, 0o644)
 }
 
 // fetchLocal packages a file:// dependency into dest, if its chart still has
@@ -2997,44 +3227,54 @@ func loadArchive(file string) (*Chart, error) {
 			return nil, err
 		}
 	}
-	return load(tmp)
+	return loadDir(tmp, "", nil)
 }
 
-// ignoreRules reads the chart's .helmignore, if it has one.
+// ignoreRules reads the chart's .helmignore, if it has one, and appends
+// Helm's default rule: no dotfiles directly under templates/.
 func ignoreRules(dir string) ([]string, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, ".helmignore"))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	var rules []string
 	for _, l := range strings.Split(string(raw), "\n") {
-		if l = strings.TrimSpace(l); l != "" && !strings.HasPrefix(l, "#") {
-			rules = append(rules, l)
-		}
-	}
-	return rules, nil
-}
-
-// ignored applies .helmignore to a slash path: a pattern without a slash
-// matches the base name, one with a slash the whole path, and a trailing
-// slash only directories.
-// ponytail: no ! negation; add it with Helm's odd rule that a non-matching
-// negation ignores the path.
-func ignored(rules []string, rel string, isDir bool) bool {
-	for _, p := range rules {
-		dirOnly := strings.HasSuffix(p, "/")
-		p = strings.TrimSuffix(p, "/")
-		if dirOnly && !isDir {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "#") {
 			continue
 		}
+		if strings.Contains(l, "**") {
+			return nil, errors.New("double-star (**) syntax is not supported")
+		}
+		if _, err := filepath.Match(l, "abc"); err != nil {
+			return nil, err
+		}
+		rules = append(rules, l)
+	}
+	return append(rules, "templates/.?*"), nil
+}
+
+// ignored applies .helmignore to a slash path relative to the directory the
+// rules came from. A pattern starting with / or holding a slash matches the
+// whole path, any other the base name; a trailing slash means directories
+// only. A negation ignores every path it does not match, as Helm's does.
+func ignored(rules []string, rel string, isDir bool) bool {
+	for _, p := range rules {
+		negate := strings.HasPrefix(p, "!")
+		p = strings.TrimPrefix(p, "!")
+		dirOnly := strings.HasSuffix(p, "/")
+		p = strings.TrimSuffix(p, "/")
 		name := rel
 		if !strings.Contains(p, "/") {
-			name = filepath.Base(rel)
+			name = path.Base(rel)
 		}
-		if ok, _ := filepath.Match(strings.TrimPrefix(p, "/"), name); ok {
+		match, _ := filepath.Match(strings.TrimPrefix(p, "/"), name)
+		switch {
+		case negate && (dirOnly && !isDir || !match):
+			return true
+		case negate, dirOnly && !isDir:
+			continue
+		case match:
 			return true
 		}
 	}

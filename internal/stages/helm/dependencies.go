@@ -7,6 +7,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,21 +27,24 @@ import (
 type depWork struct {
 	w     *work
 	roots [2]string // the real helm's copy, then the program's
-	env   []string
+	env   [2][]string
 }
 
 func newDepWork(w *work) *depWork {
 	d := &depWork{w: w, roots: [2]string{filepath.Join(w.dir, "h"), filepath.Join(w.dir, "a")}}
-	// No configured repositories, so update and build fetch nothing over the
-	// network and print no "Hang tight" lines about the grader's machine.
-	home := filepath.Join(w.dir, "helm-home")
-	d.env = append([]string{
-		"HELM_CONFIG_HOME=" + home + "/config",
-		"HELM_CACHE_HOME=" + home + "/cache",
-		"HELM_DATA_HOME=" + home + "/data",
-		"HELM_REPOSITORY_CONFIG=" + home + "/config/repositories.yaml",
-		"HELM_REPOSITORY_CACHE=" + home + "/cache/repository",
-	}, w.kc...)
+	// A helm home per side, with no configured repositories: update prints no
+	// "Hang tight" lines about the grader's machine, and neither side can
+	// read the repository indexes the other downloaded.
+	for i, root := range d.roots {
+		home := filepath.Join(root, ".helm")
+		d.env[i] = append([]string{
+			"HELM_CONFIG_HOME=" + home + "/config",
+			"HELM_CACHE_HOME=" + home + "/cache",
+			"HELM_DATA_HOME=" + home + "/data",
+			"HELM_REPOSITORY_CONFIG=" + home + "/config/repositories.yaml",
+			"HELM_REPOSITORY_CACHE=" + home + "/cache/repository",
+		}, w.kc...)
+	}
 	return d
 }
 
@@ -77,6 +82,11 @@ func (d *depWork) path(i int, rel string) string {
 // same runs one command on both copies and wants the same exit code, stdout
 // and Error: line from each.
 func (d *depWork) same(why string, args ...string) error {
+	return d.compare(why, false, args...)
+}
+
+// compare is same, wanting all of stderr to match when whole is set.
+func (d *depWork) compare(why string, whole bool, args ...string) error {
 	var res [2]*runner.Result
 	for i, root := range d.roots {
 		a := make([]string, len(args))
@@ -87,11 +97,11 @@ func (d *depWork) same(why string, args ...string) error {
 		if i == 0 {
 			bin = "helm"
 		}
-		r, err := runner.InvokeEnv(d.w.ctx, bin, d.env, stages.Timeout, a...)
+		r, err := runner.InvokeEnv(d.w.ctx, bin, d.env[i], stages.Timeout, a...)
 		if err != nil {
 			return err
 		}
-		r.Stdout = strings.ReplaceAll(r.Stdout, root, "ROOT")
+		r.Stdout = sortUpdates(strings.ReplaceAll(r.Stdout, root, "ROOT"))
 		r.Stderr = strings.ReplaceAll(r.Stderr, root, "ROOT")
 		res[i] = r
 	}
@@ -103,7 +113,36 @@ func (d *depWork) same(why string, args ...string) error {
 	if err := wantExact(got.Stdout, want.Stdout, what+", stdout as the real helm prints it"); err != nil {
 		return err
 	}
+	if whole {
+		return wantExact(got.Stderr, want.Stderr, what+", stderr as the real helm prints it")
+	}
 	return wantExact(errorLines(got.Stderr), errorLines(want.Stderr), what+", the Error: line on stderr")
+}
+
+// sortUpdates sorts each run of "...Successfully"/"...Unable" lines, with the
+// tab-indented reason under each, because Helm fetches repository indexes in
+// parallel and prints them as they finish.
+func sortUpdates(s string) string {
+	lines := strings.SplitAfter(s, "\n")
+	var out, run []string
+	flush := func() {
+		sort.Strings(run)
+		out = append(out, run...)
+		run = nil
+	}
+	for _, l := range lines {
+		switch {
+		case strings.HasPrefix(l, "..."):
+			run = append(run, l)
+		case strings.HasPrefix(l, "\t") && run != nil:
+			run[len(run)-1] += l
+		default:
+			flush()
+			out = append(out, l)
+		}
+	}
+	flush()
+	return strings.Join(out, "")
 }
 
 func errorLines(s string) string {
@@ -300,13 +339,7 @@ func stageDependencies(ctx context.Context, env *kube.Env, bin string) error {
 	})
 	ns := env.Namespace
 
-	type step struct {
-		why  string
-		args []string
-		tree string // the chart whose files to compare afterwards
-		do   func()
-	}
-	steps := []step{
+	steps := []depStep{
 		{why: "a chart with no dependencies", args: []string{"dependency", "list", "ROOT/lib"}},
 		{why: "nothing in charts/ yet", args: []string{"dependency", "list", "ROOT/app"}},
 		{why: "a dependency missing from charts/", args: []string{"template", "-n", ns, "x", "ROOT/app"}},
@@ -341,18 +374,8 @@ func stageDependencies(ctx context.Context, env *kube.Env, bin string) error {
 		{why: "both subcharts", args: []string{"template", "-n", ns, "x", "ROOT/app"}},
 		{why: "lock in sync", args: []string{"dependency", "build", "ROOT/app"}, tree: "app"},
 	}
-	for _, s := range steps {
-		if s.do != nil {
-			s.do()
-		}
-		if err := d.same(s.why, s.args...); err != nil {
-			return err
-		}
-		if s.tree != "" {
-			if err := d.sameTree(s.tree, "app "+strings.Join(s.args, " ")); err != nil {
-				return err
-			}
-		}
+	if err := d.run(steps); err != nil {
+		return err
 	}
 
 	// An update that resolves what the lock already says leaves it alone.
@@ -390,6 +413,228 @@ func stageDependencies(ctx context.Context, env *kube.Env, bin string) error {
 	if err := d.same("a dependency missing from charts/", "package", "-d", "ROOT/out", "ROOT/lone"); err != nil {
 		return err
 	}
-	return d.sameArchive("--dependency-update fetches it first", "out", "lone-0.3.0.tgz", "lone",
-		"package", "-u", "-d", "ROOT/out", "ROOT/lone")
+	if err := d.sameArchive("--dependency-update fetches it first", "out", "lone-0.3.0.tgz", "lone",
+		"package", "-u", "-d", "ROOT/out", "ROOT/lone"); err != nil {
+		return err
+	}
+	if err := ignoreSteps(d, ns); err != nil {
+		return err
+	}
+	return repoSteps(d, ns)
+}
+
+type depStep struct {
+	why    string
+	args   []string
+	tree   string // the chart whose files to compare afterwards
+	do     func()
+	stderr bool // compare all of stderr, not only the Error: line
+}
+
+func (d *depWork) run(steps []depStep) error {
+	for _, s := range steps {
+		if s.do != nil {
+			s.do()
+		}
+		if err := d.compare(s.why, s.stderr, s.args...); err != nil {
+			return err
+		}
+		if s.tree != "" {
+			if err := d.sameTree(s.tree, "app "+strings.Join(s.args, " ")); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// filesCM lists a chart's .Files, which is what .helmignore decides.
+const filesCM = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Chart.Name }}-files\ndata:\n  files: \"{{ range $k, $v := .Files }}{{ $k }},{{ end }}\"\n"
+
+// ignoreSteps: a directory's .helmignore covers its whole tree, unpacked
+// subcharts included and their own .helmignore not, with Helm's negation
+// and its refusal of **; a packaged chart is read with no rules at all.
+func ignoreSteps(d *depWork, ns string) error {
+	d.writeChart("ign", map[string]string{
+		"Chart.yaml":                      "apiVersion: v2\nname: ign\nversion: 0.1.0\n",
+		"values.yaml":                     "k: v\n",
+		"templates/files.yaml":            filesCM,
+		"README.md":                       "top\n",
+		"docs/README.md":                  "nested\n",
+		"docs/guide.txt":                  "kept\n",
+		"run.log":                         "dropped\n",
+		"charts/sub/Chart.yaml":           "apiVersion: v2\nname: sub\nversion: 0.1.0\n",
+		"charts/sub/templates/files.yaml": filesCM,
+		"charts/sub/templates/.dot.yaml":  "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: sub-dot\n",
+		"charts/sub/.helmignore":          "*.txt\n",
+		"charts/sub/a.txt":                "the subchart's own .helmignore does not apply\n",
+		"charts/sub/b.log":                "the parent's does\n",
+	})
+	steps := []depStep{
+		{why: "a rule anchored at / against one that is not", args: []string{"template", "-n", ns, "x", "ROOT/ign"},
+			do: func() { d.write("ign/.helmignore", "# comment\n/README.md\n*.log\n") }},
+		{why: "a directory rule", args: []string{"template", "-n", ns, "x", "ROOT/ign"},
+			do: func() { d.write("ign/.helmignore", "docs/\n") }},
+		{why: "a negation ignores every path it does not match", args: []string{"template", "-n", ns, "x", "ROOT/ign"},
+			do: func() { d.write("ign/.helmignore", "!*.yaml\n") }},
+		{why: "a negation that leaves Chart.yaml out", args: []string{"template", "-n", ns, "x", "ROOT/ign"},
+			do: func() { d.write("ign/.helmignore", "!*.md\n") }},
+		{why: "a negation followed by a rule", args: []string{"template", "-n", ns, "x", "ROOT/ign"},
+			do: func() { d.write("ign/.helmignore", "!*\n*.md\n") }},
+		{why: "** is refused", args: []string{"template", "-n", ns, "x", "ROOT/ign"},
+			do: func() { d.write("ign/.helmignore", "docs/**\n") }},
+		{why: "a pattern that does not parse", args: []string{"package", "-d", "ROOT/out", "ROOT/ign"},
+			do: func() { d.write("ign/.helmignore", "[\n") }},
+	}
+	if err := d.run(steps); err != nil {
+		return err
+	}
+	d.write("ign/.helmignore", "*.log\n!*\ndocs/\n")
+	if err := d.sameArchive("a negation then a directory rule", "out", "ign-0.1.0.tgz", "ign",
+		"package", "-d", "ROOT/out", "ROOT/ign"); err != nil {
+		return err
+	}
+
+	// No helm package writes an archive holding files its .helmignore names,
+	// so the grader makes one, with a dotfile template besides.
+	tgz, err := tarGz(map[string]string{
+		"made/Chart.yaml":           "apiVersion: v2\nname: made\nversion: 0.1.0\n",
+		"made/.helmignore":          "*.md\ntemplates/\n",
+		"made/notes.md":             "an archive's .helmignore is not applied\n",
+		"made/templates/files.yaml": filesCM,
+		"made/templates/.dot.yaml":  "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: made-dot\n",
+	})
+	if err != nil {
+		return err
+	}
+	d.write("made-0.1.0.tgz", tgz)
+	return d.same("a packaged chart, loaded with no ignore rules", "template", "-n", ns, "x", "ROOT/made-0.1.0.tgz")
+}
+
+func tarGz(files map[string]string) (string, error) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(zw)
+	names := make([]string, 0, len(files))
+	for n := range files {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if err := tw.WriteHeader(&tar.Header{Name: n, Mode: 0o644, Size: int64(len(files[n])), ModTime: time.Now()}); err != nil {
+			return "", err
+		}
+		if _, err := tw.Write([]byte(files[n])); err != nil {
+			return "", err
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return "", err
+	}
+	if err := zw.Close(); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// repoSteps: dependency update against a chart repository served over HTTP
+// that `helm repo add` never heard of. Its index is listed out of version
+// order, one URL in it is relative, and one archive is missing.
+func repoSteps(d *depWork, ns string) error {
+	served := map[string][]byte{}
+	for _, c := range []struct{ name, version, path string }{
+		{"db", "1.3.0", "db-1.3.0.tgz"}, {"db", "2.0.0", "db-2.0.0.tgz"}, {"db", "1.4.2", "pkg/db-1.4.2.tgz"},
+		{"db", "2.1.0-beta.1", "db-2.1.0-beta.1.tgz"}, {"cache", "1.0.0", "cache-1.0.0.tgz"},
+	} {
+		src := filepath.Join(d.w.dir, "repo-src", c.name+"-"+c.version)
+		for name, body := range map[string]string{
+			"Chart.yaml":        fmt.Sprintf("apiVersion: v2\nname: %s\nversion: %s\n", c.name, c.version),
+			"templates/cm.yaml": fmt.Sprintf("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-%s\ndata:\n  version: %q\n", c.name, c.version),
+		} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(src, name)), 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(src, name), []byte(body), 0o644); err != nil {
+				return err
+			}
+		}
+		out := filepath.Join(d.w.dir, "repo-out")
+		if res, err := d.w.helm("package", "-d", out, src); err != nil {
+			return err
+		} else if res.ExitCode != 0 {
+			return fmt.Errorf("the grader's helm package %s: %s", src, res.Stderr)
+		}
+		raw, err := os.ReadFile(filepath.Join(out, c.name+"-"+c.version+".tgz"))
+		if err != nil {
+			return err
+		}
+		served["/"+c.path] = raw
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := served[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(body)
+	}))
+	defer srv.Close()
+	u := srv.URL
+	served["/index.yaml"] = []byte(fmt.Sprintf(`apiVersion: v1
+entries:
+  db:
+  - {name: db, version: 1.3.0, urls: [%[1]s/db-1.3.0.tgz]}
+  - {name: db, version: 2.0.0, urls: [%[1]s/db-2.0.0.tgz]}
+  - {name: db, version: 1.4.2, urls: [pkg/db-1.4.2.tgz]}
+  - {name: db, version: 0.9.0, urls: [%[1]s/gone/db-0.9.0.tgz]}
+  - {name: db, version: 2.1.0-beta.1, urls: [%[1]s/db-2.1.0-beta.1.tgz]}
+  cache:
+  - {name: cache, version: 1.0.0, urls: [%[1]s/cache-1.0.0.tgz]}
+`, u))
+
+	web := func(deps string) func() {
+		return func() {
+			d.write("web/Chart.yaml", "apiVersion: v2\nname: web\nversion: 0.1.0\ndependencies:\n"+deps)
+		}
+	}
+	dep := func(name, version, repo string) string {
+		return fmt.Sprintf("  - name: %s\n    version: %q\n    repository: %q\n", name, version, repo)
+	}
+	lib := dep("lib", "0.1.0", "file://../lib")
+	d.write("lib/Chart.yaml", "apiVersion: v2\nname: lib\nversion: 0.1.0\n")
+	d.write("web/templates/cm.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\n")
+	steps := []depStep{
+		{why: "the newest db in ^1.0.0, whose URL in the index is relative", args: []string{"dependency", "update", "ROOT/web"}, tree: "web",
+			do: web(dep("db", "^1.0.0", u) + lib)},
+		{why: "db fetched from the repository", args: []string{"dependency", "list", "ROOT/web"}},
+		{why: "db rendered from the downloaded archive", args: []string{"template", "-n", ns, "x", "ROOT/web"}},
+		{why: "build only fetches from repositories helm repo add knows", args: []string{"dependency", "build", "ROOT/web"}},
+		{why: "a constraint that admits prereleases; 1.4.2 is now outdated", args: []string{"dependency", "update", "ROOT/web"}, tree: "web",
+			do: web(dep("db", ">=2.0.0-0", u))},
+		{why: "two charts from one repository, and a URL ending in /", args: []string{"dependency", "update", "ROOT/web"}, tree: "web",
+			do: web(dep("db", "^2", u+"/") + dep("cache", "*", u))},
+		{why: "the index lists an archive the repository does not have", args: []string{"dependency", "update", "ROOT/web"}, tree: "web",
+			do: web(dep("db", "~0.9", u))},
+		{why: "no version in the index satisfies the constraint", args: []string{"dependency", "update", "ROOT/web"},
+			do: web(dep("db", ">=5", u))},
+		{why: "a chart the index does not list", args: []string{"dependency", "update", "ROOT/web"},
+			do: web(dep("nope", "1.0.0", u))},
+		{why: "a repository with no index.yaml, its URL ending in /", args: []string{"dependency", "update", "ROOT/web"},
+			do: web(dep("db", "1.3.0", u+"/none/"))},
+		{why: "repositories named, not given by URL", args: []string{"dependency", "update", "ROOT/web"}, stderr: true,
+			do: web(dep("db", "1.3.0", "@stable") + dep("cache", "1.0.0", "incubator"))},
+		{why: "an alias alone gets no note", args: []string{"dependency", "build", "ROOT/web"}, stderr: true,
+			do: web(dep("db", "1.3.0", "@stable"))},
+	}
+	if err := d.run(steps[:1]); err != nil {
+		return err
+	}
+	got, err := os.ReadFile(d.path(1, "web/charts/db-1.4.2.tgz"))
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(got, served["/pkg/db-1.4.2.tgz"]) {
+		return fmt.Errorf("web/charts/db-1.4.2.tgz is not the archive the repository served; update saves a downloaded chart as it arrives")
+	}
+	return d.run(steps[1:])
 }
