@@ -1308,7 +1308,7 @@ func (k *kube) records(ns, selector string) ([]*Record, error) {
 	for i := range list.Items {
 		r, err := decodeRecord(&list.Items[i])
 		if err != nil {
-			return nil, err
+			continue // helm skips a release Secret it cannot decode
 		}
 		out = append(out, r)
 	}
@@ -1534,7 +1534,7 @@ func history(ns, name string, limit int) error {
 	if len(h) == 0 {
 		return errNotFound
 	}
-	h = h[len(h)-min(limit, len(h)):]
+	h = h[len(h)-min(max(limit, 0), len(h)):]
 	rows := [][]string{{"REVISION", "UPDATED", "STATUS", "CHART", "APP VERSION", "DESCRIPTION"}}
 	for _, r := range h {
 		rows = append(rows, []string{strconv.Itoa(r.Version), r.Info.LastDeployed.Format(time.ANSIC), r.Info.Status,
