@@ -2377,6 +2377,15 @@ func stageListStatus(ctx context.Context, env *kube.Env, bin string) error {
 	if err := setStatus(ctx, env, "ls-pending", 1, "pending-install"); err != nil {
 		return err
 	}
+	// A record that does not decode, which helm's list passes over.
+	if _, err := env.Client.CoreV1().Secrets(ns).Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "sh.helm.release.v1.ls-corrupt.v1",
+			Labels: map[string]string{"owner": "helm", "name": "ls-corrupt", "status": "deployed", "version": "1"}},
+		Type: "helm.sh/release.v1",
+		Data: map[string][]byte{"release": []byte("not base64!")},
+	}, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed an undecodable release record: %w", err)
+	}
 
 	for _, args := range [][]string{
 		{"list"},

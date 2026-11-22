@@ -14,8 +14,9 @@ import (
 // stdout, stderr and exit code, on a chart full of whitespace, typing and
 // function traps, on every way a render fails, on --set's typing and syntax
 // (list indexes, --set-json and --set-file too), on flags placed after the
-// positional arguments, and on charts that render nothing but hooks. Nothing
-// touches the cluster.
+// positional arguments, and on charts that render nothing but hooks; then
+// install and upgrade, which read .Capabilities and lookup from the cluster
+// where template never does.
 func stageTemplateParity(ctx context.Context, env *kube.Env, bin string) error {
 	w, err := newWork(ctx, env, bin)
 	if err != nil {
@@ -375,7 +376,7 @@ metadata:
 			return err
 		}
 	}
-	return nil
+	return liveRender(ctx, env, w)
 }
 
 // sameTemplate runs one command on both and wants the same exit code, stdout
