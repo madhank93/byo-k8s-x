@@ -53,6 +53,9 @@
 // Stage 17: documents annotated helm.sh/hook are kept out of the manifest
 // and run around install, upgrade and rollback, each waited on and deleted
 // as its delete policy says.
+//
+// Stage 18: an event's hooks run lowest weight first, then by name, then in
+// the order kinds install; `get hooks NAME` prints them as they are stored.
 
 package main
 
@@ -257,7 +260,7 @@ func run(cmd string, args []string) error {
 			return fmt.Errorf(`"helm history" requires 1 argument`)
 		}
 		return history(namespace, args[0], *histMax)
-	case "get manifest", "get values", "get notes":
+	case "get manifest", "get values", "get notes", "get hooks":
 		if len(args) != 1 {
 			return fmt.Errorf(`"helm %s" requires 1 argument`, cmd)
 		}
@@ -268,6 +271,8 @@ func run(cmd string, args []string) error {
 		switch cmd {
 		case "get manifest":
 			fmt.Println(r.Manifest)
+		case "get hooks":
+			fmt.Print(hookText(r.Hooks))
 		case "get notes":
 			if r.Info.Notes != "" {
 				fmt.Printf("NOTES:\n%s\n", r.Info.Notes)

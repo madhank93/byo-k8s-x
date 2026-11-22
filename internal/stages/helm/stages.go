@@ -65,6 +65,7 @@ func init() {
 	register(Stage{Slug: "upgrade-3way-merge", Run: stageUpgrade})
 	register(Stage{Slug: "rollback", Run: stageRollback})
 	register(Stage{Slug: "hooks", Run: stageHooks})
+	register(Stage{Slug: "hook-weights", Run: stageHookWeights})
 }
 
 const chartYAML = `apiVersion: v2
@@ -3280,4 +3281,173 @@ func stageHooks(ctx context.Context, env *kube.Env, bin string) error {
 		}
 	}
 	return nil
+}
+
+// hwHooks are the hw chart's hooks in template-path order: path, kind, name
+// and the raw hook-weight annotation ("" for none).
+var hwHooks = [][4]string{
+	{"01-z-cm", "ConfigMap", "a-cm", `"0"`},
+	{"02-y-sec", "Secret", "b-sec", `"0"`},
+	{"03-x-sa", "ServiceAccount", "c-sa", ""},
+	{"04-cm-zz", "ConfigMap", "zz", ""},
+	{"05-cm-aa", "ConfigMap", "aa", ""},
+	{"06-neg", "ConfigMap", "neg-ten", `"-10"`},
+	{"07-neg5", "ConfigMap", "neg-five", `"-5"`},
+	{"08-pos", "ConfigMap", "pos-ten", `"10"`},
+	{"09-two", "ConfigMap", "pos-two", `"2"`},
+	{"10-str", "ConfigMap", "str-abc", `"abc"`},
+	{"11-plus", "ConfigMap", "str-plus3", `"+3"`},
+	{"12-space", "ConfigMap", "str-space-1", `" 1"`},
+	{"13-float", "ConfigMap", "str-float", `"1.5"`},
+	{"14-big", "ConfigMap", "pos-hundred", `"100"`},
+	{"15-sec-zz", "Secret", "zz", `"0"`},
+	{"16-sa-a", "ServiceAccount", "aa", `"0"`},
+	{"16b-intweight", "ConfigMap", "int-weight", `"3"`},
+	{"17-post-a", "ConfigMap", "post-a", `"1"`},
+	{"18-post-b", "ConfigMap", "post-b", `"-1"`},
+}
+
+// hwChart has the hooks above, all pre-install but the two post- ones, and
+// one object of its own.
+func hwChart() map[string]string {
+	f := map[string]string{
+		"Chart.yaml":          "apiVersion: v2\nname: hw\nversion: 1.0.0\n",
+		"templates/main.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-main\n",
+	}
+	for _, h := range hwHooks {
+		event := "pre-install"
+		if strings.HasPrefix(h[2], "post-") {
+			event = "post-install"
+		}
+		body := "apiVersion: v1\nkind: " + h[1] + "\nmetadata:\n  name: {{ .Release.Name }}-" + h[2] + "\n  annotations:\n    \"helm.sh/hook\": " + event + "\n"
+		if h[3] != "" {
+			body += "    \"helm.sh/hook-weight\": " + h[3] + "\n"
+		}
+		if h[1] == "ConfigMap" {
+			body += "data:\n  k: v\n"
+		}
+		f["templates/"+h[0]+".yaml"] = body
+	}
+	return f
+}
+
+// creationOrder lists the stage namespace's ConfigMaps, Secrets and
+// ServiceAccounts whose names start with prefix, as Kind/name in the order
+// they were created: resourceVersion is one counter for the whole cluster.
+func creationOrder(ctx context.Context, env *kube.Env, prefix string) ([]string, error) {
+	type item struct {
+		id string
+		rv int64
+	}
+	var items []item
+	add := func(kind string, m metav1.ObjectMeta) {
+		if strings.HasPrefix(m.Name, prefix) {
+			rv, _ := strconv.ParseInt(m.ResourceVersion, 10, 64)
+			items = append(items, item{kind + "/" + m.Name, rv})
+		}
+	}
+	core := env.Client.CoreV1()
+	cms, err := core.ConfigMaps(env.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for _, o := range cms.Items {
+		add("ConfigMap", o.ObjectMeta)
+	}
+	secs, err := core.Secrets(env.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for _, o := range secs.Items {
+		add("Secret", o.ObjectMeta)
+	}
+	sas, err := core.ServiceAccounts(env.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for _, o := range sas.Items {
+		add("ServiceAccount", o.ObjectMeta)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].rv < items[j].rv })
+	var out []string
+	for _, it := range items {
+		out = append(out, it.id)
+	}
+	return out, nil
+}
+
+// stageHookWeights — an event's hooks run by weight, an integer or 0, then by
+// name, then by kind in install order; they are stored, printed by get hooks
+// and template, in kind-then-path order; and an unquoted weight, which is not
+// a string, fails the install as it does for Helm.
+func stageHookWeights(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := needHelm(w); err != nil {
+		return err
+	}
+	hw := w.chart("hw", hwChart())
+	if _, err := wantStep(w, "install", "hw", hw); err != nil {
+		return err
+	}
+	got, err := creationOrder(ctx, env, "hw-")
+	if err != nil {
+		return err
+	}
+	var want []string
+	for _, id := range []string{
+		"ConfigMap/neg-ten", "ConfigMap/neg-five",
+		"ConfigMap/a-cm", "ServiceAccount/aa", "ConfigMap/aa", "Secret/b-sec", "ServiceAccount/c-sa",
+		"ConfigMap/str-abc", "ConfigMap/str-float", "ConfigMap/str-space-1", "Secret/zz", "ConfigMap/zz",
+		"ConfigMap/pos-two", "ConfigMap/int-weight", "ConfigMap/str-plus3", "ConfigMap/pos-ten", "ConfigMap/pos-hundred",
+		"ConfigMap/main",
+		"ConfigMap/post-b", "ConfigMap/post-a",
+	} {
+		k, n, _ := strings.Cut(id, "/")
+		want = append(want, k+"/hw-"+n)
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		return fmt.Errorf("install hw should create its hooks lowest weight first (a weight that is not an integer is 0, \"+3\" is 3), then by name, then by kind in install order; the release's own objects between the pre- and post-install hooks. Expected this creation order:\n  %s\ngot:\n  %s", strings.Join(want, "\n  "), strings.Join(got, "\n  "))
+	}
+
+	rec, err := wantRecord(ctx, env, "hw", 1, "deployed", time.Now().Add(-time.Minute), time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	weights := map[string]any{"neg-ten": -10.0, "neg-five": -5.0, "pos-ten": 10.0, "pos-two": 2.0, "str-plus3": 3.0, "pos-hundred": 100.0, "int-weight": 3.0, "post-a": 1.0, "post-b": -1.0}
+	hooks, _ := rec["hooks"].([]any)
+	for _, h := range hooks {
+		name := strings.TrimPrefix(fmt.Sprint(dig(h, "name")), "hw-")
+		if g := dig(h, "weight"); !reflect.DeepEqual(g, weights[name]) {
+			return fmt.Errorf("hook hw-%s's recorded weight should be %v (left out when 0, which an unparseable weight is), got %v", name, weights[name], g)
+		}
+	}
+	for _, args := range [][]string{
+		{"get", "hooks", "hw"},
+		{"get", "hooks", "--revision", "1", "hw"},
+		{"template", "hw", hw},
+	} {
+		if err := sameAsHelm(w, args, nil); err != nil {
+			return err
+		}
+	}
+
+	hwint := w.chart("hwint", map[string]string{
+		"Chart.yaml":       "apiVersion: v2\nname: hwint\nversion: 1.0.0\n",
+		"templates/x.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: hwint-x\n  annotations:\n    helm.sh/hook: pre-install\n    helm.sh/hook-weight: 3\ndata: {k: v}\n",
+	})
+	res, err := w.run("install", "hwint", hwint)
+	if err != nil {
+		return err
+	}
+	if err := wantRefusal(res, `Error: INSTALLATION FAILED: failed pre-install: unable to build kubernetes object for deleting hook hwint/templates/x.yaml: unable to decode "": json: cannot unmarshal number into Go struct field ObjectMeta.metadata.annotations of type string`, "install hwint, whose hook-weight is the YAML number 3, not a string"); err != nil {
+		return err
+	}
+	if _, err := wantRecord(ctx, env, "hwint", 1, "failed", time.Now().Add(-time.Minute), time.Now().Add(time.Second)); err != nil {
+		return err
+	}
+	return wantGone(ctx, env, "hwint-x", "after install hwint failed building its hook")
 }
