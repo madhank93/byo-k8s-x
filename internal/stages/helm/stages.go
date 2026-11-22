@@ -69,6 +69,7 @@ func init() {
 	register(Stage{Slug: "test", Run: stageTest})
 	register(Stage{Slug: "uninstall", Run: stageUninstall})
 	register(Stage{Slug: "dependencies", Run: stageDependencies})
+	register(Stage{Slug: "template-parity", Run: stageTemplateParity})
 }
 
 const chartYAML = `apiVersion: v2

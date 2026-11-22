@@ -68,6 +68,10 @@
 // Stage 21: `dependency list|update|build DIR` resolves Chart.yaml's
 // dependencies into charts/ and pins them in Chart.lock; `package DIR` writes
 // the chart as Helm's archive, which load reads back.
+//
+// Stage 22: template agrees with helm byte for byte: lookup, .Capabilities,
+// the .Files methods, Helm's wording of render errors, --set lists and
+// escapes, and --set-string.
 
 package main
 
@@ -86,6 +90,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -175,11 +180,17 @@ func run(cmd string, args []string) error {
 	fs.BoolVar(&up.install, "install", false, "install the release if it does not exist")
 	fs.BoolVar(&up.reuse, "reuse-values", false, "merge the new values over the last release's")
 	fs.BoolVar(&up.reset, "reset-values", false, "use only the new values and the chart's defaults")
+	fs.Var(&setStrings, "set-string", "key=value, the value always a string (repeatable)")
 	var filters multi
 	fs.Var(&filters, "filter", "name=NAME or !name=NAME, the test hooks to run or skip (repeatable)")
 	logs := fs.Bool("logs", false, "print the test pods' logs")
 	fs.DurationVar(&hookTimeout, "timeout", 5*time.Minute, "how long to wait for each hook")
+	kubeVersion := fs.String("kube-version", "v1.33.0", "the Kubernetes version templates see")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	var err error
+	if caps, err = capabilities(*kubeVersion); err != nil {
 		return err
 	}
 	args = fs.Args()
@@ -229,19 +240,31 @@ func run(cmd string, args []string) error {
 		}
 		rel := Release{Name: args[0], Namespace: namespace, Revision: 1, IsInstall: true, Service: "Helm"}
 		r, err := renderRelease(args[1], files, sets, rel)
+		if re := (renderError{}); errors.As(err, &re) {
+			return fmt.Errorf("%w\n\nUse --debug flag to render out invalid YAML", err)
+		}
 		if err != nil {
 			return err
 		}
-		ms := r.Manifests
 		if len(show) > 0 {
+			ms := r.Manifests
+			for _, h := range r.Hooks {
+				ms = append(ms, File{Name: h.Path, Data: []byte(h.Manifest)})
+			}
 			if ms, err = showOnly(ms, show); err != nil {
 				return err
 			}
+			fmt.Print(manifestText(ms))
+			return nil
 		}
-		fmt.Print(manifestText(ms))
-		if len(show) == 0 {
-			fmt.Print(hookText(r.Hooks))
+		// helm prints the manifest trimmed plus a newline, so a chart that
+		// renders nothing but hooks starts with an empty line.
+		if text := manifestText(r.Manifests); text != "" {
+			fmt.Print(text)
+		} else {
+			fmt.Println()
 		}
+		fmt.Print(hookText(r.Hooks))
 		return nil
 	case "install":
 		if len(args) != 2 {
@@ -400,6 +423,47 @@ type Files map[string][]byte
 
 // Get is .Files.Get in a template: the file's contents, or "" if it is absent.
 func (f Files) Get(name string) string { return string(f[name]) }
+
+func (f Files) GetBytes(name string) []byte { return f[name] }
+
+// Glob is the files whose path matches pattern.
+// ponytail: path.Match, so no "**"; Helm's gobwas/glob has it.
+func (f Files) Glob(pattern string) Files {
+	out := Files{}
+	for name, data := range f {
+		if ok, _ := path.Match(pattern, name); ok {
+			out[name] = data
+		}
+	}
+	return out
+}
+
+// AsConfig is the files as ConfigMap data: base name to contents, as YAML.
+func (f Files) AsConfig() string {
+	m := map[string]string{}
+	for name, data := range f {
+		m[path.Base(name)] = string(data)
+	}
+	return toYAML(m)
+}
+
+// AsSecrets is AsConfig with the contents base64-encoded, for Secret data.
+func (f Files) AsSecrets() string {
+	m := map[string]string{}
+	for name, data := range f {
+		m[path.Base(name)] = base64.StdEncoding.EncodeToString(data)
+	}
+	return toYAML(m)
+}
+
+// Lines splits a file into lines, dropping one trailing newline first.
+func (f Files) Lines(name string) []string {
+	s := string(f[name])
+	if s == "" {
+		return []string{}
+	}
+	return strings.Split(strings.TrimSuffix(s, "\n"), "\n")
+}
 
 // Release is .Release in a template.
 type Release struct {
@@ -571,12 +635,20 @@ func userValues(files, sets []string) (map[string]any, error) {
 		mergeMaps(user, m)
 	}
 	for _, s := range sets {
-		if err := parseSet(user, s); err != nil {
+		if err := parseSet(user, s, typedVal); err != nil {
 			return nil, fmt.Errorf("failed parsing --set data: %w", err)
+		}
+	}
+	for _, s := range setStrings {
+		if err := parseSet(user, s, func(v string) any { return v }); err != nil {
+			return nil, fmt.Errorf("failed parsing --set-string data: %w", err)
 		}
 	}
 	return user, nil
 }
+
+// setStrings are the --set-string flags, applied after every --set.
+var setStrings multi
 
 // mergeMaps overlays src onto dst: maps merge key by key, anything else,
 // lists and nulls included, replaces what was there.
@@ -811,17 +883,70 @@ func copyMap(m map[string]any) map[string]any {
 	return out
 }
 
-// parseSet applies one --set argument: comma-separated a.b.c=value pairs.
-// ponytail: no list syntax ({a,b}, a[0]) or escaped commas; add when a stage needs them.
-func parseSet(into map[string]any, arg string) error {
-	for _, pair := range strings.Split(arg, ",") {
-		key, val, ok := strings.Cut(pair, "=")
-		if !ok {
-			return fmt.Errorf("key %q has no value", pair)
+// parseSet applies one --set argument: comma-separated a.b.c=value pairs,
+// where a value may be a list {x,y} and a backslash escapes , . = { }.
+// typed reads each scalar.
+// ponytail: no index syntax (a[0]=x); add when a stage needs it.
+func parseSet(into map[string]any, arg string, typed func(string) any) error {
+	rest := arg
+	for rest != "" {
+		// The key runs to the first unescaped '=', split on unescaped '.'.
+		var keys []string
+		var k strings.Builder
+		i, found := 0, false
+		for ; i < len(rest); i++ {
+			switch c := rest[i]; {
+			case c == '\\' && i+1 < len(rest):
+				i++
+				k.WriteByte(rest[i])
+			case c == '.':
+				keys = append(keys, k.String())
+				k.Reset()
+			case c == ',':
+				return fmt.Errorf("key %q has no value (cannot end with ,)", rest[:i])
+			case c == '=':
+				found = true
+			default:
+				k.WriteByte(c)
+			}
+			if found {
+				break
+			}
 		}
-		path := strings.Split(key, ".")
+		if !found {
+			return fmt.Errorf("key %q has no value", rest)
+		}
+		keys = append(keys, k.String())
+		rest = rest[i+1:]
+
+		var val any
+		if strings.HasPrefix(rest, "{") {
+			end := strings.IndexByte(rest, '}')
+			if end < 0 {
+				return errors.New("list must terminate with '}'")
+			}
+			var list []any
+			for _, e := range splitUnescaped(rest[1:end]) {
+				list = append(list, typed(e))
+			}
+			val, rest = list, rest[end+1:]
+			if rest != "" && rest[0] != ',' {
+				return fmt.Errorf("key %q has no value", rest)
+			}
+			rest = strings.TrimPrefix(rest, ",")
+		} else {
+			var v strings.Builder
+			for i = 0; i < len(rest) && rest[i] != ','; i++ {
+				if rest[i] == '\\' && i+1 < len(rest) {
+					i++
+				}
+				v.WriteByte(rest[i])
+			}
+			val, rest = typed(v.String()), rest[min(i+1, len(rest)):]
+		}
+
 		m := into
-		for _, p := range path[:len(path)-1] {
+		for _, p := range keys[:len(keys)-1] {
 			next, ok := m[p].(map[string]any)
 			if !ok {
 				next = map[string]any{}
@@ -829,9 +954,29 @@ func parseSet(into map[string]any, arg string) error {
 			}
 			m = next
 		}
-		m[path[len(path)-1]] = typedVal(val)
+		m[keys[len(keys)-1]] = val
 	}
 	return nil
+}
+
+// splitUnescaped splits a list's body on commas not escaped by a backslash,
+// and drops the escapes.
+func splitUnescaped(s string) []string {
+	var out []string
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		switch {
+		case s[i] == '\\' && i+1 < len(s):
+			i++
+			b.WriteByte(s[i])
+		case s[i] == ',':
+			out = append(out, b.String())
+			b.Reset()
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return append(out, b.String())
 }
 
 // typedVal reads a --set value the way Helm does: booleans, null and integers
@@ -889,7 +1034,7 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, string, error) 
 	bindIncludes(t, map[string]int{})
 	for _, f := range parseOrder(all) {
 		if _, err := t.New(f.Name).Parse(string(f.Data)); err != nil {
-			return nil, "", err
+			return nil, "", renderError{parseError(f.Name, err)}
 		}
 	}
 	var out []File
@@ -902,15 +1047,16 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, string, error) 
 		}
 		name, top := f.Name, data[f.Name]
 		d := map[string]any{
-			"Values":   top["Values"],
-			"Release":  rel,
-			"Chart":    top["Chart"],
-			"Files":    top["Files"],
-			"Template": map[string]string{"Name": name, "BasePath": top["BasePath"].(string)},
+			"Values":       top["Values"],
+			"Release":      rel,
+			"Chart":        top["Chart"],
+			"Files":        top["Files"],
+			"Template":     map[string]string{"Name": name, "BasePath": top["BasePath"].(string)},
+			"Capabilities": caps,
 		}
 		var b strings.Builder
 		if err := t.ExecuteTemplate(&b, name, d); err != nil {
-			return nil, "", err
+			return nil, "", renderError{execError(name, err)}
 		}
 		// missingkey=zero prints a missing map key as "<no value>"; Helm blanks it.
 		text := strings.ReplaceAll(b.String(), "<no value>", "")
@@ -1052,11 +1198,11 @@ func bindIncludes(t *template.Template, depth map[string]int) *template.Template
 				return "", err
 			}
 			if c, err = bindIncludes(c, depth).New("gotpl").Parse(text); err != nil {
-				return "", err
+				return "", fmt.Errorf("cannot parse template %q: %w", text, err)
 			}
 			var b strings.Builder
 			if err := c.Execute(&b, data); err != nil {
-				return "", err
+				return "", fmt.Errorf("error during tpl function execution for %q: %w", text, err)
 			}
 			return strings.ReplaceAll(b.String(), "<no value>", ""), nil
 		},
@@ -1071,7 +1217,49 @@ func funcMap() template.FuncMap {
 	delete(f, "expandenv")
 	f["toYaml"] = toYAML
 	f["required"] = required
+	f["fail"] = func(msg string) (string, error) { return "", errors.New(warnWrap(msg)) }
+	// ponytail: never asks the cluster, which is what helm template does;
+	// install and upgrade would need a live lookup to match helm there.
+	f["lookup"] = func(apiVersion, kind, namespace, name string) (map[string]any, error) {
+		return map[string]any{}, nil
+	}
 	return f
+}
+
+// Capabilities is what .Capabilities shows a template. Like helm template, it
+// reports the Kubernetes version helm was built against unless --kube-version
+// names another, and every API version and kind the client knows.
+// ponytail: install reports the same instead of asking the cluster.
+type Capabilities struct {
+	KubeVersion KubeVersion
+	APIVersions APIVersions
+}
+
+type KubeVersion struct{ Version, Major, Minor string }
+
+func (v KubeVersion) String() string { return v.Version }
+
+type APIVersions []string
+
+// Has accepts "group/version" or "group/version/Kind".
+func (a APIVersions) Has(v string) bool { return slices.Contains(a, v) }
+
+var caps Capabilities
+
+func capabilities(kube string) (Capabilities, error) {
+	v, err := semver.NewVersion(kube)
+	if err != nil {
+		return Capabilities{}, fmt.Errorf("invalid kube version '%s': %s", kube, err)
+	}
+	var apis APIVersions
+	for gvk := range scheme.Scheme.AllKnownTypes() {
+		gv := gvk.GroupVersion().String()
+		apis = append(apis, gv, gv+"/"+gvk.Kind)
+	}
+	return Capabilities{
+		KubeVersion: KubeVersion{"v" + v.String(), strconv.FormatUint(v.Major(), 10), strconv.FormatUint(v.Minor(), 10)},
+		APIVersions: apis,
+	}, nil
 }
 
 // toYAML drops the trailing newline so that `toYaml x | nindent 4` controls
@@ -1088,9 +1276,49 @@ func toYAML(v any) string {
 // otherwise passes the value through.
 func required(msg string, v any) (any, error) {
 	if s, ok := v.(string); v == nil || ok && s == "" {
-		return v, errors.New(msg)
+		return v, errors.New(warnWrap(msg))
 	}
 	return v, nil
+}
+
+// renderError is a failure inside the templates, after which helm template
+// points at --debug.
+type renderError struct{ error }
+
+func (e renderError) Unwrap() error { return e.error }
+
+// required and fail mark their message so that execError can lift it out of
+// text/template's wrapping, however deep in includes it was raised.
+func warnWrap(msg string) string { return "HELM_ERR_START" + msg + "HELM_ERR_END" }
+
+var warnRegex = regexp.MustCompile(`HELM_ERR_START((?s).*)HELM_ERR_END`)
+
+// execError is Helm's rewording of a template execution error: a required or
+// fail message becomes "execution error at (FILE:LINE:COL): MSG", and any
+// other error is left as text/template wrote it.
+func execError(name string, err error) error {
+	var ee template.ExecError
+	if !errors.As(err, &ee) {
+		return err
+	}
+	tokens := strings.SplitN(err.Error(), ": ", 3)
+	if len(tokens) != 3 {
+		return fmt.Errorf("execution error at (%s): %s", name, err)
+	}
+	if m := warnRegex.FindStringSubmatch(tokens[2]); m != nil {
+		return fmt.Errorf("execution error at (%s): %s", tokens[1], m[1])
+	}
+	return err
+}
+
+// parseError is Helm's rewording of a parse error: its location and its
+// last clause, "parse error at (FILE:LINE): MSG".
+func parseError(name string, err error) error {
+	tokens := strings.Split(err.Error(), ": ")
+	if len(tokens) == 1 {
+		return fmt.Errorf("parse error in (%s): %s", name, err)
+	}
+	return fmt.Errorf("parse error at (%s): %s", tokens[1], tokens[len(tokens)-1])
 }
 
 // kubeNamespace is the kubeconfig context's namespace, as kubectl picks it,
@@ -1154,7 +1382,7 @@ func renderWith(dir string, user map[string]any, rel Release) (*Rendered, error)
 	}
 	ms, err := manifests(docs)
 	if err != nil {
-		return nil, err
+		return nil, renderError{err}
 	}
 	ms, hooks := splitHooks(ms)
 	return &Rendered{Chart: c, Config: user, Manifests: ms, Hooks: hooks, Notes: notes}, nil
