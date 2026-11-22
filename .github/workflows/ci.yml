@@ -49,6 +49,13 @@ jobs:
           curl -fsSLo "$RUNNER_TEMP/kubectl" "https://dl.k8s.io/release/v$version/bin/linux/amd64/kubectl"
           sudo install -m 0755 "$RUNNER_TEMP/kubectl" /usr/local/bin/kubectl
           kubectl version --client
+      # The helm course's release stages grade against the real helm.
+      - name: Install the pinned helm
+        run: |
+          version=$(awk -F'"' '/^helm = /{print $2}' mise.toml)
+          curl -fsSL "https://get.helm.sh/helm-v$version-linux-amd64.tar.gz" | tar -xz -C "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/linux-amd64/helm" /usr/local/bin/helm
+          helm version --short
       # Sized by the courses themselves (course.yml `workers`), so CI creates
       # the cluster exactly the way a learner does.
       - run: go run ./cmd/byok8s up

@@ -214,7 +214,7 @@ so a real kubelet can drive it.
 
 Host processes again. Independent of tiers 2 and 3 — take them whenever.
 
-### `helm` — Build your own Helm · 22 stages
+### [x] `helm` — Build your own Helm · 22 stages
 
 `chart-load` · `values-merge` · `template-engine` · `builtin-objects` ·
 `template-functions` · `named-templates` · `subcharts` · `conditions` ·
