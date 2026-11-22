@@ -3,6 +3,7 @@ package helm
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
@@ -374,5 +375,11 @@ func sameTemplate(w *work, args []string) error {
 	if err := wantExact(got.Stdout, want.Stdout, shown+" (stdout)"); err != nil {
 		return err
 	}
-	return wantExact(got.Stderr, want.Stderr, shown+" (stderr)")
+	return wantExact(goNeutral(got.Stderr), goNeutral(want.Stderr), shown+" (stderr)")
 }
+
+// goTypes is the operand-type suffix newer Go releases add to text/template's
+// comparison error; whether it appears depends on the Go that built each binary.
+var goTypes = regexp.MustCompile(`(incompatible types for comparison): \S+ and \S+`)
+
+func goNeutral(s string) string { return goTypes.ReplaceAllString(s, "$1") }
