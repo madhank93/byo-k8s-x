@@ -65,7 +65,7 @@ entries:
 
   - slug: helm
     name: Build your own Helm
-    status: planned
+    status: shipped
     tier: the ecosystem
     blurb: Charts, values, releases, and a three-way-merge upgrade.
 
