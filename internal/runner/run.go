@@ -28,6 +28,13 @@ const MaxOutput = 1 << 20 // 1 MiB
 // path. It is called once per run, not once per assertion: compiling is the
 // slowest thing in the loop and the program does not change mid-run.
 func Build(ctx context.Context, appDir string) (string, error) {
+	return BuildFor(ctx, appDir, "", "")
+}
+
+// BuildFor is Build for another platform; empty goos and goarch mean the
+// host's. A cross build has cgo off, so the binary is static and runs on a
+// kind node whatever libc the node image carries.
+func BuildFor(ctx context.Context, appDir, goos, goarch string) (string, error) {
 	bin, err := os.MkdirTemp("", "byok8s-app-")
 	if err != nil {
 		return "", fmt.Errorf("temp dir: %w", err)
@@ -36,6 +43,9 @@ func Build(ctx context.Context, appDir string) (string, error) {
 
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", out, ".")
 	cmd.Dir = appDir
+	if goos != "" || goarch != "" {
+		cmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=0")
+	}
 	if combined, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("build %s:\n%s", appDir, combined)
 	}
@@ -69,17 +79,28 @@ func InvokeEnv(ctx context.Context, bin string, env []string, timeout time.Durat
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
-	var stdout, stderr capped
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	signal := groupSignal(cmd)
+	return capture(cmd, func() error { return signal(syscall.SIGKILL) })
+}
 
-	// Its own process group, so cancelling reaches children the program spawned.
+// groupSignal puts cmd in its own process group and returns a way to signal
+// that whole group, so a signal reaches children the program spawned.
+func groupSignal(cmd *exec.Cmd) func(syscall.Signal) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
+	return func(sig syscall.Signal) error {
 		if cmd.Process == nil {
 			return nil
 		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		return syscall.Kill(-cmd.Process.Pid, sig)
 	}
+}
+
+// capture runs cmd to completion, calling cancel when its context ends, and
+// returns what it printed and how it exited.
+func capture(cmd *exec.Cmd, cancel func() error) (*Result, error) {
+	var stdout, stderr capped
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.Cancel = cancel
 	// A grandchild can inherit our pipes and outlive the program; without a
 	// bound, Wait blocks forever on EOF that never comes.
 	cmd.WaitDelay = 3 * time.Second
@@ -143,6 +164,7 @@ type Process struct {
 	stderr *capped
 	done   chan error
 	cancel context.CancelFunc
+	signal func(syscall.Signal) error
 
 	mu     sync.Mutex
 	result *Result
@@ -158,16 +180,15 @@ func Start(ctx context.Context, bin string, env []string, args ...string) (*Proc
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
-	p := &Process{cmd: cmd, stdout: &capped{}, stderr: &capped{}, done: make(chan error, 1), cancel: cancel}
-	cmd.Stdout, cmd.Stderr = p.stdout, p.stderr
+	return start(cmd, cancel, groupSignal(cmd))
+}
 
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
+// start launches cmd as a supervised Process; signal is how Stop and Kill
+// reach every process the program started.
+func start(cmd *exec.Cmd, cancel context.CancelFunc, signal func(syscall.Signal) error) (*Process, error) {
+	p := &Process{cmd: cmd, stdout: &capped{}, stderr: &capped{}, done: make(chan error, 1), cancel: cancel, signal: signal}
+	cmd.Stdout, cmd.Stderr = p.stdout, p.stderr
+	cmd.Cancel = func() error { return signal(syscall.SIGKILL) }
 	cmd.WaitDelay = 3 * time.Second
 
 	if err := cmd.Start(); err != nil {
@@ -215,17 +236,13 @@ func (p *Process) Stop(grace time.Duration) *Result {
 		return cached
 	}
 
-	if p.cmd.Process != nil {
-		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGTERM)
-	}
+	_ = p.signal(syscall.SIGTERM)
 	select {
 	case err := <-p.done:
 		return p.finish(err)
 	case <-time.After(grace):
 	}
-	if p.cmd.Process != nil {
-		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
-	}
+	_ = p.signal(syscall.SIGKILL)
 	select {
 	case err := <-p.done:
 		return p.finish(err)
@@ -251,9 +268,7 @@ func (p *Process) Kill() *Result {
 		return cached
 	}
 
-	if p.cmd.Process != nil {
-		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
-	}
+	_ = p.signal(syscall.SIGKILL)
 	select {
 	case err := <-p.done:
 		return p.finish(err)
