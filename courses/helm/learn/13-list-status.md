@@ -66,7 +66,8 @@ beside `app list` is the quickest way to find a difference.
 - `fmt.Sprintf("%-*s", width, cell)` pads a cell to a width.
 - `sort.Slice` by name is enough: names are unique within a namespace.
 - The standard `flag` package stops at the first non-flag argument, so
-  flags go before `NAME`, as every command here is written.
+  flags go before `NAME`, as every command here is written; stage 22
+  lifts that.
 
 ## Hints
 

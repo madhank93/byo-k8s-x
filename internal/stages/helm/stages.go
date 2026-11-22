@@ -3,8 +3,9 @@
 //
 // Every stage writes a chart to a temporary directory, runs the learner's
 // built binary on it, and judges exit code, stdout and, from install onwards,
-// what the cluster holds. Flags always come before positional arguments, as
-// both Go's flag package and the real helm accept.
+// what the cluster holds. Flags come before positional arguments, as both
+// Go's flag package and the real helm accept, until template-parity, which
+// also puts them after.
 package helm
 
 import (

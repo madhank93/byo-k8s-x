@@ -99,6 +99,7 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/Masterminds/sprig/v3"
@@ -149,6 +150,24 @@ type multi []string
 func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(v string) error { *m = append(*m, v); return nil }
 
+// parseFlags parses flags wherever they fall among the positional arguments,
+// as Helm's command line does.
+// ponytail: an argument after "--" that starts with "-" is still read as a
+// flag; Helm takes it as positional, but no valid NAME or chart looks like one.
+func parseFlags(fs *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return pos, nil
+		}
+		pos, args = append(pos, rest[0]), rest[1:]
+	}
+}
+
 func run(cmd string, args []string) error {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	var files, sets multi
@@ -181,19 +200,20 @@ func run(cmd string, args []string) error {
 	fs.BoolVar(&up.reuse, "reuse-values", false, "merge the new values over the last release's")
 	fs.BoolVar(&up.reset, "reset-values", false, "use only the new values and the chart's defaults")
 	fs.Var(&setStrings, "set-string", "key=value, the value always a string (repeatable)")
+	fs.Var(&setJSONs, "set-json", "key=JSON (repeatable)")
+	fs.Var(&setFiles, "set-file", "key=FILE, the value the file's contents (repeatable)")
 	var filters multi
 	fs.Var(&filters, "filter", "name=NAME or !name=NAME, the test hooks to run or skip (repeatable)")
 	logs := fs.Bool("logs", false, "print the test pods' logs")
 	fs.DurationVar(&hookTimeout, "timeout", 5*time.Minute, "how long to wait for each hook")
 	kubeVersion := fs.String("kube-version", "v1.33.0", "the Kubernetes version templates see")
-	if err := fs.Parse(args); err != nil {
+	args, err := parseFlags(fs, args)
+	if err != nil {
 		return err
 	}
-	var err error
 	if caps, err = capabilities(*kubeVersion); err != nil {
 		return err
 	}
-	args = fs.Args()
 	if namespace == "" {
 		namespace = kubeNamespace()
 	}
@@ -618,9 +638,9 @@ func validate(m Metadata) error {
 	return nil
 }
 
-// userValues merges -f files in order, then --set flags in order. A null is
-// kept here, not applied: it means "delete the chart's default", which only
-// coalesce can do.
+// userValues merges -f files in order, then the --set style flags in order.
+// A null is kept here, not applied: it means "delete the chart's default",
+// which only coalesce can do.
 func userValues(files, sets []string) (map[string]any, error) {
 	user := map[string]any{}
 	for _, f := range files {
@@ -634,21 +654,40 @@ func userValues(files, sets []string) (map[string]any, error) {
 		}
 		mergeMaps(user, m)
 	}
+	typed := func(v string) (any, error) { return typedVal(v), nil }
+	for _, s := range setJSONs {
+		if err := parseSet(user, s, nil, true); err != nil {
+			return nil, fmt.Errorf("failed parsing --set-json data %s", s)
+		}
+	}
 	for _, s := range sets {
-		if err := parseSet(user, s, typedVal); err != nil {
+		if err := parseSet(user, s, typed, false); err != nil {
 			return nil, fmt.Errorf("failed parsing --set data: %w", err)
 		}
 	}
 	for _, s := range setStrings {
-		if err := parseSet(user, s, func(v string) any { return v }); err != nil {
+		if err := parseSet(user, s, func(v string) (any, error) { return v, nil }, false); err != nil {
 			return nil, fmt.Errorf("failed parsing --set-string data: %w", err)
+		}
+	}
+	for _, s := range setFiles {
+		if err := parseSet(user, s, readSetFile, false); err != nil {
+			return nil, fmt.Errorf("failed parsing --set-file data: %w", err)
 		}
 	}
 	return user, nil
 }
 
-// setStrings are the --set-string flags, applied after every --set.
-var setStrings multi
+// The other value flags, applied in Helm's order: -f files, --set-json,
+// --set, --set-string, --set-file.
+var setStrings, setJSONs, setFiles multi
+
+// readSetFile reads a --set-file value: the named file's contents, as a string.
+// ponytail: local files only; Helm also takes - for stdin and URLs.
+func readSetFile(name string) (any, error) {
+	b, err := os.ReadFile(name)
+	return string(b), err
+}
 
 // mergeMaps overlays src onto dst: maps merge key by key, anything else,
 // lists and nulls included, replaces what was there.
@@ -883,100 +922,293 @@ func copyMap(m map[string]any) map[string]any {
 	return out
 }
 
-// parseSet applies one --set argument: comma-separated a.b.c=value pairs,
-// where a value may be a list {x,y} and a backslash escapes , . = { }.
-// typed reads each scalar.
-// ponytail: no index syntax (a[0]=x); add when a stage needs it.
-func parseSet(into map[string]any, arg string, typed func(string) any) error {
-	rest := arg
-	for rest != "" {
-		// The key runs to the first unescaped '=', split on unescaped '.'.
-		var keys []string
-		var k strings.Builder
-		i, found := 0, false
-		for ; i < len(rest); i++ {
-			switch c := rest[i]; {
-			case c == '\\' && i+1 < len(rest):
-				i++
-				k.WriteByte(rest[i])
-			case c == '.':
-				keys = append(keys, k.String())
-				k.Reset()
-			case c == ',':
-				return fmt.Errorf("key %q has no value (cannot end with ,)", rest[:i])
-			case c == '=':
-				found = true
-			default:
-				k.WriteByte(c)
-			}
-			if found {
-				break
-			}
+// parseSet applies one --set style argument: comma-separated key=value pairs,
+// where a key is a dotted path that may index lists (a[0].b, a[1][2]), a value
+// may be a list {x,y}, and a backslash escapes the next character. read turns
+// each raw value into what is stored; json decodes the value as JSON instead.
+// It follows Helm's strvals parser closely, panics included: a key that walks
+// into a value of the wrong type fails with Go's interface-conversion message.
+func parseSet(into map[string]any, arg string, read func(string) (any, error), json bool) error {
+	p := &setParser{sc: bytes.NewBufferString(arg), read: read, json: json}
+	for {
+		switch err := p.key(into, 0); err {
+		case nil:
+		case io.EOF:
+			return nil
+		default:
+			return err
 		}
-		if !found {
-			return fmt.Errorf("key %q has no value", rest)
-		}
-		keys = append(keys, k.String())
-		rest = rest[i+1:]
-
-		var val any
-		if strings.HasPrefix(rest, "{") {
-			end := strings.IndexByte(rest, '}')
-			if end < 0 {
-				return errors.New("list must terminate with '}'")
-			}
-			var list []any
-			for _, e := range splitUnescaped(rest[1:end]) {
-				list = append(list, typed(e))
-			}
-			val, rest = list, rest[end+1:]
-			if rest != "" && rest[0] != ',' {
-				return fmt.Errorf("key %q has no value", rest)
-			}
-			rest = strings.TrimPrefix(rest, ",")
-		} else {
-			var v strings.Builder
-			for i = 0; i < len(rest) && rest[i] != ','; i++ {
-				if rest[i] == '\\' && i+1 < len(rest) {
-					i++
-				}
-				v.WriteByte(rest[i])
-			}
-			val, rest = typed(v.String()), rest[min(i+1, len(rest)):]
-		}
-
-		m := into
-		for _, p := range keys[:len(keys)-1] {
-			next, ok := m[p].(map[string]any)
-			if !ok {
-				next = map[string]any{}
-				m[p] = next
-			}
-			m = next
-		}
-		m[keys[len(keys)-1]] = val
 	}
-	return nil
 }
 
-// splitUnescaped splits a list's body on commas not escaped by a backslash,
-// and drops the escapes.
-func splitUnescaped(s string) []string {
-	var out []string
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		switch {
-		case s[i] == '\\' && i+1 < len(s):
-			i++
-			b.WriteByte(s[i])
-		case s[i] == ',':
-			out = append(out, b.String())
-			b.Reset()
+type setParser struct {
+	sc   *bytes.Buffer
+	read func(string) (any, error)
+	json bool
+}
+
+const (
+	maxSetIndex = 65536
+	maxSetDepth = 30
+)
+
+var errNotList = errors.New("not a list")
+
+func (p *setParser) key(data map[string]any, depth int) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("unable to parse key: %s", r)
+		}
+	}()
+	k, last, err := runesUntil(p.sc, "=[,.")
+	switch {
+	case err != nil:
+		if k == "" {
+			return err
+		}
+		return fmt.Errorf("key %q has no value", k)
+	case last == '[':
+		i, err := p.keyIndex()
+		if err != nil {
+			return fmt.Errorf("error parsing index: %w", err)
+		}
+		list := []any{}
+		if _, ok := data[k]; ok {
+			list = data[k].([]any)
+		}
+		list, err = p.listItem(list, i, depth)
+		setKey(data, k, list)
+		return err
+	case last == '=':
+		if p.json {
+			v, done, err := p.jsonVal()
+			if err == nil || done {
+				setKey(data, k, v)
+			}
+			return err
+		}
+		vl, err := p.valList()
+		switch err {
+		case nil:
+			setKey(data, k, vl)
+			return nil
+		case io.EOF:
+			setKey(data, k, "")
+			return err
+		case errNotList:
+			raw, err := runesUntil1(p.sc, ",")
+			if err != nil && err != io.EOF {
+				return err
+			}
+			v, err := p.read(raw)
+			setKey(data, k, v)
+			return err
 		default:
-			b.WriteByte(s[i])
+			return err
+		}
+	case last == ',':
+		setKey(data, k, "")
+		return fmt.Errorf("key %q has no value (cannot end with ,)", k)
+	default: // '.'
+		if depth++; depth > maxSetDepth {
+			return fmt.Errorf("value name nested level is greater than maximum supported nested level of %d", maxSetDepth)
+		}
+		inner := map[string]any{}
+		if _, ok := data[k]; ok {
+			inner = data[k].(map[string]any)
+		}
+		err := p.key(inner, depth)
+		if err == nil && len(inner) == 0 {
+			return fmt.Errorf("key map %q has no value", k)
+		}
+		if len(inner) != 0 {
+			setKey(data, k, inner)
+		}
+		return err
+	}
+}
+
+// jsonVal decodes one JSON value after '=' and the comma that ends it. An
+// empty value is a null; done reports that the value is ready to store.
+func (p *setParser) jsonVal() (v any, done bool, err error) {
+	if p.emptyVal() {
+		return nil, true, nil
+	}
+	dec := json.NewDecoder(strings.NewReader(p.sc.String()))
+	if err := dec.Decode(&v); err != nil {
+		return nil, false, err
+	}
+	p.sc.Next(int(dec.InputOffset()))
+	p.emptyVal()
+	return v, true, nil
+}
+
+// emptyVal consumes spaces up to a comma or the end, reporting whether that
+// is all there was; anything else is left unread.
+func (p *setParser) emptyVal() bool {
+	for {
+		r, _, err := p.sc.ReadRune()
+		if err != nil || r == ',' {
+			return true
+		}
+		if !unicode.IsSpace(r) {
+			p.sc.UnreadRune()
+			return false
 		}
 	}
-	return append(out, b.String())
+}
+
+func (p *setParser) keyIndex() (int, error) {
+	v, _, err := runesUntil(p.sc, "]")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(v)
+}
+
+func (p *setParser) listItem(list []any, i, depth int) ([]any, error) {
+	if i < 0 {
+		return list, fmt.Errorf("negative %d index not allowed", i)
+	}
+	k, last, err := runesUntil(p.sc, "[.=")
+	switch {
+	case k != "":
+		return list, fmt.Errorf("unexpected data at end of array index: %q", []rune(k))
+	case err != nil:
+		return list, err
+	case last == '=':
+		if p.json {
+			v, done, err := p.jsonVal()
+			if !done {
+				return list, err
+			}
+			return setIndex(list, i, v)
+		}
+		vl, err := p.valList()
+		switch err {
+		case nil:
+			return setIndex(list, i, vl)
+		case io.EOF:
+			return setIndex(list, i, "")
+		case errNotList:
+			raw, err := runesUntil1(p.sc, ",")
+			if err != nil && err != io.EOF {
+				return list, err
+			}
+			v, err := p.read(raw)
+			if err != nil {
+				return list, err
+			}
+			return setIndex(list, i, v)
+		default:
+			return list, err
+		}
+	case last == '[':
+		next, err := p.keyIndex()
+		if err != nil {
+			return list, fmt.Errorf("error parsing index: %w", err)
+		}
+		var inner []any
+		if len(list) > i && list[i] != nil {
+			inner = list[i].([]any)
+		}
+		inner, err = p.listItem(inner, next, depth)
+		if err != nil {
+			return list, err
+		}
+		return setIndex(list, i, inner)
+	default: // '.'
+		inner := map[string]any{}
+		if len(list) > i {
+			var ok bool
+			if inner, ok = list[i].(map[string]any); !ok {
+				inner = map[string]any{}
+				list[i] = inner
+			}
+		}
+		if err := p.key(inner, depth); err != nil {
+			return list, err
+		}
+		return setIndex(list, i, inner)
+	}
+}
+
+// valList reads a {x,y} list, or reports errNotList with nothing consumed.
+func (p *setParser) valList() ([]any, error) {
+	r, _, err := p.sc.ReadRune()
+	if err != nil {
+		return []any{}, err
+	}
+	if r != '{' {
+		p.sc.UnreadRune()
+		return []any{}, errNotList
+	}
+	list := []any{}
+	for {
+		raw, last, err := runesUntil(p.sc, ",}")
+		if err == io.EOF {
+			return list, errors.New("list must terminate with '}'")
+		}
+		v, rerr := p.read(raw)
+		if last == '}' {
+			if r, _, err := p.sc.ReadRune(); err == nil && r != ',' {
+				p.sc.UnreadRune()
+			}
+			return append(list, v), rerr
+		}
+		if rerr != nil {
+			return list, rerr
+		}
+		list = append(list, v)
+	}
+}
+
+func setKey(data map[string]any, k string, v any) {
+	if k != "" {
+		data[k] = v
+	}
+}
+
+func setIndex(list []any, i int, v any) ([]any, error) {
+	if i < 0 {
+		return list, fmt.Errorf("negative %d index not allowed", i)
+	}
+	if i > maxSetIndex {
+		return list, fmt.Errorf("index of %d is greater than maximum supported index of %d", i, maxSetIndex)
+	}
+	if len(list) <= i {
+		list = append(list, make([]any, i+1-len(list))...)
+	}
+	list[i] = v
+	return list, nil
+}
+
+// runesUntil reads up to the first unescaped rune in stop, returning what it
+// read with the escapes dropped and the rune it stopped on.
+func runesUntil(sc *bytes.Buffer, stop string) (string, rune, error) {
+	var v strings.Builder
+	for {
+		r, _, err := sc.ReadRune()
+		switch {
+		case err != nil:
+			return v.String(), r, err
+		case strings.ContainsRune(stop, r):
+			return v.String(), r, nil
+		case r == '\\':
+			next, _, err := sc.ReadRune()
+			if err != nil {
+				return v.String(), next, err
+			}
+			v.WriteRune(next)
+		default:
+			v.WriteRune(r)
+		}
+	}
+}
+
+func runesUntil1(sc *bytes.Buffer, stop string) (string, error) {
+	v, _, err := runesUntil(sc, stop)
+	return v, err
 }
 
 // typedVal reads a --set value the way Helm does: booleans, null and integers
@@ -2666,10 +2898,10 @@ func runPackaging(cmd string, args []string) error {
 	var update bool
 	fs.BoolVar(&update, "u", false, "update dependencies before packaging")
 	fs.BoolVar(&update, "dependency-update", false, "update dependencies before packaging")
-	if err := fs.Parse(args); err != nil {
+	args, err := parseFlags(fs, args)
+	if err != nil {
 		return err
 	}
-	args = fs.Args()
 	if cmd == "package" {
 		if len(args) == 0 {
 			return fmt.Errorf(`"helm package" requires at least 1 argument`)

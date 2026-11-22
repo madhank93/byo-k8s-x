@@ -8,10 +8,13 @@ concepts: [byte-for-byte parity, error rewording, --set syntax, .Capabilities]
 Every earlier stage graded one feature. This one grades `template` the way a
 user notices a difference: run the same command through the real helm and
 your program, and stdout, stderr and the exit code must be **identical**.
-Flags go before NAME, as in every stage.
+Helm reads flags anywhere among the arguments, so from here on yours does
+too: `template rel ./chart --set a=1` is the same command as
+`template --set a=1 rel ./chart`.
 
 ```
 app template [-n NS] [-f FILE]... [--set k=v]... [--set-string k=v]...
+             [--set-json k=JSON]... [--set-file k=FILE]...
              [-s TEMPLATE]... [--kube-version V] NAME DIR
 ```
 
@@ -66,8 +69,30 @@ before rendering (bad values, a schema, `-s` matching nothing) do not.
 | `x` | `failed parsing --set data: key "x" has no value` |
 | `x={a` | `failed parsing --set data: list must terminate with '}'` |
 
-`--set-string` is the same syntax with every value a string, applied after
-all the `--set` flags.
+A key may index a list, and lists grow to fit, padded with nulls:
+
+| `--set` | value |
+|---|---|
+| `a[2].b=y` | `a: [null, null, {b: y}]` |
+| `m[1][1]=z` | `m: [null, [null, z]]` |
+| `a[0]=x` then `a[1]=y` | `a: [x, y]`: later flags write into the same list |
+| `a[0]=x` then `a.b=1` | `unable to parse key: interface conversion: interface {} is []interface {}, not map[string]interface {}` |
+| `a[-1]=x` | `negative -1 index not allowed` |
+| `a[65537]=x` | `index of 65537 is greater than maximum supported index of 65536` |
+| `a[0]b=1` | `unexpected data at end of array index: ['b']` |
+
+A list given with `--set` replaces the chart's list whole; it is never
+merged index by index with the default.
+
+Three more flags share the syntax, and helm applies them in this order
+after the `-f` files, whatever order they were typed in:
+
+1. `--set-json k=JSON`: the value is JSON, so `k=[1,"a"]` is a list and
+   `k={"x":1}` a map. A bad value fails with only
+   `failed parsing --set-json data ARG`.
+2. `--set`
+3. `--set-string`: every value a string.
+4. `--set-file k=PATH`: the value is the file's contents.
 
 **Output edges.** A chart that renders only hooks prints an empty line
 first: helm prints the trimmed manifest and a newline, then the hooks. And
