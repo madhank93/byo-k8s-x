@@ -23,7 +23,9 @@ in this order:
    every state (`uninstalled`, `pending-install`, ...);
 3. **sorts by release name**, not by Secret name: `web` comes before
    `web-a`, though `sh.helm.release.v1.web-a.v1` sorts before
-   `sh.helm.release.v1.web.v1`.
+   `sh.helm.release.v1.web.v1`. Two releases of one name in different
+   namespaces come out of helm in no fixed order, so the grader never
+   lists such a pair.
 
 With `-q` it prints the names, one per line. Otherwise it prints a table:
 
@@ -51,7 +53,9 @@ The grader runs every one of these through your program and through the
 real `helm`, against the same releases, and wants the same bytes. Some of
 those releases your program installed and some helm did, including one
 helm upgraded to revision 2 and one it uninstalled with `--keep-history`,
-which leaves its last revision marked `uninstalled`. Running `helm list`
+which leaves its last revision marked `uninstalled`, and one whose record
+the grader rewrites to `pending-install`, as a helm interrupted mid-install
+leaves it. Running `helm list`
 beside `app list` is the quickest way to find a difference.
 
 ## Go APIs
@@ -60,7 +64,9 @@ beside `app list` is the quickest way to find a difference.
 - `time.Time.String()` is the `UPDATED` format; a time decoded from JSON
   whose offset is the local one prints with the local zone's name.
 - `fmt.Sprintf("%-*s", width, cell)` pads a cell to a width.
-- `sort.SliceStable` keeps the API's order for equal names.
+- `sort.Slice` by name is enough: names are unique within a namespace.
+- The standard `flag` package stops at the first non-flag argument, so
+  flags go before `NAME`, as every command here is written.
 
 ## Hints
 

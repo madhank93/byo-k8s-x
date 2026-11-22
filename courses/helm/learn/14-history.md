@@ -19,8 +19,8 @@ app get values   [-n NS] [--revision N] [-a|--all] NAME
 app get notes    [-n NS] [--revision N] NAME
 ```
 
-**`history`** prints the last `--max` revisions (default 256), oldest
-first, in the same padded table as `list` with other columns:
+**`history`** prints the last `--max` revisions (default 256; 0 or less
+prints the header alone), oldest first, in the same padded table as `list` with other columns:
 
 ```
 REVISION	UPDATED                 	STATUS    	CHART    	APP VERSION	DESCRIPTION     
@@ -36,6 +36,9 @@ error>`, and the column is as wide as that.
 
 **`get`** reads one revision: the latest, or `--revision N`. A revision
 that does not exist is `Error: release: not found`, as is a name with none.
+Find it by its **number**, not its place: helm's `--history-max` prunes the
+oldest revisions, and the grader has it do so, so revision 11 can be the
+first in a history.
 
 | command | prints |
 |---|---|
@@ -46,7 +49,9 @@ that does not exist is `Error: release: not found`, as is a name with none.
 
 The computed values come from the **record** alone: the stored chart's
 defaults with the user's values merged over them, exactly as `values`
-merges them. The record holds no subcharts, so neither do they.
+merges them: maps merge key by key at every depth, and a user's `null`
+removes the default under it. The record holds no subcharts, so neither do
+they.
 
 As in the last stage, the grader runs each command through your program
 and the real `helm` and wants the same bytes.

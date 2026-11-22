@@ -87,7 +87,8 @@ helm -n shop status web
 The install itself becomes a small state machine:
 
 1. If any revision of the name exists, whatever its status, refuse with
-   `cannot re-use a name that is still in use`.
+   `cannot re-use a name that is still in use`. Look for any revision, not
+   revision 1: helm prunes old revisions, so a history can start anywhere.
 2. Render and run the ownership check. A refusal here records nothing.
 3. Write revision 1 as `pending-install` (description
    `Initial install underway`) *before* creating objects.
