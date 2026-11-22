@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"sigs.k8s.io/yaml"
 )
@@ -30,6 +32,44 @@ type Kustomization struct {
 	Labels       []Label           `json:"labels,omitempty"`
 
 	CommonAnnotations map[string]string `json:"commonAnnotations,omitempty"`
+
+	Images   []Image   `json:"images,omitempty"`
+	Replicas []Replica `json:"replicas,omitempty"`
+
+	ConfigMapGenerator []Generator       `json:"configMapGenerator,omitempty"`
+	GeneratorOptions   *GeneratorOptions `json:"generatorOptions,omitempty"`
+}
+
+// Generator is one entry of configMapGenerator.
+type Generator struct {
+	Name      string            `json:"name,omitempty"`
+	Namespace string            `json:"namespace,omitempty"`
+	Literals  []string          `json:"literals,omitempty"`
+	Files     []string          `json:"files,omitempty"`
+	Envs      []string          `json:"envs,omitempty"`
+	Options   *GeneratorOptions `json:"options,omitempty"`
+}
+
+// GeneratorOptions apply to every generator, or to one, which wins.
+type GeneratorOptions struct {
+	Labels                map[string]string `json:"labels,omitempty"`
+	Annotations           map[string]string `json:"annotations,omitempty"`
+	DisableNameSuffixHash bool              `json:"disableNameSuffixHash,omitempty"`
+	Immutable             bool              `json:"immutable,omitempty"`
+}
+
+// Replica is one entry of replicas.
+type Replica struct {
+	Name  string `json:"name,omitempty"`
+	Count int64  `json:"count"`
+}
+
+// Image is one entry of images: which image, and what to change in it.
+type Image struct {
+	Name    string `json:"name,omitempty"`
+	NewName string `json:"newName,omitempty"`
+	NewTag  string `json:"newTag,omitempty"`
+	Digest  string `json:"digest,omitempty"`
 }
 
 // Label is one entry of labels: pairs, and how far into the object they go.
@@ -42,16 +82,47 @@ type Label struct {
 // obj is one resource, as decoded YAML.
 type obj = map[string]any
 
+// resource is an object and every name it has had, the current one last, so
+// a reference to an older name can still find it.
+type resource struct {
+	o     obj
+	names []string
+}
+
+func (r *resource) rename(name string) {
+	meta(r.o)["name"] = name
+	r.names = append(r.names, name)
+}
+
+// hasName is whether the resource is, or once was, called name.
+func (r *resource) hasName(name string) bool {
+	for _, n := range r.names {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+func objects(rs []*resource) []obj {
+	var out []obj
+	for _, r := range rs {
+		out = append(out, r.o)
+	}
+	return out
+}
+
 func main() {
 	if len(os.Args) != 3 || os.Args[1] != "build" {
 		fmt.Fprintln(os.Stderr, "usage: app build DIR")
 		os.Exit(2)
 	}
-	objs, err := build(os.Args[2], map[string]bool{})
+	rs, err := build(os.Args[2], map[string]bool{})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
+	objs := objects(rs)
 	sortLegacy(objs)
 	out, err := render(objs)
 	if err != nil {
@@ -120,7 +191,7 @@ func load(dir string) (*Kustomization, error) {
 
 // build produces a kustomization directory's resources. visiting holds the
 // directories being built further up, so a cycle is caught, not recursed.
-func build(dir string, visiting map[string]bool) ([]obj, error) {
+func build(dir string, visiting map[string]bool) ([]*resource, error) {
 	abs, err := filepath.Abs(dir)
 	if err == nil {
 		abs, err = filepath.EvalSymlinks(abs)
@@ -138,28 +209,39 @@ func build(dir string, visiting map[string]bool) ([]obj, error) {
 	if err != nil {
 		return nil, err
 	}
-	var out []obj
+	var rs []*resource
 	for _, r := range k.Resources {
-		objs, err := accumulate(abs, r, visiting)
+		more, err := accumulate(abs, r, visiting)
 		if err != nil {
 			return nil, fmt.Errorf("accumulating resources from %q: %w", r, err)
 		}
-		out = append(out, objs...)
-		if err := unique(out); err != nil {
+		rs = append(rs, more...)
+		if err := unique(objects(rs)); err != nil {
 			return nil, fmt.Errorf("may not add resource with an already registered id: %w", err)
 		}
 	}
+	for _, g := range k.ConfigMapGenerator {
+		o, err := generate(abs, g, k.GeneratorOptions)
+		if err != nil {
+			return nil, err
+		}
+		rs = append(rs, &resource{o: o, names: []string{g.Name}})
+	}
+	if err := unique(objects(rs)); err != nil {
+		return nil, fmt.Errorf("may not add resource with an already registered id: %w", err)
+	}
 	if k.Namespace != "" {
-		setNamespace(out, k.Namespace)
-		if err := unique(out); err != nil {
+		setNamespace(rs, k.Namespace)
+		if err := unique(objects(rs)); err != nil {
 			return nil, fmt.Errorf("namespace transformation produces ID conflict: %w", err)
 		}
 	}
-	for _, o := range out {
-		if !fixedName[str(o, "kind")] {
-			meta(o)["name"] = k.NamePrefix + str(o, "metadata", "name") + k.NameSuffix
+	for _, r := range rs {
+		if !fixedName[str(r.o, "kind")] && k.NamePrefix+k.NameSuffix != "" {
+			r.rename(k.NamePrefix + str(r.o, "metadata", "name") + k.NameSuffix)
 		}
 	}
+	out := objects(rs)
 	if len(k.CommonLabels) > 0 {
 		apply(out, labelSpecs, setPairs(k.CommonLabels))
 	}
@@ -181,7 +263,211 @@ func build(dir string, visiting map[string]bool) ([]obj, error) {
 	if len(k.CommonAnnotations) > 0 {
 		apply(out, annotationSpecs, setPairs(k.CommonAnnotations))
 	}
+	for _, img := range k.Images {
+		for _, o := range out {
+			setImages(o, img)
+		}
+	}
+	for _, rep := range k.Replicas {
+		found := false
+		for _, r := range rs {
+			if scalable[str(r.o, "kind")] && r.hasName(rep.Name) {
+				spec, ok := r.o["spec"].(obj)
+				if !ok {
+					spec = obj{}
+					r.o["spec"] = spec
+				}
+				spec["replicas"] = rep.Count
+				found = true
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("resource with name %s does not match a config with a scalable kind", rep.Name)
+		}
+	}
+	return rs, nil
+}
+
+// scalable are the kinds replicas may set, in any API group.
+var scalable = map[string]bool{"Deployment": true, "ReplicaSet": true, "StatefulSet": true, "ReplicationController": true}
+
+// generate builds the ConfigMap one generator describes.
+func generate(root string, g Generator, global *GeneratorOptions) (obj, error) {
+	pairs, err := keyValues(root, g)
+	if err != nil {
+		return nil, fmt.Errorf("configmap %s: %w", g.Name, err)
+	}
+	data, binary := obj{}, obj{}
+	for _, kv := range pairs {
+		if _, dup := data[kv[0]]; dup {
+			return nil, fmt.Errorf("configmap %s illegally repeats the key `%s`", g.Name, kv[0])
+		}
+		if _, dup := binary[kv[0]]; dup {
+			return nil, fmt.Errorf("configmap %s illegally repeats the key `%s`", g.Name, kv[0])
+		}
+		if utf8.ValidString(kv[1]) {
+			data[kv[0]] = kv[1]
+		} else {
+			binary[kv[0]] = base64.StdEncoding.EncodeToString([]byte(kv[1]))
+		}
+	}
+	md := obj{"name": g.Name}
+	if g.Namespace != "" {
+		md["namespace"] = g.Namespace
+	}
+	o := obj{"apiVersion": "v1", "kind": "ConfigMap", "metadata": md}
+	if len(data) > 0 {
+		o["data"] = data
+	}
+	if len(binary) > 0 {
+		o["binaryData"] = binary
+	}
+	opts := mergeOptions(global, g.Options)
+	if len(opts.Labels) > 0 {
+		setPairs(opts.Labels)(md, "labels")
+	}
+	if len(opts.Annotations) > 0 {
+		setPairs(opts.Annotations)(md, "annotations")
+	}
+	if opts.Immutable {
+		o["immutable"] = true
+	}
+	return o, nil
+}
+
+// mergeOptions lays a generator's own options over the global ones.
+func mergeOptions(global, own *GeneratorOptions) GeneratorOptions {
+	var out GeneratorOptions
+	for _, o := range []*GeneratorOptions{global, own} {
+		if o == nil {
+			continue
+		}
+		for k, v := range o.Labels {
+			if out.Labels == nil {
+				out.Labels = map[string]string{}
+			}
+			out.Labels[k] = v
+		}
+		for k, v := range o.Annotations {
+			if out.Annotations == nil {
+				out.Annotations = map[string]string{}
+			}
+			out.Annotations[k] = v
+		}
+		out.DisableNameSuffixHash = out.DisableNameSuffixHash || o.DisableNameSuffixHash
+		out.Immutable = out.Immutable || o.Immutable
+	}
+	return out
+}
+
+// keyValues reads a generator's sources in kustomize's order: literals,
+// then files, then env files.
+func keyValues(root string, g Generator) ([][2]string, error) {
+	var out [][2]string
+	for _, l := range g.Literals {
+		k, v, ok := strings.Cut(l, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid literal source %s, expected key=value", l)
+		}
+		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		out = append(out, [2]string{k, v})
+	}
+	for _, f := range g.Files {
+		k, path, ok := strings.Cut(f, "=")
+		if !ok {
+			k, path = filepath.Base(f), f
+		}
+		b, err := readInRoot(root, path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, [2]string{k, string(b)})
+	}
+	for _, e := range g.Envs {
+		b, err := readInRoot(root, e)
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimLeft(line, " \t\r")
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			k, v, ok := strings.Cut(line, "=")
+			if !ok {
+				if v, ok = os.LookupEnv(k); !ok {
+					continue
+				}
+			}
+			out = append(out, [2]string{k, v})
+		}
+	}
 	return out, nil
+}
+
+// readInRoot reads a file that must sit inside root.
+func readInRoot(root, path string) ([]byte, error) {
+	full := filepath.Join(root, path)
+	if rel, err := filepath.Rel(root, full); err != nil || strings.HasPrefix(rel, "..") {
+		return nil, fmt.Errorf("security; file %q is not in or below %q", full, root)
+	}
+	return os.ReadFile(full)
+}
+
+// setImages rewrites every container image matching img, wherever the
+// containers and initContainers lists sit in the object.
+func setImages(v any, img Image) {
+	switch v := v.(type) {
+	case []any:
+		for _, item := range v {
+			setImages(item, img)
+		}
+	case obj:
+		for key, val := range v {
+			if key == "containers" || key == "initContainers" {
+				list, _ := val.([]any)
+				for _, c := range list {
+					if c, ok := c.(obj); ok {
+						if ref, ok := c["image"].(string); ok {
+							c["image"] = retag(ref, img)
+						}
+					}
+				}
+				continue
+			}
+			setImages(val, img)
+		}
+	}
+}
+
+// retag applies img to one image reference, name[:tag][@digest].
+func retag(ref string, img Image) string {
+	name, digest, _ := strings.Cut(ref, "@")
+	tag := ""
+	if i := strings.LastIndex(name, ":"); i > strings.LastIndex(name, "/") {
+		name, tag = name[:i], name[i+1:]
+	}
+	if name != img.Name {
+		return ref
+	}
+	if img.NewName != "" {
+		name = img.NewName
+	}
+	switch {
+	case img.Digest != "":
+		tag, digest = img.NewTag, img.Digest
+	case img.NewTag != "":
+		tag, digest = img.NewTag, ""
+	}
+	if tag != "" {
+		name += ":" + tag
+	}
+	if digest != "" {
+		name += "@" + digest
+	}
+	return name
 }
 
 // fieldSpec is a field kustomize knows to change: a slash path, in objects of
@@ -354,8 +640,9 @@ func meta(o obj) obj {
 
 // setNamespace moves every namespaced resource into ns. A Namespace object is
 // renamed to match, and a binding's subjects named default follow it too.
-func setNamespace(objs []obj, ns string) {
-	for _, o := range objs {
+func setNamespace(rs []*resource, ns string) {
+	for _, r := range rs {
+		o := r.o
 		if group(o) == "rbac.authorization.k8s.io" && strings.HasSuffix(str(o, "kind"), "RoleBinding") {
 			subjects, _ := o["subjects"].([]any)
 			for _, sub := range subjects {
@@ -366,7 +653,7 @@ func setNamespace(objs []obj, ns string) {
 		}
 		switch {
 		case group(o) == "" && str(o, "kind") == "Namespace":
-			meta(o)["name"] = ns
+			r.rename(ns)
 		case !clusterScoped(o):
 			meta(o)["namespace"] = ns
 		}
@@ -375,7 +662,7 @@ func setNamespace(objs []obj, ns string) {
 
 // accumulate reads one entry of resources: a directory is another
 // kustomization, and a file must sit inside the kustomization's own root.
-func accumulate(root, entry string, visiting map[string]bool) ([]obj, error) {
+func accumulate(root, entry string, visiting map[string]bool) ([]*resource, error) {
 	path := filepath.Join(root, entry)
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -452,12 +739,12 @@ func sortLegacy(objs []obj) {
 var docSep = regexp.MustCompile(`(?m)^---[ \t]*$`)
 
 // readResources decodes every document of a YAML file.
-func readResources(path string) ([]obj, error) {
+func readResources(path string) ([]*resource, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var out []obj
+	var objs []obj
 	for _, doc := range docSep.Split(string(data), -1) {
 		var o obj
 		if err := yaml.Unmarshal([]byte(doc), &o); err != nil {
@@ -466,23 +753,28 @@ func readResources(path string) ([]obj, error) {
 		if o == nil {
 			continue
 		}
-		if items, ok := o["items"].([]any); ok && strings.HasSuffix(str(o, "kind"), "List") {
-			for _, it := range items {
-				m, ok := it.(obj)
-				if !ok {
-					return nil, errors.New("a List item is not an object")
-				}
-				out = append(out, m)
-			}
+		items, ok := o["items"].([]any)
+		if !ok || !strings.HasSuffix(str(o, "kind"), "List") {
+			objs = append(objs, o)
 			continue
 		}
+		for _, it := range items {
+			m, ok := it.(obj)
+			if !ok {
+				return nil, errors.New("a List item is not an object")
+			}
+			objs = append(objs, m)
+		}
+	}
+	var out []*resource
+	for _, o := range objs {
 		if str(o, "kind") == "" {
 			return nil, errors.New("missing kind in object")
 		}
 		if str(o, "metadata", "name") == "" {
 			return nil, errors.New("missing metadata.name in object")
 		}
-		out = append(out, o)
+		out = append(out, &resource{o: o, names: []string{str(o, "metadata", "name")}})
 	}
 	return out, nil
 }

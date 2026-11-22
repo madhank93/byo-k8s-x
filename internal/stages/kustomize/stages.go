@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"sigs.k8s.io/yaml"
 
@@ -46,6 +47,9 @@ func init() {
 	register(Stage{Slug: "name-prefix", Run: stageNamePrefix})
 	register(Stage{Slug: "common-labels", Run: stageCommonLabels})
 	register(Stage{Slug: "common-annotations", Run: stageCommonAnnotations})
+	register(Stage{Slug: "images", Run: stageImages})
+	register(Stage{Slug: "replicas", Run: stageReplicas})
+	register(Stage{Slug: "configmap-generator", Run: stageConfigMapGenerator})
 }
 
 // tree is a kustomization directory as slash paths to contents.
@@ -638,6 +642,288 @@ func stageCommonAnnotations(ctx context.Context, _ *kube.Env, bin string) error 
 	})
 }
 
+// stageImages — images rewrites the name, tag and digest of every container
+// and init container whose image name matches exactly, wherever in the object
+// the containers are, entry by entry in the order they are listed.
+func stageImages(ctx context.Context, _ *kube.Env, bin string) error {
+	pods := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      initContainers:
+      - name: migrate
+        image: localhost:5000/tools/migrate:1.0
+      - name: seed
+        image: localhost:5000/tools/migrate
+      containers:
+      - name: web
+        image: nginx
+      - name: pinned
+        image: nginx:1.25@sha256:0000000000000000000000000000000000000000000000000000000000000001
+      - name: cache
+        image: redis:7.2@sha256:0000000000000000000000000000000000000000000000000000000000000002
+      - name: shell
+        image: busybox:1.36
+      - name: lookalike
+        image: nginx-exporter:0.11
+      - name: namespaced
+        image: library/nginx:1.25
+      - name: registry
+        image: docker.io/nginx:1.25
+      - name: noimage
+      ephemeralContainers:
+      - name: debug
+        image: busybox:1.36
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: backup
+            image: busybox
+---
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w
+spec:
+  image: nginx
+  runner:
+    containers:
+    - name: inner
+      image: redis
+`
+	return runChecks(ctx, bin, []check{
+		{"newTag replaces the tag and drops a digest; newName keeps both; digest replaces the tag; a name only matches the whole name, registry and path included; ephemeral containers and other image fields are left alone; containers are found wherever they are", ".", tree{
+			"kustomization.yaml": `images:
+- name: nginx
+  newTag: "1.27"
+- name: redis
+  newName: valkey/valkey
+- name: busybox
+  digest: sha256:00000000000000000000000000000000000000000000000000000000000000bb
+- name: localhost:5000/tools/migrate
+  newName: ghcr.io/acme/migrate
+  newTag: "2.0"
+resources: [pods.yaml]
+`, "pods.yaml": pods,
+		}},
+		{"newTag with digest keeps both, and entries apply in order, so a later entry sees what an earlier one renamed", ".", tree{
+			"kustomization.yaml": `images:
+- name: nginx
+  newName: mirror/nginx
+- name: mirror/nginx
+  newTag: "1.27"
+  digest: sha256:00000000000000000000000000000000000000000000000000000000000000aa
+- name: busybox
+  newTag: "1.37"
+- name: busybox
+  newName: alpine
+resources: [pods.yaml]
+`, "pods.yaml": pods,
+		}},
+		{"an outer kustomization's images apply after the inner one's", "app", tree{
+			"app/kustomization.yaml":  "images:\n- name: nginx\n  newTag: \"1.27\"\nresources: [../base]\n",
+			"base/kustomization.yaml": "images:\n- name: nginx\n  newTag: \"1.26\"\n- name: redis\n  newTag: \"7.4\"\nresources: [pods.yaml]\n",
+			"base/pods.yaml":          pods,
+		}},
+		{"newTag is a string; 1.10 unquoted is a number, and kustomize refuses it rather than print 1.1", ".", tree{
+			"kustomization.yaml": "images:\n- name: nginx\n  newTag: 1.10\nresources: [pods.yaml]\n", "pods.yaml": pods,
+		}},
+	})
+}
+
+// stageReplicas — replicas sets spec.replicas on the scalable kinds with a
+// matching name, found by the name they have now or the one they started
+// with, and refuses a name nothing scalable answers to.
+func stageReplicas(ctx context.Context, _ *kube.Env, bin string) error {
+	scalable := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: rs
+---
+apiVersion: v1
+kind: ReplicationController
+metadata:
+  name: rc
+---
+apiVersion: example.com/v1
+kind: Deployment
+metadata:
+  name: web
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: once
+`
+	return runChecks(ctx, bin, []check{
+		{"every scalable kind with the name gets the count, whatever its API group, and an existing count is overwritten; the Service called web is not scalable", ".", tree{
+			"kustomization.yaml": "replicas:\n- name: web\n  count: 3\n- name: db\n  count: 0\n- name: rs\n  count: 2\n- name: rc\n  count: 4\nresources: [r.yaml]\n", "r.yaml": scalable,
+		}},
+		{"a prefixed resource answers to its new name and to the one it started with", ".", tree{
+			"kustomization.yaml": "namePrefix: shop-\nreplicas:\n- name: web\n  count: 3\n- name: shop-db\n  count: 5\nresources: [r.yaml]\n", "r.yaml": scalable,
+		}},
+		{"the outer kustomization finds the inner one's Deployment by its original name, and its count wins", "app", tree{
+			"app/kustomization.yaml":  "replicas:\n- name: web\n  count: 10\nresources: [../base]\n",
+			"base/kustomization.yaml": "namePrefix: base-\nreplicas:\n- name: web\n  count: 2\nresources: [r.yaml]\n",
+			"base/r.yaml":             scalable,
+		}},
+		{"a name no scalable resource has is an error, not a no-op: the Job called once cannot be scaled", ".", tree{
+			"kustomization.yaml": "replicas:\n- name: once\n  count: 3\nresources: [r.yaml]\n", "r.yaml": scalable,
+		}},
+		{"count is a number", ".", tree{
+			"kustomization.yaml": "replicas:\n- name: web\n  count: \"3\"\nresources: [r.yaml]\n", "r.yaml": scalable,
+		}},
+	})
+}
+
+// sources are the files a generator reads, a binary one among them.
+var sources = tree{
+	"app.conf":         "port = 8080\nworkers = 4\n",
+	"conf/logging.ini": "[root]\nlevel = info\n",
+	"logo.png":         "\x89PNG\r\n\x1a\n\x00\x00\xff\xfe",
+	"app.env":          "# settings: MODE=slow is the default\nMODE=fast\n\nURL=https://example.com/?a=b\nQUOTED=\"kept\"\nEMPTY=\n",
+}
+
+// with returns a copy of t with more files.
+func (t tree) with(more tree) tree {
+	out := tree{}
+	for k, v := range t {
+		out[k] = v
+	}
+	for k, v := range more {
+		out[k] = v
+	}
+	return out
+}
+
+// stageConfigMapGenerator — configMapGenerator makes a ConfigMap from
+// literals, files and env files, with generatorOptions and per-generator
+// options, and the result is a resource like any other. Every generator here
+// turns the name hash off; the hash is stage 11.
+func stageConfigMapGenerator(ctx context.Context, _ *kube.Env, bin string) error {
+	return runChecks(ctx, bin, []check{
+		{"literals split at the first =, lose one pair of surrounding quotes, and may be empty; files are keyed by base name unless a key= is given; a file that is not UTF-8 goes in binaryData; an env file is KEY=VALUE lines, comments and blank lines skipped, quotes kept", ".", sources.with(tree{
+			"kustomization.yaml": `generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+- name: literals
+  literals:
+  - mode=fast
+  - query=a=b
+  - greeting="hello there"
+  - single='quoted'
+  - empty=
+- name: files
+  files:
+  - app.conf
+  - conf/logging.ini
+  - settings.conf=app.conf
+  - logo.png
+- name: env
+  envs:
+  - app.env
+- name: everything
+  literals:
+  - extra=yes
+  files:
+  - app.conf
+  envs:
+  - app.env
+- name: nothing
+`,
+		})},
+		{"generatorOptions labels and annotations go on every generated object, a generator's own options override them key by key, and immutable sets immutable", ".", tree{
+			"kustomization.yaml": `generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    generated: "true"
+    owner: platform
+  annotations:
+    note: generated
+configMapGenerator:
+- name: plain
+  literals: [a=1]
+- name: owned
+  literals: [a=1]
+  options:
+    labels:
+      owner: team-a
+    annotations:
+      extra: "yes"
+    immutable: true
+`,
+		}},
+		{"a generated ConfigMap is a resource like the rest: namespace, namePrefix and commonLabels reach it, and kustomization's namespace beats the generator's own", ".", tree{
+			"kustomization.yaml": `namespace: prod
+namePrefix: shop-
+commonLabels:
+  app: shop
+configMapGenerator:
+- name: settings
+  namespace: elsewhere
+  literals: [a=1]
+  options:
+    disableNameSuffixHash: true
+- name: other
+  literals: [b=2]
+  options:
+    disableNameSuffixHash: true
+resources: [cm.yaml]
+`,
+			"cm.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: handwritten\ndata:\n  c: \"3\"\n",
+		}},
+		{"a generator in an inner kustomization is built there, with that kustomization's transformers", "app", tree{
+			"app/kustomization.yaml":  "namePrefix: outer-\nresources: [../base]\n",
+			"base/kustomization.yaml": "namePrefix: inner-\ngeneratorOptions:\n  disableNameSuffixHash: true\nconfigMapGenerator:\n- name: settings\n  literals: [a=1]\n",
+		}},
+		{"a key may appear once: here a literal and a file both say app.conf", ".", sources.with(tree{
+			"kustomization.yaml": "generatorOptions:\n  disableNameSuffixHash: true\nconfigMapGenerator:\n- name: twice\n  literals: [app.conf=inline]\n  files: [app.conf]\n",
+		})},
+		{"a literal with no = has no value", ".", tree{
+			"kustomization.yaml": "generatorOptions:\n  disableNameSuffixHash: true\nconfigMapGenerator:\n- name: bad\n  literals: [novalue]\n",
+		}},
+		{"a file that is not there", ".", tree{
+			"kustomization.yaml": "generatorOptions:\n  disableNameSuffixHash: true\nconfigMapGenerator:\n- name: bad\n  files: [missing.conf]\n",
+		}},
+		{"a file outside the kustomization's directory is refused, as resources refuse one", "app", tree{
+			"app/kustomization.yaml": "generatorOptions:\n  disableNameSuffixHash: true\nconfigMapGenerator:\n- name: bad\n  files: [../shared.conf]\n",
+			"shared.conf":            "x\n",
+		}},
+		{"a generated ConfigMap collides with a handwritten one of the same name", ".", tree{
+			"kustomization.yaml": "generatorOptions:\n  disableNameSuffixHash: true\nconfigMapGenerator:\n- name: settings\n  literals: [a=1]\nresources: [cm.yaml]\n",
+			"cm.yaml":            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n",
+		}},
+	})
+}
+
 // runChecks builds every check with both programs and compares them as data.
 func runChecks(ctx context.Context, bin string, checks []check) error {
 	w, err := newWork(ctx, bin)
@@ -792,7 +1078,11 @@ func describe(c check) string {
 	fmt.Fprintf(&b, "%s — building %s of:\n", c.why, c.root)
 	for _, p := range sortedKeys(c.t) {
 		fmt.Fprintf(&b, "  ┌ %s\n", p)
-		for _, l := range strings.Split(strings.TrimRight(c.t[p], "\n"), "\n") {
+		body := c.t[p]
+		if !utf8.ValidString(body) {
+			body = fmt.Sprintf("(%d bytes of binary)", len(body))
+		}
+		for _, l := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
 			fmt.Fprintf(&b, "  │ %s\n", l)
 		}
 	}
