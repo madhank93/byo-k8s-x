@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,21 @@ type Kustomization struct {
 	APIVersion string   `json:"apiVersion,omitempty"`
 	Kind       string   `json:"kind,omitempty"`
 	Resources  []string `json:"resources,omitempty"`
+	Namespace  string   `json:"namespace,omitempty"`
+	NamePrefix string   `json:"namePrefix,omitempty"`
+	NameSuffix string   `json:"nameSuffix,omitempty"`
+
+	CommonLabels map[string]string `json:"commonLabels,omitempty"`
+	Labels       []Label           `json:"labels,omitempty"`
+
+	CommonAnnotations map[string]string `json:"commonAnnotations,omitempty"`
+}
+
+// Label is one entry of labels: pairs, and how far into the object they go.
+type Label struct {
+	Pairs            map[string]string `json:"pairs,omitempty"`
+	IncludeSelectors bool              `json:"includeSelectors,omitempty"`
+	IncludeTemplates bool              `json:"includeTemplates,omitempty"`
 }
 
 // obj is one resource, as decoded YAML.
@@ -81,11 +97,16 @@ func load(dir string) (*Kustomization, error) {
 	if strings.TrimSpace(string(data)) == "" {
 		return nil, fmt.Errorf("%s is empty", found[0])
 	}
+	// YAMLToJSON first: yaml.Unmarshal into a struct would quietly turn a
+	// number into the string a field wants, which kustomize refuses.
+	js, err := yaml.YAMLToJSON(data)
+	if err != nil {
+		return nil, err
+	}
 	var k Kustomization
-	if err := yaml.Unmarshal(data, &k, func(d *json.Decoder) *json.Decoder {
-		d.DisallowUnknownFields()
-		return d
-	}); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(js))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&k); err != nil {
 		return nil, fmt.Errorf("invalid Kustomization: %w", err)
 	}
 	if k.Kind != "" && k.Kind != "Kustomization" {
@@ -123,16 +144,233 @@ func build(dir string, visiting map[string]bool) ([]obj, error) {
 		if err != nil {
 			return nil, fmt.Errorf("accumulating resources from %q: %w", r, err)
 		}
-		for _, o := range objs {
-			for _, have := range out {
-				if id(have) == id(o) {
-					return nil, fmt.Errorf("may not add resource with an already registered id: %s", id(o))
-				}
-			}
-			out = append(out, o)
+		out = append(out, objs...)
+		if err := unique(out); err != nil {
+			return nil, fmt.Errorf("may not add resource with an already registered id: %w", err)
 		}
 	}
+	if k.Namespace != "" {
+		setNamespace(out, k.Namespace)
+		if err := unique(out); err != nil {
+			return nil, fmt.Errorf("namespace transformation produces ID conflict: %w", err)
+		}
+	}
+	for _, o := range out {
+		if !fixedName[str(o, "kind")] {
+			meta(o)["name"] = k.NamePrefix + str(o, "metadata", "name") + k.NameSuffix
+		}
+	}
+	if len(k.CommonLabels) > 0 {
+		apply(out, labelSpecs, setPairs(k.CommonLabels))
+	}
+	for _, l := range k.Labels {
+		specs := labelSpecs[:1]
+		switch {
+		case l.IncludeSelectors:
+			specs = labelSpecs
+		case l.IncludeTemplates:
+			specs = nil
+			for _, fs := range labelSpecs {
+				if strings.HasSuffix(fs.path, "metadata/labels") {
+					specs = append(specs, fs)
+				}
+			}
+		}
+		apply(out, specs, setPairs(l.Pairs))
+	}
+	if len(k.CommonAnnotations) > 0 {
+		apply(out, annotationSpecs, setPairs(k.CommonAnnotations))
+	}
 	return out, nil
+}
+
+// fieldSpec is a field kustomize knows to change: a slash path, in objects of
+// a group and kind ("" matches any), created when missing only if create.
+// A path segment that meets a list applies to every item.
+type fieldSpec struct {
+	group, kind, path string
+	create            bool
+}
+
+// apply runs set on the field each matching spec names.
+func apply(objs []obj, specs []fieldSpec, set func(parent obj, key string)) {
+	for _, o := range objs {
+		for _, fs := range specs {
+			if (fs.group == "" || fs.group == group(o)) && (fs.kind == "" || fs.kind == str(o, "kind")) {
+				walk(o, strings.Split(fs.path, "/"), fs.create, set)
+			}
+		}
+	}
+}
+
+func walk(v any, path []string, create bool, set func(parent obj, key string)) {
+	switch v := v.(type) {
+	case []any:
+		for _, item := range v {
+			walk(item, path, create, set)
+		}
+	case obj:
+		key := strings.TrimSuffix(path[0], "[]")
+		if len(path) == 1 {
+			if _, ok := v[key]; ok || create {
+				set(v, key)
+			}
+			return
+		}
+		next, ok := v[key]
+		if !ok || next == nil {
+			if !create {
+				return
+			}
+			next = obj{}
+			v[key] = next
+		}
+		walk(next, path[1:], create, set)
+	}
+}
+
+// setPairs merges pairs into the map at parent[key], creating it.
+func setPairs(pairs map[string]string) func(obj, string) {
+	return func(parent obj, key string) {
+		m, ok := parent[key].(obj)
+		if !ok {
+			m = obj{}
+			parent[key] = m
+		}
+		for k, v := range pairs {
+			m[k] = v
+		}
+	}
+}
+
+// selectorTerms are the optional label selectors inside a pod template.
+var selectorTerms = []string{
+	"spec/template/spec/affinity/podAffinity/preferredDuringSchedulingIgnoredDuringExecution/podAffinityTerm/labelSelector/matchLabels",
+	"spec/template/spec/affinity/podAffinity/requiredDuringSchedulingIgnoredDuringExecution/labelSelector/matchLabels",
+	"spec/template/spec/affinity/podAntiAffinity/preferredDuringSchedulingIgnoredDuringExecution/podAffinityTerm/labelSelector/matchLabels",
+	"spec/template/spec/affinity/podAntiAffinity/requiredDuringSchedulingIgnoredDuringExecution/labelSelector/matchLabels",
+	"spec/template/spec/topologySpreadConstraints/labelSelector/matchLabels",
+}
+
+// labelSpecs is where commonLabels goes; metadata/labels comes first.
+var labelSpecs = func() []fieldSpec {
+	specs := []fieldSpec{
+		{"", "", "metadata/labels", true},
+		{"", "ReplicationController", "spec/selector", true},
+		{"", "ReplicationController", "spec/template/metadata/labels", true},
+		{"", "Service", "spec/selector", true},
+		{"", "Deployment", "spec/selector/matchLabels", true},
+		{"", "Deployment", "spec/template/metadata/labels", true},
+		{"", "ReplicaSet", "spec/selector/matchLabels", true},
+		{"", "ReplicaSet", "spec/template/metadata/labels", true},
+		{"", "DaemonSet", "spec/selector/matchLabels", true},
+		{"", "DaemonSet", "spec/template/metadata/labels", true},
+		{"apps", "StatefulSet", "spec/selector/matchLabels", true},
+		{"apps", "StatefulSet", "spec/template/metadata/labels", true},
+		{"apps", "StatefulSet", "spec/volumeClaimTemplates[]/metadata/labels", true},
+		{"batch", "Job", "spec/selector/matchLabels", false},
+		{"batch", "Job", "spec/template/metadata/labels", true},
+		{"batch", "CronJob", "spec/jobTemplate/spec/selector/matchLabels", false},
+		{"batch", "CronJob", "spec/jobTemplate/metadata/labels", true},
+		{"batch", "CronJob", "spec/jobTemplate/spec/template/metadata/labels", true},
+		{"policy", "PodDisruptionBudget", "spec/selector/matchLabels", false},
+		{"networking.k8s.io", "NetworkPolicy", "spec/podSelector/matchLabels", false},
+		{"networking.k8s.io", "NetworkPolicy", "spec/ingress/from/podSelector/matchLabels", false},
+		{"networking.k8s.io", "NetworkPolicy", "spec/egress/to/podSelector/matchLabels", false},
+	}
+	for _, kind := range []string{"Deployment", "StatefulSet"} {
+		for _, p := range selectorTerms {
+			specs = append(specs, fieldSpec{"apps", kind, p, false})
+		}
+	}
+	return specs
+}()
+
+// annotationSpecs is where commonAnnotations goes: metadata and pod templates.
+var annotationSpecs = []fieldSpec{
+	{"", "", "metadata/annotations", true},
+	{"", "ReplicationController", "spec/template/metadata/annotations", true},
+	{"", "Deployment", "spec/template/metadata/annotations", true},
+	{"", "ReplicaSet", "spec/template/metadata/annotations", true},
+	{"", "DaemonSet", "spec/template/metadata/annotations", true},
+	{"apps", "StatefulSet", "spec/template/metadata/annotations", true},
+	{"batch", "Job", "spec/template/metadata/annotations", true},
+	{"batch", "CronJob", "spec/jobTemplate/metadata/annotations", true},
+	{"batch", "CronJob", "spec/jobTemplate/spec/template/metadata/annotations", true},
+}
+
+// fixedName are the kinds whose names the API server derives from their
+// content, so a prefix would break them.
+var fixedName = map[string]bool{"Namespace": true, "CustomResourceDefinition": true, "APIService": true}
+
+// unique refuses two resources with one identity.
+func unique(objs []obj) error {
+	seen := map[string]bool{}
+	for _, o := range objs {
+		if seen[id(o)] {
+			return errors.New(id(o))
+		}
+		seen[id(o)] = true
+	}
+	return nil
+}
+
+// clusterKinds are the built-in kinds with no namespace, by group/kind.
+var clusterKinds = map[string]bool{
+	"/Namespace": true, "/Node": true, "/PersistentVolume": true, "/ComponentStatus": true,
+	"rbac.authorization.k8s.io/ClusterRole": true, "rbac.authorization.k8s.io/ClusterRoleBinding": true,
+	"apiextensions.k8s.io/CustomResourceDefinition": true, "apiregistration.k8s.io/APIService": true,
+	"storage.k8s.io/StorageClass": true, "storage.k8s.io/CSIDriver": true, "storage.k8s.io/CSINode": true,
+	"storage.k8s.io/VolumeAttachment": true, "scheduling.k8s.io/PriorityClass": true,
+	"node.k8s.io/RuntimeClass": true, "networking.k8s.io/IngressClass": true,
+	"admissionregistration.k8s.io/MutatingWebhookConfiguration":     true,
+	"admissionregistration.k8s.io/ValidatingWebhookConfiguration":   true,
+	"admissionregistration.k8s.io/ValidatingAdmissionPolicy":        true,
+	"admissionregistration.k8s.io/ValidatingAdmissionPolicyBinding": true,
+	"certificates.k8s.io/CertificateSigningRequest":                 true,
+	"flowcontrol.apiserver.k8s.io/FlowSchema":                       true,
+	"flowcontrol.apiserver.k8s.io/PriorityLevelConfiguration":       true,
+}
+
+func group(o obj) string {
+	g, _, ok := strings.Cut(str(o, "apiVersion"), "/")
+	if !ok {
+		return ""
+	}
+	return g
+}
+
+func clusterScoped(o obj) bool { return clusterKinds[group(o)+"/"+str(o, "kind")] }
+
+// meta is the object's metadata, created if it is missing.
+func meta(o obj) obj {
+	m, ok := o["metadata"].(obj)
+	if !ok {
+		m = obj{}
+		o["metadata"] = m
+	}
+	return m
+}
+
+// setNamespace moves every namespaced resource into ns. A Namespace object is
+// renamed to match, and a binding's subjects named default follow it too.
+func setNamespace(objs []obj, ns string) {
+	for _, o := range objs {
+		if group(o) == "rbac.authorization.k8s.io" && strings.HasSuffix(str(o, "kind"), "RoleBinding") {
+			subjects, _ := o["subjects"].([]any)
+			for _, sub := range subjects {
+				if m, ok := sub.(obj); ok && m["name"] == "default" {
+					m["namespace"] = ns
+				}
+			}
+		}
+		switch {
+		case group(o) == "" && str(o, "kind") == "Namespace":
+			meta(o)["name"] = ns
+		case !clusterScoped(o):
+			meta(o)["namespace"] = ns
+		}
+	}
 }
 
 // accumulate reads one entry of resources: a directory is another

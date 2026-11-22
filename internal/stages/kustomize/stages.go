@@ -42,6 +42,10 @@ func Lookup(slug string) (Stage, bool) {
 func init() {
 	register(Stage{Slug: "kustomization-load", Run: stageKustomizationLoad})
 	register(Stage{Slug: "resources", Run: stageResources})
+	register(Stage{Slug: "namespace", Run: stageNamespace})
+	register(Stage{Slug: "name-prefix", Run: stageNamePrefix})
+	register(Stage{Slug: "common-labels", Run: stageCommonLabels})
+	register(Stage{Slug: "common-annotations", Run: stageCommonAnnotations})
 }
 
 // tree is a kustomization directory as slash paths to contents.
@@ -256,6 +260,380 @@ func stageResources(ctx context.Context, _ *kube.Env, bin string) error {
 		}},
 		{"a file that is not YAML at all", ".", tree{
 			"kustomization.yaml": "resources: [bad.yaml]\n", "bad.yaml": "kind: ConfigMap\nmetadata: {name: [\n",
+		}},
+	})
+}
+
+// clusterScoped is one of each kind of object that has no namespace, plus a
+// look-alike from another API group that does.
+const clusterScoped = `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: reader
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: disk
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: urgent
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: guard
+webhooks:
+- name: guard.example.com
+  clientConfig:
+    service:
+      name: guard
+      namespace: guard-system
+---
+apiVersion: example.com/v1
+kind: ClusterRole
+metadata:
+  name: not-rbac
+`
+
+// stageNamespace — namespace moves every namespaced resource into one
+// namespace, overwriting what was there, leaves cluster-scoped ones alone,
+// renames a Namespace object to match, and refuses the collisions that makes.
+func stageNamespace(ctx context.Context, _ *kube.Env, bin string) error {
+	return runChecks(ctx, bin, []check{
+		{"every namespaced resource lands in prod, the one that named its own namespace too", ".", tree{
+			"kustomization.yaml": "namespace: prod\nresources: [all.yaml]\n",
+			"all.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+  namespace: somewhere-else
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+---
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w
+`,
+		}},
+		{"cluster-scoped kinds have no namespace to set, and a kind is judged with its API group: example.com's ClusterRole is namespaced", ".", tree{
+			"kustomization.yaml": "namespace: prod\nresources: [cluster.yaml]\n", "cluster.yaml": clusterScoped,
+		}},
+		{"a Namespace object in the resources is renamed to the namespace everything else now lives in", ".", tree{
+			"kustomization.yaml": "namespace: prod\nresources: [ns.yaml, cm.yaml]\n",
+			"ns.yaml":            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: dev\n  labels:\n    team: a\n",
+			"cm.yaml":            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: dev\n",
+		}},
+		{"a binding's subject named default gets the namespace, whatever its kind; other subjects are left alone", ".", tree{
+			"kustomization.yaml": "namespace: prod\nresources: [rb.yaml]\n",
+			"rb.yaml": `apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: r
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: dev
+- kind: ServiceAccount
+  name: default
+- kind: User
+  name: default
+- kind: ServiceAccount
+  name: builder
+  namespace: ci
+- kind: Group
+  name: admins
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: crb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: r
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: kube-system
+- kind: ServiceAccount
+  name: builder
+  namespace: ci
+`,
+		}},
+		{"each kustomization applies its own namespace to what it builds, so the outer one has the last word", "app", tree{
+			"app/kustomization.yaml":  "namespace: prod\nresources: [../base, extra.yaml]\n",
+			"app/extra.yaml":          "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: extra\n",
+			"base/kustomization.yaml": "namespace: dev\nresources: [../lib, cm.yaml]\n",
+			"base/cm.yaml":            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: base\n",
+			"lib/kustomization.yaml":  "resources: [cm.yaml]\n",
+			"lib/cm.yaml":             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: lib\n  namespace: lib\n",
+		}},
+		{"an inner namespace survives an outer kustomization that sets none", "app", tree{
+			"app/kustomization.yaml":  "resources: [../base]\n",
+			"base/kustomization.yaml": "namespace: dev\nresources: [cm.yaml]\n",
+			"base/cm.yaml":            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: base\n",
+		}},
+		{"two ConfigMaps called settings, in two namespaces, become one identity twice once both are in prod", ".", tree{
+			"kustomization.yaml": "namespace: prod\nresources: [a.yaml, b.yaml]\n",
+			"a.yaml":             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: a\n",
+			"b.yaml":             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: b\n",
+		}},
+		{"two Namespace objects would both be renamed prod", ".", tree{
+			"kustomization.yaml": "namespace: prod\nresources: [ns.yaml]\n",
+			"ns.yaml":            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: one\n---\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: two\n",
+		}},
+	})
+}
+
+// stageNamePrefix — namePrefix and nameSuffix wrap every name except the
+// three kinds whose names mean something to the API server, and each level of
+// kustomization wraps the names the level below produced.
+func stageNamePrefix(ctx context.Context, _ *kube.Env, bin string) error {
+	unprefixed := `apiVersion: v1
+kind: Namespace
+metadata:
+  name: tools
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.metrics.example.com
+`
+	return runChecks(ctx, bin, []check{
+		{"namePrefix goes in front of every name, cluster-scoped ones included", ".", tree{
+			"kustomization.yaml": "namePrefix: prod-\nresources: [all.yaml, cluster.yaml]\n", "all.yaml": mixed, "cluster.yaml": clusterScoped,
+		}},
+		{"nameSuffix goes on the end", ".", tree{
+			"kustomization.yaml": "nameSuffix: -v2\nresources: [all.yaml]\n", "all.yaml": mixed,
+		}},
+		{"a Namespace, a CustomResourceDefinition and an APIService keep their names: the server derives them from what they define", ".", tree{
+			"kustomization.yaml": "namePrefix: prod-\nnameSuffix: -v2\nresources: [fixed.yaml]\n", "fixed.yaml": unprefixed,
+		}},
+		{"the outer kustomization's prefix goes outside the inner one's, and its suffix after", "app", tree{
+			"app/kustomization.yaml":  "namePrefix: outer-\nnameSuffix: -outer\nresources: [../base, own.yaml]\n",
+			"app/own.yaml":            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: own\n",
+			"base/kustomization.yaml": "namePrefix: inner-\nnameSuffix: -inner\nresources: [cm.yaml]\n",
+			"base/cm.yaml":            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n",
+		}},
+		{"namespace and namePrefix together: the Namespace object takes the namespace's name, unprefixed", ".", tree{
+			"kustomization.yaml": "namespace: prod\nnamePrefix: app-\nresources: [r.yaml]\n",
+			"r.yaml":             "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: dev\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n",
+		}},
+	})
+}
+
+// workloads is every kind with a pod template or a selector, each with the
+// optional fields commonLabels reaches into only when they are already there.
+const workloads = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    tier: front
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                tier: front
+            topologyKey: kubernetes.io/hostname
+          - labelSelector:
+              matchExpressions: []
+            topologyKey: zone
+      topologySpreadConstraints:
+      - labelSelector:
+          matchLabels:
+            tier: front
+        maxSkew: 1
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: agent
+spec:
+  template:
+    spec:
+      topologySpreadConstraints:
+      - labelSelector:
+          matchLabels:
+            x: "y"
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: rs
+---
+apiVersion: v1
+kind: ReplicationController
+metadata:
+  name: rc
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: once
+spec:
+  selector:
+    matchLabels:
+      job: once
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: twice
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly
+spec:
+  schedule: "0 0 * * *"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+spec:
+  minAvailable: 1
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db
+spec:
+  selector:
+    matchLabels:
+      app: db
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow
+spec:
+  podSelector: {}
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          role: client
+    - namespaceSelector: {}
+    - podSelector:
+        matchLabels:
+          role: admin
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: solo
+---
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w
+spec:
+  selector:
+    matchLabels:
+      a: b
+  template:
+    metadata: {}
+`
+
+// stageCommonLabels — commonLabels lands on every resource and on the
+// selectors and pod templates that must agree with it; labels does the same
+// with each part switched on separately.
+func stageCommonLabels(ctx context.Context, _ *kube.Env, bin string) error {
+	return runChecks(ctx, bin, []check{
+		{"commonLabels goes on every object's metadata, and into each selector and template kustomize knows of — creating the ones a workload must have, extending the optional ones only where they exist, and never touching a kind it does not know", ".", tree{
+			"kustomization.yaml": "commonLabels:\n  app: shop\n  tier: back\nresources: [workloads.yaml]\n", "workloads.yaml": workloads,
+		}},
+		{"labels with neither switch is metadata only", ".", tree{
+			"kustomization.yaml": "labels:\n- pairs:\n    owner: team-a\nresources: [workloads.yaml]\n", "workloads.yaml": workloads,
+		}},
+		{"includeTemplates adds the pod templates (and the claim templates), but no selector", ".", tree{
+			"kustomization.yaml": "labels:\n- pairs:\n    version: v2\n  includeTemplates: true\nresources: [workloads.yaml]\n", "workloads.yaml": workloads,
+		}},
+		{"includeSelectors is commonLabels, wherever it reaches", ".", tree{
+			"kustomization.yaml": "labels:\n- pairs:\n    app: shop\n  includeSelectors: true\n- pairs:\n    owner: team-a\nresources: [workloads.yaml]\n", "workloads.yaml": workloads,
+		}},
+		{"labels and commonLabels together, the outer kustomization's label overriding the inner one's value", "app", tree{
+			"app/kustomization.yaml":  "commonLabels:\n  env: prod\nlabels:\n- pairs:\n    team: core\nresources: [../base]\n",
+			"base/kustomization.yaml": "commonLabels:\n  env: dev\n  app: web\nresources: [svc.yaml]\n",
+			"base/svc.yaml":           "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  selector:\n    app: old\n",
+		}},
+		{"a label value is a string: kustomize refuses a number", ".", tree{
+			"kustomization.yaml": "commonLabels:\n  replicas: 3\nresources: [svc.yaml]\n",
+			"svc.yaml":           "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n",
+		}},
+	})
+}
+
+// stageCommonAnnotations — commonAnnotations lands on every object and on
+// every pod template, never on a selector, and overrides what was there.
+func stageCommonAnnotations(ctx context.Context, _ *kube.Env, bin string) error {
+	return runChecks(ctx, bin, []check{
+		{"commonAnnotations goes on every object's metadata and into every pod template kustomize knows of, creating them", ".", tree{
+			"kustomization.yaml": "commonAnnotations:\n  owner: team-a\n  docs: https://example.com/runbook\nresources: [workloads.yaml]\n", "workloads.yaml": workloads,
+		}},
+		{"an annotation already there keeps its neighbours and loses its value; the outer kustomization has the last word", "app", tree{
+			"app/kustomization.yaml":  "commonAnnotations:\n  stage: prod\nresources: [../base]\n",
+			"base/kustomization.yaml": "commonAnnotations:\n  stage: dev\n  build: \"42\"\ncommonLabels:\n  app: web\nresources: [d.yaml]\n",
+			"base/d.yaml":             "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  annotations:\n    stage: none\n    keep: me\nspec:\n  template:\n    metadata:\n      annotations:\n        keep: pod\n",
+		}},
+		{"an annotation value is a string: kustomize refuses a boolean", ".", tree{
+			"kustomization.yaml": "commonAnnotations:\n  enabled: true\nresources: [svc.yaml]\n",
+			"svc.yaml":           "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n",
 		}},
 	})
 }
