@@ -53,19 +53,27 @@
 // Stage 17: documents annotated helm.sh/hook are kept out of the manifest
 // and run around install, upgrade and rollback, each waited on and deleted
 // as its delete policy says.
+//
+// Stage 21: `dependency list|update|build DIR` resolves Chart.yaml's
+// dependencies into charts/ and pins them in Chart.lock; `package DIR` writes
+// the chart as Helm's archive, which load reads back.
 
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -106,7 +114,14 @@ func main() {
 	if cmd == "get" && len(args) > 0 {
 		cmd, args = "get "+args[0], args[1:]
 	}
-	if err := run(cmd, args); err != nil {
+	if (cmd == "dependency" || cmd == "dep") && len(args) > 0 {
+		cmd, args = "dependency "+args[0], args[1:]
+	}
+	do := run
+	if cmd == "package" || strings.HasPrefix(cmd, "dependency ") {
+		do = runPackaging
+	}
+	if err := do(cmd, args); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
@@ -342,6 +357,8 @@ type Chart struct {
 	Subcharts []*Chart
 	Schema    []byte // values.schema.json, if the chart has one
 	Files     Files
+	Raw       []byte // values.yaml as written, nil if the chart has none
+	Lock      *Lock  // Chart.lock, if the chart has one
 }
 
 // Files is every chart file Helm does not read itself: not a template,
@@ -362,7 +379,11 @@ type Release struct {
 	Service   string
 }
 
+// load reads a chart directory, or a packaged chart when dir is a file.
 func load(dir string) (*Chart, error) {
+	if fi, err := os.Stat(dir); err == nil && !fi.IsDir() {
+		return loadArchive(dir)
+	}
 	raw, err := os.ReadFile(filepath.Join(dir, "Chart.yaml"))
 	if err != nil {
 		return nil, fmt.Errorf("%s is not a chart: %w", dir, err)
@@ -383,23 +404,45 @@ func load(dir string) (*Chart, error) {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
+	if raw, err := os.ReadFile(filepath.Join(dir, "Chart.lock")); err == nil {
+		c.Lock = &Lock{}
+		if err := yaml.Unmarshal(raw, c.Lock); err != nil {
+			return nil, fmt.Errorf("cannot load Chart.lock: %w", err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
 	c.Values = map[string]any{}
 	if raw, err := os.ReadFile(filepath.Join(dir, "values.yaml")); err == nil {
+		c.Raw = raw
 		if err := yaml.Unmarshal(raw, &c.Values); err != nil {
 			return nil, fmt.Errorf("cannot load values.yaml: %w", err)
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
+	ignore, err := ignoreRules(dir)
+	if err != nil {
+		return nil, err
+	}
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		rel, err := filepath.Rel(dir, path)
 		if err != nil {
 			return err
 		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil || rel == "." {
+			return err
+		}
 		rel = filepath.ToSlash(rel)
+		if ignored(ignore, rel, d.IsDir()) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
 		// Helm never loads dotfiles directly under templates/.
 		if strings.HasPrefix(rel, "templates/.") {
 			return nil
@@ -429,8 +472,7 @@ func load(dir string) (*Chart, error) {
 	// Helm sorts templates by whole path, not directory by directory.
 	sort.Slice(c.Templates, func(i, j int) bool { return c.Templates[i].Name < c.Templates[j].Name })
 
-	// Helm loads every entry of charts/ as a chart.
-	// ponytail: unpacked directories only; .tgz archives arrive with dependency build.
+	// Helm loads every entry of charts/ as a chart, packaged or not.
 	entries, err := os.ReadDir(filepath.Join(dir, "charts"))
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
@@ -449,7 +491,7 @@ func load(dir string) (*Chart, error) {
 			c.Files["charts/"+e.Name()] = data
 			continue
 		}
-		if !e.IsDir() {
+		if !e.IsDir() && !strings.HasSuffix(e.Name(), ".tgz") {
 			return nil, fmt.Errorf("error unpacking subchart %s in %s: not a chart directory", e.Name(), c.Metadata.Name)
 		}
 		sub, err := load(filepath.Join(dir, "charts", e.Name()))
@@ -689,6 +731,14 @@ func enabled(deps []Dependency, name string, vals, tags map[string]any) bool {
 // missingDeps refuses a chart whose Chart.yaml lists a dependency that
 // charts/ does not hold, switched off or not.
 func missingDeps(c *Chart) error {
+	if err := checkDeps(c); err != nil {
+		return fmt.Errorf("An error occurred while checking for chart dependencies. You may need to run `helm dependency build` to fetch missing dependencies: %w", err)
+	}
+	return nil
+}
+
+// checkDeps lists, in Chart.yaml's order, the dependencies charts/ lacks.
+func checkDeps(c *Chart) error {
 	have := map[string]bool{}
 	for _, sub := range c.Subcharts {
 		have[sub.Metadata.Name] = true
@@ -702,7 +752,7 @@ func missingDeps(c *Chart) error {
 	if missing == nil {
 		return nil
 	}
-	return fmt.Errorf("An error occurred while checking for chart dependencies. You may need to run `helm dependency build` to fetch missing dependencies: found in Chart.yaml, but missing in charts/ directory: %s", strings.Join(missing, ", "))
+	return fmt.Errorf("found in Chart.yaml, but missing in charts/ directory: %s", strings.Join(missing, ", "))
 }
 
 // pathValue reads a dotted path such as db.enabled, or nil if it is not there.
@@ -2079,4 +2129,626 @@ func (k *kube) deleteHook(ns string, h *Hook, policy string) error {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// Lock is Chart.lock: the versions dependency update resolved, and a digest
+// of Chart.yaml's dependencies with them, which tells build the two still agree.
+type Lock struct {
+	Generated    time.Time    `json:"generated"`
+	Digest       string       `json:"digest"`
+	Dependencies []Dependency `json:"dependencies"`
+}
+
+// runPackaging is the commands that work on chart directories and archives
+// and never reach a cluster.
+func runPackaging(cmd string, args []string) error {
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	dest := fs.String("d", ".", "where to write the archive")
+	fs.StringVar(dest, "destination", ".", "where to write the archive")
+	version := fs.String("version", "", "set the chart's version")
+	appVersion := fs.String("app-version", "", "set the chart's appVersion")
+	var update bool
+	fs.BoolVar(&update, "u", false, "update dependencies before packaging")
+	fs.BoolVar(&update, "dependency-update", false, "update dependencies before packaging")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	args = fs.Args()
+	if cmd == "package" {
+		if len(args) == 0 {
+			return fmt.Errorf(`"helm package" requires at least 1 argument`)
+		}
+		for _, dir := range args {
+			if update {
+				if err := depUpdate(dir, io.Discard); err != nil {
+					return err
+				}
+			}
+			name, err := packageChart(dir, *dest, *version, *appVersion)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Successfully packaged chart and saved it to: %s\n", name)
+		}
+		return nil
+	}
+	if len(args) > 1 {
+		return fmt.Errorf(`"helm %s" accepts at most 1 argument`, cmd)
+	}
+	dir := "."
+	if len(args) == 1 {
+		dir = filepath.Clean(args[0])
+	}
+	switch cmd {
+	case "dependency list":
+		return depList(dir)
+	case "dependency update":
+		return depUpdate(dir, os.Stdout)
+	case "dependency build":
+		return depBuild(dir, os.Stdout)
+	}
+	return fmt.Errorf("unknown command %q", cmd)
+}
+
+// depList prints each dependency with what charts/ holds for it, then warns
+// about charts in charts/ that Chart.yaml does not declare.
+func depList(dir string) error {
+	c, err := load(dir)
+	if err != nil {
+		return err
+	}
+	if c.Metadata.Dependencies == nil {
+		fmt.Printf("WARNING: no dependencies at %s\n", filepath.Join(dir, "charts"))
+		return nil
+	}
+	rows := [][]string{{"NAME", "VERSION", "REPOSITORY", "STATUS"}}
+	for _, d := range c.Metadata.Dependencies {
+		rows = append(rows, []string{d.Name, d.Version, d.Repository, depStatus(dir, d, c)})
+	}
+	printTable(rows)
+	fmt.Println()
+	found, _ := filepath.Glob(filepath.Join(dir, "charts/*"))
+	for _, f := range found {
+		fi, err := os.Stat(f)
+		if err != nil || (!fi.IsDir() && filepath.Ext(f) != ".tgz") {
+			continue
+		}
+		sub, err := load(f)
+		if err != nil {
+			fmt.Printf("WARNING: %q is not a chart.\n", f)
+			continue
+		}
+		if !slices.ContainsFunc(c.Metadata.Dependencies, func(d Dependency) bool { return d.Name == sub.Metadata.Name }) {
+			fmt.Printf("WARNING: %q is not in Chart.yaml.\n", f)
+		}
+	}
+	return nil
+}
+
+// depStatus is Helm's verdict on one dependency: an archive named for it is
+// checked first, then an unpacked directory.
+func depStatus(dir string, d Dependency, parent *Chart) string {
+	archives, err := filepath.Glob(filepath.Join(dir, "charts", d.Name+"-*.tgz"))
+	if err != nil {
+		return "bad pattern"
+	}
+	var semverNamed []string
+	for _, a := range archives {
+		v := strings.TrimPrefix(strings.TrimSuffix(filepath.Base(a), ".tgz"), d.Name+"-")
+		if _, err := semver.StrictNewVersion(v); err == nil {
+			semverNamed = append(semverNamed, a)
+		}
+	}
+	switch {
+	case len(archives) == 1:
+		semverNamed = archives
+	case len(semverNamed) > 1:
+		return "too many matches"
+	}
+	if len(semverNamed) == 1 {
+		sub, err := load(semverNamed[0])
+		switch {
+		case err != nil:
+			return "corrupt"
+		case sub.Metadata.Name != d.Name:
+			return "misnamed"
+		}
+		if s := versionStatus(sub.Metadata.Version, d.Version); s != "" {
+			return s
+		}
+		return "ok"
+	}
+	for _, sub := range parent.Subcharts {
+		if sub.Metadata.Name == d.Name {
+			if s := versionStatus(sub.Metadata.Version, d.Version); s != "" {
+				return s
+			}
+			return "unpacked"
+		}
+	}
+	return "missing"
+}
+
+// versionStatus is "" when version satisfies the constraint.
+func versionStatus(version, constraint string) string {
+	if version == constraint {
+		return ""
+	}
+	c, err := semver.NewConstraint(constraint)
+	if err != nil {
+		return "invalid version"
+	}
+	v, err := semver.NewVersion(version)
+	if err != nil {
+		return "invalid version"
+	}
+	if !c.Check(v) {
+		return "wrong version"
+	}
+	return ""
+}
+
+// chartDir loads a chart that dependency update or build may write into.
+func chartDir(dir string) (*Chart, error) {
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return nil, fmt.Errorf("could not find %s: %w", dir, err)
+	}
+	if !fi.IsDir() {
+		return nil, errors.New("only unpacked charts can be updated")
+	}
+	return load(dir)
+}
+
+// depUpdate resolves every dependency to a version, fetches them into
+// charts/, and writes Chart.lock unless its digest is unchanged.
+func depUpdate(dir string, out io.Writer) error {
+	c, err := chartDir(dir)
+	if err != nil {
+		return err
+	}
+	reqs := c.Metadata.Dependencies
+	if reqs == nil {
+		return nil
+	}
+	if err := checkRepos(dir, reqs); err != nil {
+		return err
+	}
+	lock, err := resolveDeps(dir, reqs)
+	if err != nil {
+		return err
+	}
+	if err := fetchDeps(dir, lock.Dependencies, out); err != nil {
+		return err
+	}
+	if c.Lock != nil && c.Lock.Digest == lock.Digest {
+		return nil
+	}
+	data, err := yaml.Marshal(lock)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "Chart.lock"), data, 0o644)
+}
+
+// depBuild fetches the locked versions, refusing a lock whose digest no
+// longer matches Chart.yaml. Without a lock it is an update.
+func depBuild(dir string, out io.Writer) error {
+	c, err := chartDir(dir)
+	if err != nil {
+		return err
+	}
+	if c.Lock == nil {
+		return depUpdate(dir, out)
+	}
+	sum, err := hashDeps(c.Metadata.Dependencies, c.Lock.Dependencies)
+	if err != nil {
+		return err
+	}
+	if sum != c.Lock.Digest {
+		return errors.New("the lock file (Chart.lock) is out of sync with the dependencies file (Chart.yaml). Please update the dependencies")
+	}
+	if err := checkRepos(dir, c.Metadata.Dependencies); err != nil {
+		return err
+	}
+	return fetchDeps(dir, c.Lock.Dependencies, out)
+}
+
+// checkRepos insists every file:// repository exists. Chart repositories over
+// HTTP or OCI would need `helm repo add`, which this program has no store for.
+func checkRepos(dir string, reqs []Dependency) error {
+	var missing []string
+	for _, d := range reqs {
+		switch {
+		case d.Repository == "":
+		case strings.HasPrefix(d.Repository, "file://"):
+			if _, err := localPath(d.Repository, dir); err != nil {
+				return err
+			}
+		default:
+			missing = append(missing, d.Repository)
+		}
+	}
+	if missing != nil {
+		return fmt.Errorf("no repository definition for %s. Please add the missing repos via 'helm repo add'", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// localPath resolves a file:// repository against the chart's directory.
+func localPath(repo, dir string) (string, error) {
+	p := strings.TrimPrefix(repo, "file://")
+	if !strings.HasPrefix(p, "/") {
+		p = filepath.Join(dir, p)
+	}
+	if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("directory %s not found", p)
+	} else if err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
+// resolveDeps picks a version for each dependency. A file:// one is whatever
+// version that chart has, if it satisfies the constraint; one with no
+// repository must already be unpacked in charts/ and keeps its constraint.
+func resolveDeps(dir string, reqs []Dependency) (*Lock, error) {
+	locked := make([]Dependency, len(reqs))
+	var missing []string
+	for i, d := range reqs {
+		constraint, err := semver.NewConstraint(d.Version)
+		if err != nil {
+			return nil, fmt.Errorf("dependency %q has an invalid version/constraint format: %w", d.Name, err)
+		}
+		if d.Repository == "" {
+			if _, err := localPath(filepath.Join("charts", d.Name), dir); err != nil {
+				return nil, err
+			}
+			locked[i] = Dependency{Name: d.Name, Version: d.Version}
+			continue
+		}
+		p, err := localPath(d.Repository, dir)
+		if err != nil {
+			return nil, err
+		}
+		sub, err := load(p)
+		if err != nil {
+			return nil, err
+		}
+		v, err := semver.NewVersion(sub.Metadata.Version)
+		if err != nil {
+			continue
+		}
+		if !constraint.Check(v) {
+			missing = append(missing, fmt.Sprintf("%q (repository %q, version %q)", d.Name, d.Repository, d.Version))
+			continue
+		}
+		locked[i] = Dependency{Name: d.Name, Repository: d.Repository, Version: sub.Metadata.Version}
+	}
+	if missing != nil {
+		return nil, fmt.Errorf("can't get a valid version for %d subchart(s): %s. Make sure a matching chart version exists in the repo, or change the version constraint in Chart.yaml", len(missing), strings.Join(missing, ", "))
+	}
+	sum, err := hashDeps(reqs, locked)
+	if err != nil {
+		return nil, err
+	}
+	return &Lock{Generated: time.Now(), Digest: sum, Dependencies: locked}, nil
+}
+
+// hashDeps is Helm's lock digest: sha256 of the declared and the locked
+// dependencies, as one JSON array of the two lists.
+func hashDeps(reqs, locked []Dependency) (string, error) {
+	data, err := json.Marshal([2][]Dependency{reqs, locked})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(data)), nil
+}
+
+// fetchDeps packages each file:// dependency into charts/ and then deletes
+// every other archive there, except those of dependencies with no repository.
+func fetchDeps(dir string, deps []Dependency, out io.Writer) error {
+	dest := filepath.Join(dir, "charts")
+	if fi, err := os.Stat(dest); err == nil && !fi.IsDir() {
+		return fmt.Errorf("%q is not a directory", dest)
+	}
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, fmt.Sprintf("tmpcharts-%d", os.Getpid()))
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+
+	fmt.Fprintf(out, "Saving %d charts\n", len(deps))
+	local := map[string]bool{}
+	for _, d := range deps {
+		if d.Repository != "" {
+			if err := fetchLocal(dir, d, tmp); err != nil {
+				fmt.Fprintln(out, "Save error occurred: ", err)
+				return err
+			}
+			continue
+		}
+		local[d.Name] = true
+		fmt.Fprintf(out, "Dependency %s did not declare a repository. Assuming it exists in the charts directory\n", d.Name)
+		p := filepath.Join(dest, d.Name)
+		sub, err := load(p)
+		if err != nil {
+			return fmt.Errorf("unable to load chart '%s': %v", p, err)
+		}
+		if versionStatus(sub.Metadata.Version, d.Version) != "" {
+			err := fmt.Errorf("dependency %s at version %s does not satisfy the constraint %s", d.Name, sub.Metadata.Version, d.Version)
+			fmt.Fprintln(out, "Save error occurred: ", err)
+			return err
+		}
+	}
+
+	fetched, err := os.ReadDir(tmp)
+	if err != nil {
+		return err
+	}
+	present, err := os.ReadDir(dest)
+	if err != nil {
+		return err
+	}
+	keep := map[string]bool{}
+	for _, f := range fetched {
+		keep[f.Name()] = true
+		if err := os.Rename(filepath.Join(tmp, f.Name()), filepath.Join(dest, f.Name())); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintln(out, "Deleting outdated charts")
+	for _, f := range present {
+		if f.IsDir() || keep[f.Name()] {
+			continue
+		}
+		p := filepath.Join(dest, f.Name())
+		sub, err := load(p)
+		if err != nil {
+			fmt.Fprintf(out, "Could not verify %s for deletion: %s (Skipping)\n", p, err)
+			continue
+		}
+		if !local[sub.Metadata.Name] {
+			if err := os.Remove(p); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// fetchLocal packages a file:// dependency into dest, if its chart still has
+// a version the lock or constraint accepts.
+func fetchLocal(dir string, d Dependency, dest string) error {
+	p, err := localPath(d.Repository, dir)
+	if err != nil {
+		return err
+	}
+	sub, err := load(p)
+	if err != nil {
+		return err
+	}
+	if versionStatus(sub.Metadata.Version, d.Version) != "" {
+		return fmt.Errorf("can't get a valid version for dependency %s", d.Name)
+	}
+	_, err = saveArchive(sub, dest)
+	return err
+}
+
+// packageChart writes a chart directory as <name>-<version>.tgz in dest,
+// refusing one whose charts/ lacks a declared dependency.
+func packageChart(dir, dest, version, appVersion string) (string, error) {
+	c, err := load(dir)
+	if err != nil {
+		return "", err
+	}
+	if version != "" {
+		c.Metadata.Version = version
+	}
+	if appVersion != "" {
+		c.Metadata.AppVersion = appVersion
+	}
+	if c.Metadata.Dependencies != nil {
+		if err := checkDeps(c); err != nil {
+			return "", err
+		}
+	}
+	if dest == "." {
+		if dest, err = os.Getwd(); err != nil {
+			return "", err
+		}
+	}
+	name, err := saveArchive(c, dest)
+	if err != nil {
+		return "", fmt.Errorf("failed to save: %w", err)
+	}
+	return name, nil
+}
+
+// helmGzipExtra is the extra field Helm writes into every archive's gzip header.
+var helmGzipExtra = []byte("+aHR0cHM6Ly95b3V0dS5iZS96OVV6MWljandyTQo=")
+
+// saveArchive writes Helm's archive layout: gzip with Helm's header, and a
+// tar of regular files only under a directory named for the chart.
+func saveArchive(c *Chart, dest string) (string, error) {
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	zw.Extra = helmGzipExtra
+	zw.Comment = "Helm"
+	tw := tar.NewWriter(zw)
+	if err := writeChart(tw, c, ""); err != nil {
+		return "", err
+	}
+	if err := tw.Close(); err != nil {
+		return "", err
+	}
+	if err := zw.Close(); err != nil {
+		return "", err
+	}
+	name := filepath.Join(dest, fmt.Sprintf("%s-%s.tgz", c.Metadata.Name, c.Metadata.Version))
+	return name, os.WriteFile(name, buf.Bytes(), 0o644)
+}
+
+// writeChart is one chart's entries, in Helm's order: Chart.yaml and
+// Chart.lock re-serialized, values.yaml as written, the schema, templates,
+// other files, then each subchart unpacked under charts/.
+func writeChart(tw *tar.Writer, c *Chart, prefix string) error {
+	base := filepath.ToSlash(filepath.Join(prefix, c.Metadata.Name))
+	put := func(name string, data []byte) error {
+		h := &tar.Header{Name: base + "/" + name, Mode: 0o644, Size: int64(len(data)), ModTime: time.Now()}
+		if err := tw.WriteHeader(h); err != nil {
+			return err
+		}
+		_, err := tw.Write(data)
+		return err
+	}
+	meta := c.Metadata
+	if meta.APIVersion == "v1" {
+		meta.Dependencies = nil
+	}
+	data, err := yaml.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	if err := put("Chart.yaml", data); err != nil {
+		return err
+	}
+	if c.Lock != nil && meta.APIVersion == "v2" {
+		data, err := yaml.Marshal(c.Lock)
+		if err != nil {
+			return err
+		}
+		if err := put("Chart.lock", data); err != nil {
+			return err
+		}
+	}
+	if c.Raw != nil {
+		if err := put("values.yaml", c.Raw); err != nil {
+			return err
+		}
+	}
+	if c.Schema != nil {
+		if !json.Valid(c.Schema) {
+			return errors.New("Invalid JSON in values.schema.json")
+		}
+		if err := put("values.schema.json", c.Schema); err != nil {
+			return err
+		}
+	}
+	for _, t := range c.Templates {
+		if err := put(t.Name, t.Data); err != nil {
+			return err
+		}
+	}
+	// ponytail: files in path order; Helm keeps directory-walk order, which
+	// differs only where a name sorts below "/" (a-b/x before a/x).
+	for _, name := range slices.Sorted(maps.Keys(c.Files)) {
+		if err := put(name, c.Files[name]); err != nil {
+			return err
+		}
+	}
+	for _, sub := range c.Subcharts {
+		if err := writeChart(tw, sub, base+"/charts"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadArchive unpacks a packaged chart to a scratch directory and loads that.
+// Like Helm, it drops each entry's first path element, the chart's directory.
+func loadArchive(file string) (*Chart, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", file, err)
+	}
+	tmp, err := os.MkdirTemp("", "chart-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmp)
+	tr := tar.NewReader(zr)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if h.Typeflag != tar.TypeReg {
+			continue
+		}
+		_, rel, ok := strings.Cut(strings.ReplaceAll(h.Name, `\`, "/"), "/")
+		if !ok || rel == "" {
+			continue
+		}
+		if !filepath.IsLocal(rel) {
+			return nil, errors.New("chart illegally contains content outside the base directory")
+		}
+		p := filepath.Join(tmp, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			return nil, err
+		}
+	}
+	return load(tmp)
+}
+
+// ignoreRules reads the chart's .helmignore, if it has one.
+func ignoreRules(dir string) ([]string, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, ".helmignore"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var rules []string
+	for _, l := range strings.Split(string(raw), "\n") {
+		if l = strings.TrimSpace(l); l != "" && !strings.HasPrefix(l, "#") {
+			rules = append(rules, l)
+		}
+	}
+	return rules, nil
+}
+
+// ignored applies .helmignore to a slash path: a pattern without a slash
+// matches the base name, one with a slash the whole path, and a trailing
+// slash only directories.
+// ponytail: no ! negation; add it with Helm's odd rule that a non-matching
+// negation ignores the path.
+func ignored(rules []string, rel string, isDir bool) bool {
+	for _, p := range rules {
+		dirOnly := strings.HasSuffix(p, "/")
+		p = strings.TrimSuffix(p, "/")
+		if dirOnly && !isDir {
+			continue
+		}
+		name := rel
+		if !strings.Contains(p, "/") {
+			name = filepath.Base(rel)
+		}
+		if ok, _ := filepath.Match(strings.TrimPrefix(p, "/"), name); ok {
+			return true
+		}
+	}
+	return false
 }

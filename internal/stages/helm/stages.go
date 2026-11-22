@@ -65,6 +65,7 @@ func init() {
 	register(Stage{Slug: "upgrade-3way-merge", Run: stageUpgrade})
 	register(Stage{Slug: "rollback", Run: stageRollback})
 	register(Stage{Slug: "hooks", Run: stageHooks})
+	register(Stage{Slug: "dependencies", Run: stageDependencies})
 }
 
 const chartYAML = `apiVersion: v2
