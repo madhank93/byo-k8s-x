@@ -40,15 +40,31 @@ for every namespaced kind you can list and delete, and list each with a label
 selector. kubectl's ApplySet avoids that sweep by recording the set's kinds on
 a parent object; for a cluster this size, the sweep is fine.
 
+The sweep touches every API on the cluster, including ones that are broken.
+An aggregated API whose backend is down can still be in discovery, and
+listing its kinds fails with a 503. That is no reason to stop: every other
+kind's leftovers are still right. So skip a kind whose list fails with
+ServiceUnavailable, NotFound or MethodNotSupported, and do the same for the
+groups discovery itself could not reach. Say so on stderr, naming the group.
+A kind you could not list is a kind whose leftovers you cannot see, and the
+person running prune needs to know the answer is incomplete.
+
+Warn, don't refuse. A missed leftover is only kept, never deleted, so
+continuing is safe. Refusing would let one broken API that belongs to someone
+else block every prune on the cluster.
+
 This stage only **plans**. `prune -f FILE --set NAME` prints one `Kind/name`
 line per candidate, sorted, and deletes nothing. Without `--set` there is no
 way to tell yours from anyone else's, so refuse.
 
 ## Go APIs
 
-- `discovery.ServerPreferredNamespacedResources()`: tolerate
-  `discovery.IsGroupDiscoveryFailedError`, which only means an aggregated API
-  is down.
+- `discovery.ServerPreferredNamespacedResources()`: a
+  `*discovery.ErrGroupDiscoveryFailed` (use `errors.As`) means some groups
+  could not be discovered. Its `Groups` map names them, and the lists still
+  hold every group that did resolve.
+- `apierrors.IsServiceUnavailable`, `IsNotFound`, `IsMethodNotSupported`: a
+  kind in discovery that cannot be listed right now.
 - `discovery.FilteredBy(discovery.SupportsAllVerbs{Verbs: []string{"list", "delete"}}, lists)`.
 - `metav1.ListOptions{LabelSelector: "byok8s.dev/set=web"}`.
 

@@ -32,7 +32,16 @@ with `Preconditions{UID, ResourceVersion}` from the listed copy fails with a
 ```
 ConfigMap/gone pruned
 ConfigMap/precious kept: prune disabled
+ConfigMap/moved kept: changed since the plan
 ```
+
+The change can even land while the delete is in flight. The server re-checks
+the preconditions against the object it is about to remove, so the delete
+still fails. Keeping an object because it changed means the prune did not do
+what it said, so apply exits 1.
+
+A kind that stage 12 could not list is not pruned at all. You never saw its
+leftovers, so there is nothing to delete.
 
 The opt-out annotation is the same idea as Argo CD's `Prune=false` and
 Flux's `prune: disabled`. `prune` (the plan) prints the kept line too, so the

@@ -19,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -34,6 +35,11 @@ import (
 // StageLabel marks every namespace the harness creates, so a stray one can be
 // swept without touching anything else in the cluster.
 const StageLabel = "byok8s.dev/stage"
+
+// GraderAPILabel marks an APIService a grader registers for one check. Left
+// behind by a killed run, it has no backend, and an unavailable aggregated API
+// stalls every namespace deletion on the cluster until it is removed.
+const GraderAPILabel = "byok8s.dev/grader-api"
 
 // Env is one stage's view of the cluster: a client, an isolated namespace, and
 // a context bounded by the stage's timeout.
@@ -95,6 +101,10 @@ func Begin(ctx context.Context, course, stage string, timeout time.Duration) (*E
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	ns := "bko-" + course + "-" + stage
 
+	if err := sweepGraderAPIs(ctx, cfg); err != nil {
+		cancel()
+		return nil, nil, err
+	}
 	if err := reset(ctx, cs, cfg, ns); err != nil {
 		cancel()
 		return nil, nil, err
@@ -130,6 +140,48 @@ func reset(ctx context.Context, cs kubernetes.Interface, cfg *rest.Config, ns st
 		return fmt.Errorf("create namespace %s: %w", ns, err)
 	}
 	return nil
+}
+
+// sweepGraderAPIs deletes grader APIServices that are unavailable and older
+// than any check keeps one, so a killed run cannot wedge namespace deletion
+// for whatever runs next. A live one is Available within seconds of creation.
+func sweepGraderAPIs(ctx context.Context, cfg *rest.Config) error {
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("dynamic client: %w", err)
+	}
+	r := dyn.Resource(schema.GroupVersionResource{Group: "apiregistration.k8s.io", Version: "v1", Resource: "apiservices"})
+	list, err := r.List(ctx, metav1.ListOptions{LabelSelector: GraderAPILabel})
+	if err != nil {
+		return fmt.Errorf("list grader APIServices: %w", err)
+	}
+	for _, a := range list.Items {
+		if time.Since(a.GetCreationTimestamp().Time) < 20*time.Second || apiAvailable(a.Object) {
+			continue
+		}
+		name := a.GetName()
+		if err := r.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete orphaned APIService %s: %w", name, err)
+		}
+		if err := WaitFor(ctx, "orphaned APIService "+name+" to go", func(ctx context.Context) (bool, error) {
+			_, err := r.Get(ctx, name, metav1.GetOptions{})
+			return apierrors.IsNotFound(err), nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func apiAvailable(obj map[string]any) bool {
+	conds, _, _ := unstructured.NestedSlice(obj, "status", "conditions")
+	for _, c := range conds {
+		m, _ := c.(map[string]any)
+		if m["type"] == "Available" {
+			return m["status"] == "True"
+		}
+	}
+	return false
 }
 
 // clearFinalizers strips finalizers from the ConfigMaps in a namespace about to

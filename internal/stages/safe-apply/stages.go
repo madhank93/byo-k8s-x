@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 
+	admission "k8s.io/api/admission/v1"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -948,6 +949,27 @@ func stagePrunePlan(ctx context.Context, env *kube.Env, bin string) error {
 	if res.ExitCode == 0 {
 		return fmt.Errorf("prune without --set cannot know what is its own and must fail, got exit 0:\n%s", tail(res.Stdout))
 	}
+
+	// One kind the server cannot list hides only that kind's leftovers.
+	group, stop, err := unlistableAPI(ctx, env)
+	if err != nil {
+		return err
+	}
+	defer stop()
+	res, err = w.run("prune", "--set", "web", "-f", v2)
+	stop()
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("widgets.%s is in discovery but answers every list with 503; prune still lists every other kind: %w", group, err)
+	}
+	if g := lines(res.Stdout); strings.Join(g, "\n") != strings.Join(want, "\n") {
+		return fmt.Errorf("with widgets.%s unlistable, the other kinds' leftovers are still these:\n  %s\ngot:\n%s", group, strings.Join(want, "\n  "), tail(res.Stdout))
+	}
+	if !strings.Contains(res.Stderr, group) {
+		return fmt.Errorf("widgets.%s could not be listed, so its leftovers are unknown; say so on stderr, naming the group. stderr:\n%s", group, tail(res.Stderr))
+	}
 	return nil
 }
 
@@ -1044,6 +1066,33 @@ func stagePruneGuard(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if res.ExitCode == 0 {
 		return fmt.Errorf("apply --prune without --set cannot know what is its own and must fail, got exit 0:\n%s", tail(res.Stdout))
+	}
+
+	// A leftover changed while it is being deleted is no longer what prune saw.
+	res, err = w.run("apply", "--set", "guard", "-f", w.file("guard.yaml", cm("g-keep", map[string]string{"k": "v"})+"---\n"+cm("g-gone", map[string]string{"k": "v"})))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	fired, stop, err := intercept(ctx, env, admission.Delete, "g-gone", func() error { return w.updateAs("kubectl-edit", "g-gone", "k", "edited") })
+	if err != nil {
+		return err
+	}
+	res, err = w.run("apply", "--set", "guard", "--prune", "-f", w.file("guard-next.yaml", cm("g-keep", map[string]string{"k": "v"})))
+	stop()
+	if err != nil {
+		return err
+	}
+	if err := fired(); err != nil {
+		return err
+	}
+	if c, err := env.ConfigMap(ctx, "g-gone"); err != nil || c.Data["k"] != "edited" {
+		return fmt.Errorf("ConfigMap/g-gone was edited while apply --prune was deleting it, so it is not the object prune saw; it was deleted anyway. Delete with Preconditions on its UID and resourceVersion\nstdout:\n%s", tail(res.Stdout))
+	}
+	if res.ExitCode != 1 || !hasLine(res.Stdout, "ConfigMap/g-gone kept") {
+		return fmt.Errorf("a leftover kept because it changed is named in a \"ConfigMap/g-gone kept: …\" line and apply exits 1; got exit %d:\n%s", res.ExitCode, tail(res.Stdout))
 	}
 	return nil
 }
@@ -1232,6 +1281,36 @@ func stageImpactReport(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	if !hasTotals(lines(res.Stdout), 0, 0, 0, 2) {
 		return fmt.Errorf("without --prune nothing is deleted and nothing here changes; expected \"0 to create, 0 to update, 0 to delete, 2 unchanged\", got:\n%s", tail(res.Stdout))
+	}
+
+	// The same content made by another client is not byok8s's yet: applying it
+	// takes ownership, which is a write.
+	if _, err := env.Client.CoreV1().ConfigMaps(env.Namespace).Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "adopted", Labels: map[string]string{setLabel: "adopt"}},
+		Data:       map[string]string{"k": "v"},
+	}, metav1.CreateOptions{FieldManager: "kubectl-create"}); err != nil {
+		return err
+	}
+	adopt := w.file("adopt.yaml", cm("adopted", map[string]string{"k": "v"}))
+	for _, step := range []struct {
+		cmd, action, why string
+		exit             int
+	}{
+		{"plan", "update", "byok8s does not own it yet, so apply would write to take it over", 1},
+		{"apply", "", "", 0},
+		{"plan", "unchanged", "byok8s has applied it, so nothing is left to write", 0},
+	} {
+		res, err = w.run(step.cmd, "--set", "adopt", "-f", adopt)
+		if err != nil {
+			return err
+		}
+		if err := wantExit(res, step.exit); err != nil {
+			return fmt.Errorf("%s of ConfigMap/adopted, which kubectl-create made with the same content: %w", step.cmd, err)
+		}
+		if step.action != "" && !hasLine(res.Stdout, "ConfigMap/adopted "+step.action) {
+			return fmt.Errorf("ConfigMap/adopted has the manifest's content, but %s; expected \"ConfigMap/adopted %s\", got:\n%s",
+				step.why, step.action, tail(res.Stdout))
+		}
 	}
 
 	if err := w.applyAs("other-tool", cm("same-a", map[string]string{"k": "theirs"})); err != nil {
@@ -1538,8 +1617,6 @@ func stageApplyPlan(ctx context.Context, env *kube.Env, bin string) error {
 	}
 
 	// Each disturbance lands between plan and apply; the whole plan is refused.
-	// Only the up-front pin check is graded: every disturbance here lands before
-	// apply starts, so the pins sent with each write are never what refuses it.
 	v3 := w.file("v3.yaml", cm("same-a", map[string]string{"k": "v2"})+"---\n"+
 		cm("new-a", map[string]string{"k": "reviewed"})+"---\n"+cm("new-c", map[string]string{"k": "v"}))
 	untouched := func(what string, res *runner.Result, newC bool) error {
@@ -1633,6 +1710,80 @@ func stageApplyPlan(ctx context.Context, env *kube.Env, bin string) error {
 	for _, name := range []string{"same-b", "changed", "new-b"} {
 		if exists(name) {
 			return fmt.Errorf("the fresh plan deletes ConfigMap/%s, and it is still there\nstdout:\n%s", name, tail(res.Stdout))
+		}
+	}
+
+	// A change that lands mid-apply, after the up-front check, is refused by
+	// the pins each write carries. The plans are forced, so an unpinned write
+	// would take the field back rather than conflict.
+	res, err = w.run("apply", "--set", "pins", "-f", w.file("pins.yaml", cm("p-first", map[string]string{"k": "v"})+"---\n"+
+		cm("p-edit", map[string]string{"k": "v"})+"---\n"+cm("p-gone", map[string]string{"k": "v"})))
+	if err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	for _, d := range []struct {
+		what, manifest string
+		act            func() error
+		check          func() error
+	}{
+		{"ConfigMap/p-edit, planned as an update, was edited",
+			cm("p-first", map[string]string{"k": "a"}) + "---\n" + cm("p-edit", map[string]string{"k": "a"}),
+			func() error { return w.updateAs("kubectl-edit", "p-edit", "k", "edited") },
+			func() error {
+				if got := data("p-edit"); got != "edited" {
+					return fmt.Errorf("its data.k is %s, not the edit: the update was written over it; send the planned resourceVersion with it", got)
+				}
+				return nil
+			}},
+		{"ConfigMap/p-edit, planned as an update, was deleted",
+			cm("p-first", map[string]string{"k": "b"}) + "---\n" + cm("p-edit", map[string]string{"k": "b"}),
+			func() error {
+				return env.Client.CoreV1().ConfigMaps(env.Namespace).Delete(ctx, "p-edit", metav1.DeleteOptions{})
+			},
+			func() error {
+				if exists("p-edit") {
+					return fmt.Errorf("it was recreated: a resourceVersion alone in an apply body creates a missing object; send the planned UID too")
+				}
+				return nil
+			}},
+		{"ConfigMap/p-gone, planned as a delete, was edited",
+			cm("p-first", map[string]string{"k": "c"}),
+			func() error { return w.updateAs("kubectl-edit", "p-gone", "k", "edited") },
+			func() error {
+				if got := data("p-gone"); got != "edited" {
+					return fmt.Errorf("its data.k is %s: it was deleted anyway; delete with Preconditions on the planned UID and resourceVersion", got)
+				}
+				return nil
+			}},
+	} {
+		p := filepath.Join(w.dir, "pins.json")
+		res, err := w.run("plan", "--set", "pins", "--prune", "--force-conflicts", "--out", p, "-f", w.file("pins-next.yaml", d.manifest))
+		if err != nil {
+			return err
+		}
+		if err := wantExit(res, 1); err != nil {
+			return err
+		}
+		fired, stop, err := intercept(ctx, env, admission.Update, "p-first", d.act)
+		if err != nil {
+			return err
+		}
+		res, err = w.run("apply", "--plan", p)
+		stop()
+		if err != nil {
+			return err
+		}
+		if err := fired(); err != nil {
+			return err
+		}
+		if res.ExitCode == 0 {
+			return fmt.Errorf("%s while the plan was being applied, after ConfigMap/p-first was written; that write must be refused and apply fail, got exit 0:\n%s", d.what, tail(res.Stdout))
+		}
+		if err := d.check(); err != nil {
+			return fmt.Errorf("%s while the plan was being applied, and %w\nstdout:\n%s\nstderr:\n%s", d.what, err, tail(res.Stdout), tail(res.Stderr))
 		}
 	}
 	return nil
