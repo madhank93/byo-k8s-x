@@ -50,6 +50,8 @@ func init() {
 	register(Stage{Slug: "images", Run: stageImages})
 	register(Stage{Slug: "replicas", Run: stageReplicas})
 	register(Stage{Slug: "configmap-generator", Run: stageConfigMapGenerator})
+	register(Stage{Slug: "secret-generator", Run: stageSecretGenerator})
+	register(Stage{Slug: "name-hash", Run: stageNameHash})
 }
 
 // tree is a kustomization directory as slash paths to contents.
@@ -920,6 +922,115 @@ resources: [cm.yaml]
 		{"a generated ConfigMap collides with a handwritten one of the same name", ".", tree{
 			"kustomization.yaml": "generatorOptions:\n  disableNameSuffixHash: true\nconfigMapGenerator:\n- name: settings\n  literals: [a=1]\nresources: [cm.yaml]\n",
 			"cm.yaml":            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n",
+		}},
+	})
+}
+
+// stageSecretGenerator — secretGenerator reads the same sources into a
+// Secret, every value base64-encoded under data, with a type.
+func stageSecretGenerator(ctx context.Context, _ *kube.Env, bin string) error {
+	return runChecks(ctx, bin, []check{
+		{"every value is base64 under data, binary ones too, and type defaults to Opaque", ".", sources.with(tree{
+			"kustomization.yaml": `generatorOptions:
+  disableNameSuffixHash: true
+secretGenerator:
+- name: credentials
+  literals:
+  - username=admin
+  - password="p@ss=word"
+  files:
+  - app.conf
+  - logo.png
+  envs:
+  - app.env
+- name: tls
+  type: kubernetes.io/tls
+  files:
+  - tls.crt=app.conf
+  - tls.key=conf/logging.ini
+- name: nothing
+`,
+		})},
+		{"options, namespace and prefixes reach a Secret as they reach a ConfigMap, and a ConfigMap and a Secret may share a name", ".", tree{
+			"kustomization.yaml": `namespace: prod
+namePrefix: shop-
+commonAnnotations:
+  team: a
+generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    generated: "true"
+configMapGenerator:
+- name: settings
+  literals: [mode=fast]
+secretGenerator:
+- name: settings
+  literals: [token=abc]
+  options:
+    immutable: true
+    labels:
+      secret: "yes"
+`,
+		}},
+		{"a Secret refuses a repeated key too", ".", tree{
+			"kustomization.yaml": "generatorOptions:\n  disableNameSuffixHash: true\nsecretGenerator:\n- name: twice\n  literals: [a=1, a=2]\n",
+		}},
+		{"type belongs to secretGenerator only; configMapGenerator has no such field", ".", tree{
+			"kustomization.yaml": "generatorOptions:\n  disableNameSuffixHash: true\nconfigMapGenerator:\n- name: settings\n  type: Opaque\n  literals: [a=1]\n",
+		}},
+	})
+}
+
+// stageNameHash — a generated object's name ends in a hash of its content,
+// so changing the data changes the name; the hash covers kind, data and type
+// but not the name, and is added last, once every kustomization has had its
+// say.
+func stageNameHash(ctx context.Context, _ *kube.Env, bin string) error {
+	return runChecks(ctx, bin, []check{
+		{"each generated ConfigMap and Secret gets a ten-character suffix computed from its kind, data and type — not its name, so two empty ConfigMaps share a suffix", ".", sources.with(tree{
+			"kustomization.yaml": `configMapGenerator:
+- name: literals
+  literals: [mode=fast, retries=3]
+- name: files
+  files: [app.conf, logo.png]
+- name: empty
+- name: also-empty
+- name: frozen
+  literals: [mode=fast]
+  options:
+    immutable: true
+secretGenerator:
+- name: credentials
+  literals: [password=s3cr3t]
+- name: tls
+  type: kubernetes.io/tls
+  files: [tls.crt=app.conf, tls.key=conf/logging.ini]
+- name: empty
+`,
+		})},
+		{"labels and annotations are not content: these two hash as plain generators do", ".", tree{
+			"kustomization.yaml": `commonLabels:
+  app: shop
+commonAnnotations:
+  note: hi
+generatorOptions:
+  labels:
+    generated: "true"
+configMapGenerator:
+- name: literals
+  literals: [mode=fast, retries=3]
+- name: unhashed
+  literals: [mode=fast]
+  options:
+    disableNameSuffixHash: true
+`,
+		}},
+		{"the hash goes after the prefix and suffix", ".", tree{
+			"kustomization.yaml": "namespace: prod\nnamePrefix: shop-\nnameSuffix: -v1\nconfigMapGenerator:\n- name: settings\n  literals: [mode=fast]\n",
+		}},
+		{"a generator in an inner kustomization is hashed once, at the very end, so the hash lands after the outer suffix", "app", tree{
+			"app/kustomization.yaml":  "namePrefix: outer-\nnameSuffix: -v2\nresources: [../base]\n",
+			"base/kustomization.yaml": "namePrefix: inner-\nconfigMapGenerator:\n- name: settings\n  literals: [mode=fast]\nsecretGenerator:\n- name: token\n  literals: [t=abc]\n",
 		}},
 	})
 }

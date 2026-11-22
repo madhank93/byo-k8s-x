@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -37,6 +38,7 @@ type Kustomization struct {
 	Replicas []Replica `json:"replicas,omitempty"`
 
 	ConfigMapGenerator []Generator       `json:"configMapGenerator,omitempty"`
+	SecretGenerator    []SecretGenerator `json:"secretGenerator,omitempty"`
 	GeneratorOptions   *GeneratorOptions `json:"generatorOptions,omitempty"`
 }
 
@@ -48,6 +50,12 @@ type Generator struct {
 	Files     []string          `json:"files,omitempty"`
 	Envs      []string          `json:"envs,omitempty"`
 	Options   *GeneratorOptions `json:"options,omitempty"`
+}
+
+// SecretGenerator is one entry of secretGenerator: a Generator with a type.
+type SecretGenerator struct {
+	Generator
+	Type string `json:"type,omitempty"`
 }
 
 // GeneratorOptions apply to every generator, or to one, which wins.
@@ -87,6 +95,7 @@ type obj = map[string]any
 type resource struct {
 	o     obj
 	names []string
+	hash  bool // a generated name, suffixed with a content hash at the end
 }
 
 func (r *resource) rename(name string) {
@@ -121,6 +130,16 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
+	}
+	for _, r := range rs {
+		if r.hash {
+			h, err := contentHash(r.o)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			r.rename(str(r.o, "metadata", "name") + "-" + h)
+		}
 	}
 	objs := objects(rs)
 	sortLegacy(objs)
@@ -220,12 +239,23 @@ func build(dir string, visiting map[string]bool) ([]*resource, error) {
 			return nil, fmt.Errorf("may not add resource with an already registered id: %w", err)
 		}
 	}
+	var gens []SecretGenerator
 	for _, g := range k.ConfigMapGenerator {
+		gens = append(gens, SecretGenerator{Generator: g})
+	}
+	for _, g := range k.SecretGenerator {
+		if g.Type == "" {
+			g.Type = "Opaque"
+		}
+		gens = append(gens, g)
+	}
+	for _, g := range gens {
 		o, err := generate(abs, g, k.GeneratorOptions)
 		if err != nil {
 			return nil, err
 		}
-		rs = append(rs, &resource{o: o, names: []string{g.Name}})
+		hash := !mergeOptions(k.GeneratorOptions, g.Options).DisableNameSuffixHash
+		rs = append(rs, &resource{o: o, names: []string{g.Name}, hash: hash})
 	}
 	if err := unique(objects(rs)); err != nil {
 		return nil, fmt.Errorf("may not add resource with an already registered id: %w", err)
@@ -291,21 +321,26 @@ func build(dir string, visiting map[string]bool) ([]*resource, error) {
 // scalable are the kinds replicas may set, in any API group.
 var scalable = map[string]bool{"Deployment": true, "ReplicaSet": true, "StatefulSet": true, "ReplicationController": true}
 
-// generate builds the ConfigMap one generator describes.
-func generate(root string, g Generator, global *GeneratorOptions) (obj, error) {
-	pairs, err := keyValues(root, g)
+// generate builds the ConfigMap, or with a type the Secret, one generator
+// describes.
+func generate(root string, g SecretGenerator, global *GeneratorOptions) (obj, error) {
+	kind := "ConfigMap"
+	if g.Type != "" {
+		kind = "Secret"
+	}
+	pairs, err := keyValues(root, g.Generator)
 	if err != nil {
-		return nil, fmt.Errorf("configmap %s: %w", g.Name, err)
+		return nil, fmt.Errorf("%s %s: %w", kind, g.Name, err)
 	}
 	data, binary := obj{}, obj{}
 	for _, kv := range pairs {
-		if _, dup := data[kv[0]]; dup {
-			return nil, fmt.Errorf("configmap %s illegally repeats the key `%s`", g.Name, kv[0])
+		_, dup := data[kv[0]]
+		if _, dupBinary := binary[kv[0]]; dup || dupBinary {
+			return nil, fmt.Errorf("%s %s illegally repeats the key `%s`", kind, g.Name, kv[0])
 		}
-		if _, dup := binary[kv[0]]; dup {
-			return nil, fmt.Errorf("configmap %s illegally repeats the key `%s`", g.Name, kv[0])
-		}
-		if utf8.ValidString(kv[1]) {
+		if kind == "Secret" {
+			data[kv[0]] = base64.StdEncoding.EncodeToString([]byte(kv[1]))
+		} else if utf8.ValidString(kv[1]) {
 			data[kv[0]] = kv[1]
 		} else {
 			binary[kv[0]] = base64.StdEncoding.EncodeToString([]byte(kv[1]))
@@ -315,9 +350,12 @@ func generate(root string, g Generator, global *GeneratorOptions) (obj, error) {
 	if g.Namespace != "" {
 		md["namespace"] = g.Namespace
 	}
-	o := obj{"apiVersion": "v1", "kind": "ConfigMap", "metadata": md}
-	if len(data) > 0 {
+	o := obj{"apiVersion": "v1", "kind": kind, "metadata": md}
+	if len(data) > 0 || kind == "Secret" {
 		o["data"] = data
+	}
+	if kind == "Secret" {
+		o["type"] = g.Type
 	}
 	if len(binary) > 0 {
 		o["binaryData"] = binary
@@ -333,6 +371,27 @@ func generate(root string, g Generator, global *GeneratorOptions) (obj, error) {
 		o["immutable"] = true
 	}
 	return o, nil
+}
+
+// contentHash is kustomize's name suffix: the SHA-256 of the object's kind,
+// data and type as JSON, cut to ten characters and respelled so it cannot
+// read as a word or a number. kustomize's encoding carries an empty name.
+func contentHash(o obj) (string, error) {
+	m := map[string]any{"kind": o["kind"], "name": "", "data": o["data"]}
+	if m["data"] == nil {
+		m["data"] = ""
+	}
+	for _, k := range []string{"binaryData", "type"} {
+		if v, ok := o[k]; ok {
+			m[k] = v
+		}
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	sum := fmt.Sprintf("%x", sha256.Sum256(b))
+	return strings.NewReplacer("0", "g", "1", "h", "3", "k", "a", "m", "e", "t").Replace(sum[:10]), nil
 }
 
 // mergeOptions lays a generator's own options over the global ones.
