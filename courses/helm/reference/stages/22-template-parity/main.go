@@ -108,6 +108,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/jsonmergepatch"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
@@ -186,12 +187,17 @@ func run(cmd string, args []string) error {
 	logs := fs.Bool("logs", false, "print the test pods' logs")
 	fs.DurationVar(&hookTimeout, "timeout", 5*time.Minute, "how long to wait for each hook")
 	kubeVersion := fs.String("kube-version", "v1.33.0", "the Kubernetes version templates see")
+	var apiVersions multi
+	fs.Var(&apiVersions, "api-versions", "extra API versions templates see, comma-separated (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	var err error
 	if caps, err = capabilities(*kubeVersion); err != nil {
 		return err
+	}
+	for _, v := range apiVersions {
+		caps.APIVersions = append(caps.APIVersions, strings.Split(v, ",")...)
 	}
 	args = fs.Args()
 	if namespace == "" {
@@ -1052,7 +1058,7 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, string, error) 
 			"Chart":        top["Chart"],
 			"Files":        top["Files"],
 			"Template":     map[string]string{"Name": name, "BasePath": top["BasePath"].(string)},
-			"Capabilities": caps,
+			"Capabilities": &caps,
 		}
 		var b strings.Builder
 		if err := t.ExecuteTemplate(&b, name, d); err != nil {
@@ -1218,18 +1224,19 @@ func funcMap() template.FuncMap {
 	f["toYaml"] = toYAML
 	f["required"] = required
 	f["fail"] = func(msg string) (string, error) { return "", errors.New(warnWrap(msg)) }
-	// ponytail: never asks the cluster, which is what helm template does;
-	// install and upgrade would need a live lookup to match helm there.
 	f["lookup"] = func(apiVersion, kind, namespace, name string) (map[string]any, error) {
-		return map[string]any{}, nil
+		if lookupKube == nil {
+			return map[string]any{}, nil
+		}
+		return lookupKube.lookup(apiVersion, kind, namespace, name)
 	}
 	return f
 }
 
-// Capabilities is what .Capabilities shows a template. Like helm template, it
-// reports the Kubernetes version helm was built against unless --kube-version
-// names another, and every API version and kind the client knows.
-// ponytail: install reports the same instead of asking the cluster.
+// Capabilities is what .Capabilities shows a template. template reports the
+// Kubernetes version helm was built against unless --kube-version names
+// another, and the group/versions the client knows; install and upgrade ask
+// the cluster instead (useCluster).
 type Capabilities struct {
 	KubeVersion KubeVersion
 	APIVersions APIVersions
@@ -1237,7 +1244,10 @@ type Capabilities struct {
 
 type KubeVersion struct{ Version, Major, Minor string }
 
-func (v KubeVersion) String() string { return v.Version }
+// Pointer receivers, as Helm's: a piped KubeVersion is a copy, so
+// `.Capabilities.KubeVersion | quote` prints the struct, not the version.
+func (v *KubeVersion) String() string     { return v.Version }
+func (v *KubeVersion) GitVersion() string { return v.Version }
 
 type APIVersions []string
 
@@ -1251,10 +1261,12 @@ func capabilities(kube string) (Capabilities, error) {
 	if err != nil {
 		return Capabilities{}, fmt.Errorf("invalid kube version '%s': %s", kube, err)
 	}
-	var apis APIVersions
-	for gvk := range scheme.Scheme.AllKnownTypes() {
-		gv := gvk.GroupVersion().String()
-		apis = append(apis, gv, gv+"/"+gvk.Kind)
+	// Group/versions only, no kinds, plus the CRD API, as Helm's default set.
+	apis := APIVersions{"apiextensions.k8s.io/v1", "apiextensions.k8s.io/v1beta1"}
+	for _, gv := range scheme.Scheme.PrioritizedVersionsAllGroups() {
+		if !slices.Contains(apis, gv.String()) {
+			apis = append(apis, gv.String())
+		}
 	}
 	return Capabilities{
 		KubeVersion: KubeVersion{"v" + v.String(), strconv.FormatUint(v.Major(), 10), strconv.FormatUint(v.Minor(), 10)},
@@ -1412,6 +1424,9 @@ func install(name, dir, ns string, files, sets []string, replace bool) error {
 		if st := last.Info.Status; !replace || (st != "uninstalled" && st != "failed") {
 			return errors.New("cannot re-use a name that is still in use")
 		}
+	}
+	if err := k.useCluster(); err != nil {
+		return err
 	}
 	rel := Release{Name: name, Namespace: ns, Revision: 1, IsInstall: true, Service: "Helm"}
 	r, err := renderRelease(dir, files, sets, rel)
@@ -1730,6 +1745,77 @@ func connect() (*kube, error) {
 		mapper: restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))}, nil
 }
 
+// lookupKube is the cluster the lookup function reads; nil, as for template,
+// makes every lookup an empty map.
+var lookupKube *kube
+
+// useCluster points .Capabilities and lookup at the cluster, as helm install
+// and upgrade do: the server's version, and every group/version and
+// group/version/Kind discovery lists.
+func (k *kube) useCluster() error {
+	dc := k.cs.Discovery()
+	sv, err := dc.ServerVersion()
+	if err != nil {
+		return fmt.Errorf("could not get server version from Kubernetes: %w", err)
+	}
+	groups, resources, err := dc.ServerGroupsAndResources()
+	if err != nil && !discovery.IsGroupDiscoveryFailedError(err) {
+		return fmt.Errorf("could not get apiVersions from Kubernetes: %w", err)
+	}
+	seen := map[string]bool{}
+	for _, g := range groups {
+		for _, v := range g.Versions {
+			seen[v.GroupVersion] = true
+		}
+	}
+	for _, r := range resources {
+		for _, a := range r.APIResources {
+			seen[path.Join(r.GroupVersion, a.Kind)] = true
+		}
+	}
+	caps.KubeVersion = KubeVersion{sv.GitVersion, sv.Major, sv.Minor}
+	caps.APIVersions = slices.Collect(maps.Keys(seen))
+	lookupKube = k
+	return nil
+}
+
+// lookup is Helm's lookup: one object by name, or the whole list when name
+// is empty, across every namespace when a namespaced kind is given none. A
+// missing object is an empty map, so `if not (lookup ...)` works.
+func (k *kube) lookup(apiVersion, kind, ns, name string) (map[string]any, error) {
+	gv, err := schema.ParseGroupVersion(apiVersion)
+	if err != nil {
+		return map[string]any{}, err
+	}
+	m, err := k.mapper.RESTMapping(gv.WithKind(kind).GroupKind(), gv.Version)
+	if err != nil {
+		return map[string]any{}, err
+	}
+	var res dynamic.ResourceInterface = k.dyn.Resource(m.Resource)
+	if m.Scope.Name() == meta.RESTScopeNameNamespace && ns != "" {
+		res = k.dyn.Resource(m.Resource).Namespace(ns)
+	}
+	var out map[string]any
+	if name != "" {
+		var o *unstructured.Unstructured
+		if o, err = res.Get(k.ctx, name, metav1.GetOptions{}); err == nil {
+			out = o.Object
+		}
+	} else {
+		var l *unstructured.UnstructuredList
+		if l, err = res.List(k.ctx, metav1.ListOptions{}); err == nil {
+			out = l.UnstructuredContent()
+		}
+	}
+	if apierrors.IsNotFound(err) {
+		return map[string]any{}, nil
+	}
+	if err != nil {
+		return map[string]any{}, err
+	}
+	return out, nil
+}
+
 // object is one manifest parsed, with the endpoint that serves it.
 type object struct {
 	obj *unstructured.Unstructured
@@ -1934,6 +2020,9 @@ func upgradeRelease(k *kube, h []*Record, name, dir, ns string, files, sets []st
 		user = current.Config
 	}
 	rel := Release{Name: name, Namespace: ns, Revision: last.Version + 1, IsUpgrade: true, Service: "Helm"}
+	if err := k.useCluster(); err != nil {
+		return err
+	}
 	r, err := renderWith(dir, user, rel)
 	if err != nil {
 		return err

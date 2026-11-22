@@ -14,8 +14,8 @@ app status [-n NS] NAME
 ```
 
 **`list`** finds every Secret labelled `owner=helm` in the namespace (the
-kubeconfig's, or `-n`'s; every namespace with `-A`), decodes them, and then,
-in this order:
+kubeconfig's, or `-n`'s; every namespace with `-A`), decodes them (passing
+over any that do not decode, as helm does), and then, in this order:
 
 1. keeps only the **latest revision** of each release, a release being a
    name in a namespace;
@@ -55,7 +55,8 @@ those releases your program installed and some helm did, including one
 helm upgraded to revision 2 and one it uninstalled with `--keep-history`,
 which leaves its last revision marked `uninstalled`, and one whose record
 the grader rewrites to `pending-install`, as a helm interrupted mid-install
-leaves it. Running `helm list`
+leaves it. It also plants a release Secret whose record is not
+base64 at all. Running `helm list`
 beside `app list` is the quickest way to find a difference.
 
 ## Go APIs

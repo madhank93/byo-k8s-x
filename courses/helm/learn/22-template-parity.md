@@ -1,6 +1,6 @@
 ---
 title: Agree with helm
-concepts: [byte-for-byte parity, error rewording, --set syntax, .Capabilities]
+concepts: [byte-for-byte parity, error rewording, --set syntax, .Capabilities, lookup]
 ---
 
 ## Core concept
@@ -12,7 +12,7 @@ Flags go before NAME, as in every stage.
 
 ```
 app template [-n NS] [-f FILE]... [--set k=v]... [--set-string k=v]...
-             [-s TEMPLATE]... [--kube-version V] NAME DIR
+             [-s TEMPLATE]... [--kube-version V] [--api-versions V,...]... NAME DIR
 ```
 
 The chart the grader renders packs in the traps: chomping with `-}}` and
@@ -22,13 +22,21 @@ every kind of empty, a document that is only a comment (kept, and printed
 last because it has no kind). If your earlier stages are faithful, most of
 it already matches. What follows is what is new.
 
-**What templates can still ask.** `template` never talks to the cluster:
+**What templates can ask.** `template` never talks to the cluster; install
+and upgrade do, so the same chart can render differently:
 
-| | gives |
-|---|---|
-| `lookup "v1" "ConfigMap" NS NAME` | an empty map, `map[]`, so `if not (lookup ...)` is true |
-| `.Capabilities.KubeVersion.Version` | `v1.33.0`, the version helm was built against; `--kube-version 1.29.3` makes it `v1.29.3` |
-| `.Capabilities.APIVersions.Has "apps/v1"` | true for every group/version (and group/version/Kind) the client knows |
+| | `template` | `install`, `upgrade` |
+|---|---|---|
+| `lookup "v1" "ConfigMap" NS NAME` | `map[]`, so `if not (lookup ...)` is true | the live object, or `map[]` if there is none |
+| `lookup "v1" "ConfigMap" NS ""` | `map[]` | the list (`kind: ConfigMapList`, `items`); an empty NS lists every namespace |
+| `.Capabilities.KubeVersion.Version` | `v1.33.0`, helm's build; `--kube-version 1.29.3` makes it `v1.29.3` | the server's `gitVersion` |
+| `.Capabilities.APIVersions.Has "apps/v1"` | true for the group/versions client-go knows, plus `apiextensions.k8s.io/v1` and `v1beta1`, plus each `--api-versions` entry verbatim | true for every group/version discovery lists |
+| `.Capabilities.APIVersions.Has "apps/v1/Deployment"` | false: no kinds offline | true for every group/version/Kind discovery lists |
+
+`KubeVersion`'s `String` and `GitVersion` methods take a pointer, as Helm's
+do: `{{ .Capabilities.KubeVersion }}` prints `v1.33.0`, but
+`{{ .Capabilities.KubeVersion | quote }}` hands `quote` a copy and prints
+`"{v1.33.0 1 33}"`. Hand the templates `&caps`, not `caps`.
 
 `.Files` gains Helm's methods: `Glob PATTERN` (a `Files` of the matches),
 `.AsConfig` and `.AsSecrets` (base name to contents, as YAML; base64 for
@@ -77,7 +85,9 @@ first: helm prints the trimmed manifest and a newline, then the hooks. And
 
 - `errors.As(err, &template.ExecError{})` tells run-time errors from the rest.
 - `semver.NewVersion` for `--kube-version`, then `"v" + v.String()`.
-- `scheme.Scheme.AllKnownTypes()` lists the group/version/kinds client-go knows.
+- `scheme.Scheme.PrioritizedVersionsAllGroups()` lists the group/versions client-go knows.
+- `discovery.ServerVersion()` and `ServerGroupsAndResources()` for install's
+  `.Capabilities`; the RESTMapper and the dynamic client for `lookup`.
 - `path.Match` for `Files.Glob`.
 
 ## Hints
@@ -100,5 +110,6 @@ unescaped comma.
 ## Further reading
 
 - [The template engine's error rewording](https://github.com/helm/helm/blob/v3.18.6/pkg/engine/engine.go)
+- [lookup](https://github.com/helm/helm/blob/v3.18.6/pkg/engine/lookup_func.go) and [capabilities](https://github.com/helm/helm/blob/v3.18.6/pkg/action/action.go)
 - [strvals, the --set parser](https://github.com/helm/helm/blob/v3.18.6/pkg/strvals/parser.go)
 - [helm template](https://helm.sh/docs/helm/helm_template/)
