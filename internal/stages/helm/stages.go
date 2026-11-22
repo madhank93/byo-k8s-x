@@ -66,6 +66,7 @@ func init() {
 	register(Stage{Slug: "rollback", Run: stageRollback})
 	register(Stage{Slug: "hooks", Run: stageHooks})
 	register(Stage{Slug: "hook-weights", Run: stageHookWeights})
+	register(Stage{Slug: "test", Run: stageTest})
 }
 
 const chartYAML = `apiVersion: v2
@@ -3450,4 +3451,220 @@ func stageHookWeights(ctx context.Context, env *kube.Env, bin string) error {
 		return err
 	}
 	return wantGone(ctx, env, "hwint-x", "after install hwint failed building its hook")
+}
+
+// testPod is a Pod test hook in busybox running script.
+func testPod(name, event, weight, script string) string {
+	wt := ""
+	if weight != "" {
+		wt = "\n    \"helm.sh/hook-weight\": " + weight
+	}
+	return `apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ .Release.Name }}-` + name + `"
+  annotations:
+    "helm.sh/hook": ` + event + wt + `
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: c
+      image: busybox:1.36
+      command: ["sh", "-c", "` + script + `"]
+      resources:
+        requests: {cpu: 5m, memory: 8Mi}
+        limits: {cpu: 10m, memory: 16Mi}
+`
+}
+
+// tstChart has four Pod test hooks, one spelled the Helm 2 way and one
+// weighted first, a ConfigMap test hook, and, with fail=true, a failing Pod.
+func tstChart() map[string]string {
+	return map[string]string{
+		"Chart.yaml":                      "apiVersion: v2\nname: tst\nversion: 1.0.0\n",
+		"values.yaml":                     "fail: false\n",
+		"templates/NOTES.txt":             "Notes for {{ .Release.Name }}.\n",
+		"templates/main.yaml":             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-main\ndata: {k: v}\n",
+		"templates/tests/a-ok.yaml":       testPod("ok", "test", "", "echo ok-says-hello; echo second line"),
+		"templates/tests/b-legacy.yaml":   testPod("legacy", "test-success", "", "echo legacy ran"),
+		"templates/tests/c-fail.yaml":     "{{- if .Values.fail }}\n" + testPod("bad", "test", "", "echo bad-says-bye >&2; exit 2") + "{{- end }}\n",
+		"templates/tests/d-weighted.yaml": testPod("weighted", "test", `"-1"`, "echo weighted"),
+		"templates/tests/e-cm.yaml":       "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: \"{{ .Release.Name }}-test-cm\"\n  annotations:\n    \"helm.sh/hook\": test\ndata: {k: v}\n",
+	}
+}
+
+// testRuns is each recorded hook's name with its last_run, in stored order.
+func testRuns(rec map[string]any) [][2]string {
+	var out [][2]string
+	hooks, _ := rec["hooks"].([]any)
+	for _, h := range hooks {
+		out = append(out, [2]string{fmt.Sprint(dig(h, "name")), jsonText(dig(h, "last_run"))})
+	}
+	return out
+}
+
+// wantTestOutput wants a test run's stdout to be the status block the real
+// helm prints for the record it left, plus tail.
+func wantTestOutput(w *work, res *runner.Result, tail, what string) error {
+	st, err := w.helm("status", "tst")
+	if err != nil {
+		return err
+	}
+	if err := wantExit(st, 0); err != nil {
+		return fmt.Errorf("helm status tst, by the real helm after %s: %w", what, err)
+	}
+	return wantExact(res.Stdout, st.Stdout+tail, what+": the release as helm status prints it once the tests have run")
+}
+
+// stageTest — install leaves test hooks alone; test runs them in hook order
+// into the same revision, stops at the first failure, honours --filter and
+// --logs as helm does, and status shows the runs, in stored order.
+func stageTest(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := newWork(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := needHelm(w); err != nil {
+		return err
+	}
+	ns := env.Namespace
+	pods := env.Client.CoreV1().Pods(ns)
+	tst := w.chart("tst", tstChart())
+	res, err := wantStep(w, "install", "tst", tst)
+	if err != nil {
+		return err
+	}
+	if err := wantSummary(res.Stdout, "NAME: tst\nLAST DEPLOYED: *\nNAMESPACE: "+ns+"\nSTATUS: deployed\nREVISION: 1\nNOTES:\nNotes for tst.\n", "install tst, whose test hooks have never run (no TEST SUITE line: None is for a release without tests)"); err != nil {
+		return err
+	}
+	if _, err := pods.Get(ctx, "tst-ok", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		return fmt.Errorf("install tst should not create its test Pod tst-ok: test hooks run only on test (err: %v)", err)
+	}
+	if err := sameAsHelm(w, []string{"status", "tst"}, nil); err != nil {
+		return err
+	}
+
+	test := func(args ...string) (*runner.Result, error) {
+		return w.run(append(append([]string{"test", "--timeout", "120s"}, args...), "tst")...)
+	}
+	if res, err = test(); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("test tst: %w", err)
+	}
+	if err := wantTestOutput(w, res, "", "test tst"); err != nil {
+		return err
+	}
+	if err := wantRevisions(ctx, env, "tst", 1); err != nil {
+		return fmt.Errorf("test tst records the runs into revision 1, adding none: %w", err)
+	}
+	rec, err := wantRecord(ctx, env, "tst", 1, "deployed", time.Now().Add(-5*time.Minute), time.Now().Add(time.Second))
+	if err != nil {
+		return err
+	}
+	start := map[string]time.Time{}
+	for _, h := range rec["hooks"].([]any) {
+		n := fmt.Sprint(dig(h, "name"))
+		t, err := time.Parse(time.RFC3339Nano, fmt.Sprint(dig(h, "last_run", "started_at")))
+		if err != nil || dig(h, "last_run", "phase") != "Succeeded" {
+			return fmt.Errorf("after test tst, hook %s's last_run should be a Succeeded run with its times, got %s", n, jsonText(dig(h, "last_run")))
+		}
+		start[n] = t
+		if !reflect.DeepEqual(dig(h, "delete_policies"), []any{"before-hook-creation"}) || !reflect.DeepEqual(dig(h, "events"), []any{"test"}) {
+			return fmt.Errorf("after test tst, hook %s should be recorded with events [test] (test-success is the same event) and the default delete policy it ran with, got events %v, delete_policies %v", n, dig(h, "events"), dig(h, "delete_policies"))
+		}
+	}
+	order := []string{"tst-weighted", "tst-legacy", "tst-ok", "tst-test-cm"}
+	for i := 1; i < len(order); i++ {
+		if start[order[i]].Before(start[order[i-1]]) {
+			return fmt.Errorf("test tst should run its hooks by weight, then name: %s, recorded as started at %s, ran before %s, started at %s", order[i], start[order[i]].Format(time.StampMicro), order[i-1], start[order[i-1]].Format(time.StampMicro))
+		}
+	}
+	ok1, err := pods.Get(ctx, "tst-ok", metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("test tst should leave its test Pod tst-ok: the default policy deletes a hook only before it is created again: %w", err)
+	}
+
+	// A second run replaces the Pods; --filter runs one and moves the
+	// others, which keep their runs, to the front.
+	if res, err = test(); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("test tst, a second time: %w", err)
+	}
+	ok2, err := pods.Get(ctx, "tst-ok", metav1.GetOptions{})
+	if err != nil || ok2.UID == ok1.UID {
+		return fmt.Errorf("a second test tst should delete test Pod tst-ok and create it again (before-hook-creation), err %v", err)
+	}
+	if rec, err = wantRecord(ctx, env, "tst", 1, "deployed", time.Now().Add(-5*time.Minute), time.Now().Add(time.Second)); err != nil {
+		return err
+	}
+	before := map[string]string{}
+	for _, r := range testRuns(rec) {
+		before[r[0]] = r[1]
+	}
+	if res, err = test("--filter", "name=tst-ok"); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("test --filter name=tst-ok tst: %w", err)
+	}
+	if err := wantTestOutput(w, res, "", "test --filter name=tst-ok tst"); err != nil {
+		return err
+	}
+	if rec, err = wantRecord(ctx, env, "tst", 1, "deployed", time.Now().Add(-5*time.Minute), time.Now().Add(time.Second)); err != nil {
+		return err
+	}
+	var names []string
+	for _, r := range testRuns(rec) {
+		names = append(names, r[0])
+		if (r[0] == "tst-ok") == (r[1] == before[r[0]]) {
+			return fmt.Errorf("test --filter name=tst-ok tst should run tst-ok alone and leave the other hooks' last_run as it was; hook %s went from %s to %s", r[0], before[r[0]], r[1])
+		}
+	}
+	if want := []string{"tst-test-cm", "tst-legacy", "tst-weighted", "tst-ok"}; !reflect.DeepEqual(names, want) {
+		return fmt.Errorf("after test --filter name=tst-ok tst, the record's hooks should be those the filter skipped, in their order, then those it ran: %v, got %v", want, names)
+	}
+
+	// The upgrade's tests stop at the first failure; --logs walks every
+	// test hook by weight, run this time or not, and the ConfigMap has none.
+	if _, err := wantStep(w, "upgrade", "--set", "fail=true", "tst", tst); err != nil {
+		return err
+	}
+	if res, err = test(); err != nil {
+		return err
+	}
+	if err := wantRefusal(res, "Error: 1 error occurred:\n\t* pod tst-bad failed\n", "test tst at revision 2, whose test Pod tst-bad exits 2"); err != nil {
+		return err
+	}
+	if err := wantTestOutput(w, res, "", "test tst at revision 2"); err != nil {
+		return err
+	}
+	if rec, err = wantRecord(ctx, env, "tst", 2, "deployed", time.Now().Add(-5*time.Minute), time.Now().Add(time.Second)); err != nil {
+		return err
+	}
+	for _, r := range testRuns(rec) {
+		ran := r[1] != `{"completed_at":"","phase":"","started_at":""}`
+		if ran != (r[0] == "tst-weighted" || r[0] == "tst-bad") {
+			return fmt.Errorf("test tst at revision 2 should run tst-weighted, then tst-bad, which fails, and stop there; hook %s's last_run is %s", r[0], r[1])
+		}
+	}
+	if res, err = test("--logs"); err != nil {
+		return err
+	}
+	if err := wantRefusal(res, `unable to get pod logs for tst-test-cm: pods "tst-test-cm" not found`, "test --logs tst, whose ConfigMap test hook tst-test-cm has no pod logs"); err != nil {
+		return err
+	}
+	logs := "\nPOD LOGS: tst-weighted\nweighted\n\nPOD LOGS: tst-bad\nbad-says-bye\n\nPOD LOGS: tst-legacy\nlegacy ran\n\nPOD LOGS: tst-ok\nok-says-hello\nsecond line\n\n"
+	if err := wantTestOutput(w, res, logs, "test --logs tst"); err != nil {
+		return err
+	}
+	if res, err = w.run("test", "nosuch"); err != nil {
+		return err
+	}
+	return wantRefusal(res, "Error: release: not found", "test nosuch, a release that does not exist")
 }

@@ -56,6 +56,9 @@
 //
 // Stage 18: an event's hooks run lowest weight first, then by name, then in
 // the order kinds install; `get hooks NAME` prints them as they are stored.
+//
+// Stage 19: `test [--filter [!]name=N]... [--logs] NAME` runs the latest
+// revision's test hooks and records how they went, which status then shows.
 
 package main
 
@@ -68,6 +71,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -146,6 +150,9 @@ func run(cmd string, args []string) error {
 	fs.BoolVar(&up.install, "install", false, "install the release if it does not exist")
 	fs.BoolVar(&up.reuse, "reuse-values", false, "merge the new values over the last release's")
 	fs.BoolVar(&up.reset, "reset-values", false, "use only the new values and the chart's defaults")
+	var filters multi
+	fs.Var(&filters, "filter", "name=NAME or !name=NAME, the test hooks to run or skip (repeatable)")
+	logs := fs.Bool("logs", false, "print the test pods' logs")
 	fs.DurationVar(&hookTimeout, "timeout", 5*time.Minute, "how long to wait for each hook")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -237,6 +244,11 @@ func run(cmd string, args []string) error {
 			to = n
 		}
 		return rollback(args[0], namespace, to)
+	case "test":
+		if len(args) != 1 {
+			return fmt.Errorf(`"helm test" requires 1 argument`)
+		}
+		return releaseTest(args[0], namespace, filters, *logs)
 	case "list":
 		if len(args) != 0 {
 			return fmt.Errorf(`"helm list" accepts no arguments`)
@@ -1182,7 +1194,22 @@ func printRelease(r *Record) {
 	fmt.Printf("NAMESPACE: %s\n", r.Namespace)
 	fmt.Printf("STATUS: %s\n", r.Info.Status)
 	fmt.Printf("REVISION: %d\n", r.Version)
-	fmt.Println("TEST SUITE: None")
+	var tests []*Hook
+	for _, h := range r.Hooks {
+		if slices.Contains(h.Events, "test") {
+			tests = append(tests, h)
+		}
+	}
+	if len(tests) == 0 {
+		fmt.Println("TEST SUITE: None")
+	}
+	for _, h := range tests {
+		if h.LastRun.StartedAt.IsZero() {
+			continue
+		}
+		fmt.Printf("TEST SUITE:     %s\nLast Started:   %s\nLast Completed: %s\nPhase:          %s\n",
+			h.Name, h.LastRun.StartedAt.Format(time.ANSIC), h.LastRun.CompletedAt.Format(time.ANSIC), h.LastRun.Phase)
+	}
 	if r.Info.Notes != "" {
 		fmt.Printf("NOTES:\n%s\n", strings.TrimSpace(r.Info.Notes))
 	}
@@ -2084,4 +2111,72 @@ func (k *kube) deleteHook(ns string, h *Hook, policy string) error {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// releaseTest runs the latest revision's test hooks, in place: no new
+// revision, the same record rewritten. A filter that picks hooks moves the
+// ones it skipped to the front of the stored list, as Helm does.
+func releaseTest(name, ns string, filters []string, logs bool) error {
+	k, err := connect()
+	if err != nil {
+		return err
+	}
+	rec, err := revisionOf(ns, name, 0)
+	if err != nil {
+		return err
+	}
+	var include, exclude []string
+	for _, f := range filters {
+		if n, ok := strings.CutPrefix(f, "!name="); ok {
+			exclude = append(exclude, n)
+		} else if n, ok := strings.CutPrefix(f, "name="); ok {
+			include = append(include, n)
+		}
+	}
+	picks := func(h *Hook) bool {
+		return !slices.Contains(exclude, h.Name) && (len(include) == 0 || slices.Contains(include, h.Name))
+	}
+	var run, skipped []*Hook
+	for _, h := range rec.Hooks {
+		if picks(h) {
+			run = append(run, h)
+		} else {
+			skipped = append(skipped, h)
+		}
+	}
+	rec.Hooks = run
+	runErr := k.execHooks(rec, "test")
+	rec.Hooks = append(skipped, rec.Hooks...)
+	if err := k.saveRecord(rec, true); err != nil {
+		return err
+	}
+	printRelease(rec)
+	if logs {
+		fmt.Println()
+		// Every picked test hook, run this time or not, lowest weight first.
+		hs := slices.Clone(rec.Hooks)
+		sort.SliceStable(hs, func(i, j int) bool {
+			if hs[i].Weight != hs[j].Weight {
+				return hs[i].Weight < hs[j].Weight
+			}
+			return hs[i].Name < hs[j].Name
+		})
+		for _, h := range hs {
+			if !slices.Contains(h.Events, "test") || !picks(h) {
+				continue
+			}
+			r, err := k.cs.CoreV1().Pods(ns).GetLogs(h.Name, &corev1.PodLogOptions{}).Stream(k.ctx)
+			if err != nil {
+				return fmt.Errorf("unable to get pod logs for %s: %w", h.Name, err)
+			}
+			fmt.Printf("POD LOGS: %s\n", h.Name)
+			_, err = io.Copy(os.Stdout, r)
+			r.Close()
+			fmt.Println()
+			if err != nil {
+				return fmt.Errorf("unable to write pod logs for %s: %w", h.Name, err)
+			}
+		}
+	}
+	return runErr
 }
