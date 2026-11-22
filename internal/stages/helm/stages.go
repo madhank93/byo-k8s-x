@@ -68,6 +68,7 @@ func init() {
 	register(Stage{Slug: "hook-weights", Run: stageHookWeights})
 	register(Stage{Slug: "test", Run: stageTest})
 	register(Stage{Slug: "uninstall", Run: stageUninstall})
+	register(Stage{Slug: "dependencies", Run: stageDependencies})
 }
 
 const chartYAML = `apiVersion: v2
