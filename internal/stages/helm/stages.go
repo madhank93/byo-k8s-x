@@ -2106,6 +2106,24 @@ Say hi.
 	if err := wantRevisions(ctx, env, "first", 1); err != nil {
 		return err
 	}
+	// Every revision holds the name, not only the first.
+	for range 2 {
+		if res, err = w.helm("upgrade", "--history-max", "2", "--set", "msg=hi", "first", web); err != nil {
+			return err
+		}
+		if err := wantExit(res, 0); err != nil {
+			return fmt.Errorf("the grader's helm upgrade --history-max 2 first: %w", err)
+		}
+	}
+	if _, err := env.Client.CoreV1().Secrets(ns).Get(ctx, "sh.helm.release.v1.first.v1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		return fmt.Errorf("the grader's helm upgrade --history-max 2, run twice, should have pruned revision 1 of first (err: %v)", err)
+	}
+	if res, err = w.run("install", "first", web); err != nil {
+		return err
+	}
+	if err := wantRefusal(res, "cannot re-use a name that is still in use", "installing first once revision 1 is pruned and revisions 2 and 3 are left"); err != nil {
+		return err
+	}
 
 	// The same holds for a release the real helm installed.
 	if res, err = w.helm("install", "--set", "msg=h", "helmed", web); err != nil {
@@ -2317,26 +2335,27 @@ func stageListStatus(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	defer env.Client.CoreV1().Namespaces().Delete(context.WithoutCancel(ctx), ns2, metav1.DeleteOptions{})
 
-	web := w.chart("web", webChart("hello"))
+	web := w.chart("ls-web", webChart("hello"))
 	broken := w.chart("broken", map[string]string{
 		"Chart.yaml":         "apiVersion: v2\nname: broken\nversion: 0.2.0\n",
 		"templates/bad.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: broken-bad\ndata:\n  \"no spaces\": x\n",
 	})
-	// "web" and "web-a" sort one way by name and the other by Secret name.
+	// "ls-web" and "ls-web-a" sort one way by name and the other by Secret name.
 	for _, step := range []struct {
 		helm bool
 		args []string
 		exit int
 	}{
-		{false, []string{"install", "--set", "msg=a", "web-a", web}, 0},
-		{false, []string{"install", "web", web}, 0},
-		{false, []string{"install", "broken", broken}, 1},
-		{false, []string{"install", "-n", ns2, "web-c", web}, 0},
-		{true, []string{"install", "helmed", web}, 0},
-		{true, []string{"upgrade", "--set", "msg=two", "helmed", web}, 0},
-		{true, []string{"install", "dropped", web}, 0},
-		{true, []string{"uninstall", "--keep-history", "dropped"}, 0},
-		{true, []string{"install", "-n", ns2, "elsewhere", web}, 0},
+		{false, []string{"install", "--set", "msg=a", "ls-web-a", web}, 0},
+		{false, []string{"install", "ls-web", web}, 0},
+		{false, []string{"install", "ls-broken", broken}, 1},
+		{false, []string{"install", "-n", ns2, "ls-web-c", web}, 0},
+		{true, []string{"install", "ls-helmed", web}, 0},
+		{true, []string{"upgrade", "--set", "msg=two", "ls-helmed", web}, 0},
+		{true, []string{"install", "ls-dropped", web}, 0},
+		{true, []string{"uninstall", "--keep-history", "ls-dropped"}, 0},
+		{true, []string{"install", "-n", ns2, "ls-elsewhere", web}, 0},
+		{true, []string{"install", "ls-pending", web}, 0},
 	} {
 		run, who := w.run, "app"
 		if step.helm {
@@ -2351,6 +2370,11 @@ func stageListStatus(ctx context.Context, env *kube.Env, bin string) error {
 		}
 	}
 
+	// A release caught mid-install, which list hides unless -a.
+	if err := setStatus(ctx, env, "ls-pending", 1, "pending-install"); err != nil {
+		return err
+	}
+
 	for _, args := range [][]string{
 		{"list"},
 		{"list", "-a"},
@@ -2359,11 +2383,12 @@ func stageListStatus(ctx context.Context, env *kube.Env, bin string) error {
 		{"list", "--short", "-a"},
 		{"list", "-n", ns2},
 		{"list", "--namespace", ns2, "-q"},
-		{"status", "web-a"},
-		{"status", "broken"},
-		{"status", "helmed"},
-		{"status", "dropped"},
-		{"status", "-n", ns2, "elsewhere"},
+		{"status", "ls-web-a"},
+		{"status", "ls-broken"},
+		{"status", "ls-helmed"},
+		{"status", "ls-dropped"},
+		{"status", "ls-pending"},
+		{"status", "-n", ns2, "ls-elsewhere"},
 	} {
 		if err := sameAsHelm(w, args, nil); err != nil {
 			return err
@@ -2380,16 +2405,51 @@ func stageListStatus(ctx context.Context, env *kube.Env, bin string) error {
 			return err
 		}
 	}
-	names := map[string]bool{"web-a": true, "web": true, "broken": true, "helmed": true, "dropped": true, "web-c": true, "elsewhere": true}
+	names := map[string]bool{"ls-web-a": true, "ls-web": true, "ls-broken": true, "ls-helmed": true, "ls-dropped": true, "ls-web-c": true, "ls-elsewhere": true, "ls-pending": true}
 	if err := sameAsHelm(w, []string{"list", "-A", "-q"}, func(l string) bool { return names[l] }); err != nil {
 		return err
 	}
 
-	res, err := w.run("status", "nope")
+	res, err := w.run("status", "ls-nope")
 	if err != nil {
 		return err
 	}
 	return wantRefusal(res, "release: not found", "status nope, a release that does not exist")
+}
+
+// setStatus rewrites a revision's status, in its label and its record, as a
+// helm process interrupted mid-operation leaves it.
+func setStatus(ctx context.Context, env *kube.Env, name string, version int, status string) error {
+	secrets := env.Client.CoreV1().Secrets(env.Namespace)
+	s, err := secrets.Get(ctx, fmt.Sprintf("sh.helm.release.v1.%s.v%d", name, version), metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	gz, err := base64.StdEncoding.DecodeString(string(s.Data["release"]))
+	if err != nil {
+		return err
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(gz))
+	if err != nil {
+		return err
+	}
+	var rec map[string]any
+	if err := json.NewDecoder(zr).Decode(&rec); err != nil {
+		return err
+	}
+	rec["info"].(map[string]any)["status"] = status
+	body, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	zw.Write(body)
+	zw.Close()
+	s.Data["release"] = []byte(base64.StdEncoding.EncodeToString(buf.Bytes()))
+	s.Labels["status"] = status
+	_, err = secrets.Update(ctx, s, metav1.UpdateOptions{})
+	return err
 }
 
 // sameAsHelm runs the same command through the program and the real helm and
@@ -2499,9 +2559,34 @@ func stageHistory(ctx context.Context, env *kube.Env, bin string) error {
 		}
 	}
 
+	// Values nest: -f and --set reach into maps, and null drops a default.
+	nested := w.chart("nested", map[string]string{
+		"Chart.yaml":        "apiVersion: v2\nname: nested\nversion: 1.0.0\n",
+		"values.yaml":       "db:\n  host: localhost\n  port: 5432\n  opts:\n    ssl: true\n    pool: 5\n",
+		"templates/cm.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}-db\ndata:\n  db: {{ toJson .Values.db | quote }}\n",
+	})
+	nv := w.file("nested.yaml", "db:\n  opts:\n    ssl: null\n    extra: x\n")
+	if res, err = w.run("install", "-f", nv, "--set", "db.host=db1", "nested", nested); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return err
+	}
+	if res, err = w.helm("upgrade", "--set", "db.port=null,db.opts.pool=9", "nested", nested); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("the grader's helm upgrade --set db.port=null,db.opts.pool=9 nested, on top of your release: %w", err)
+	}
+
 	for _, args := range [][]string{
 		{"history", "web"},
 		{"history", "--max", "3", "web"},
+		{"history", "--max", "0", "web"},
+		{"history", "--max", "-1", "web"},
+		{"status", "web"},
+		{"list"},
+		{"list", "-a"},
 		{"history", "plain"},
 		{"get", "manifest", "web"},
 		{"get", "manifest", "--revision", "1", "web"},
@@ -2516,6 +2601,31 @@ func stageHistory(ctx context.Context, env *kube.Env, bin string) error {
 		{"get", "notes", "web"},
 		{"get", "notes", "--revision", "1", "web"},
 		{"get", "notes", "--revision", "3", "web"},
+		{"get", "values", "nested"},
+		{"get", "values", "-a", "nested"},
+		{"get", "values", "--revision", "1", "nested"},
+		{"get", "values", "-a", "--revision", "1", "nested"},
+	} {
+		if err := sameAsHelm(w, args, nil); err != nil {
+			return err
+		}
+	}
+
+	// With the oldest revisions pruned, a revision is found by its number,
+	// not by its place in the history.
+	if res, err = w.helm("upgrade", "--history-max", "2", "--set", "msg=r12", "web", web); err != nil {
+		return err
+	}
+	if err := wantExit(res, 0); err != nil {
+		return fmt.Errorf("the grader's helm upgrade --history-max 2 web, on top of your release: %w", err)
+	}
+	for _, args := range [][]string{
+		{"history", "web"},
+		{"status", "web"},
+		{"get", "values", "--revision", "11", "web"},
+		{"get", "manifest", "--revision", "12", "web"},
+		{"get", "notes", "--revision", "11", "web"},
+		{"get", "values", "--revision", "2", "web"},
 	} {
 		if err := sameAsHelm(w, args, nil); err != nil {
 			return err
@@ -2523,7 +2633,7 @@ func stageHistory(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	for _, args := range [][]string{
 		{"history", "nope"},
-		{"get", "manifest", "--revision", "12", "web"},
+		{"get", "manifest", "--revision", "13", "web"},
 		{"get", "values", "nope"},
 	} {
 		res, err := w.run(args...)

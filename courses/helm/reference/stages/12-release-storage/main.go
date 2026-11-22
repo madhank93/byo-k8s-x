@@ -1173,7 +1173,7 @@ func (k *kube) records(ns, selector string) ([]*Record, error) {
 	for i := range list.Items {
 		r, err := decodeRecord(&list.Items[i])
 		if err != nil {
-			return nil, err
+			continue // helm skips a release Secret it cannot decode
 		}
 		out = append(out, r)
 	}
