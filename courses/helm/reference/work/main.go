@@ -89,6 +89,8 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -99,6 +101,7 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/Masterminds/sprig/v3"
@@ -108,6 +111,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/jsonmergepatch"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
@@ -149,6 +153,24 @@ type multi []string
 func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(v string) error { *m = append(*m, v); return nil }
 
+// parseFlags parses flags wherever they fall among the positional arguments,
+// as Helm's command line does.
+// ponytail: an argument after "--" that starts with "-" is still read as a
+// flag; Helm takes it as positional, but no valid NAME or chart looks like one.
+func parseFlags(fs *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return pos, nil
+		}
+		pos, args = append(pos, rest[0]), rest[1:]
+	}
+}
+
 func run(cmd string, args []string) error {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	var files, sets multi
@@ -181,19 +203,25 @@ func run(cmd string, args []string) error {
 	fs.BoolVar(&up.reuse, "reuse-values", false, "merge the new values over the last release's")
 	fs.BoolVar(&up.reset, "reset-values", false, "use only the new values and the chart's defaults")
 	fs.Var(&setStrings, "set-string", "key=value, the value always a string (repeatable)")
+	fs.Var(&setJSONs, "set-json", "key=JSON (repeatable)")
+	fs.Var(&setFiles, "set-file", "key=FILE, the value the file's contents (repeatable)")
 	var filters multi
 	fs.Var(&filters, "filter", "name=NAME or !name=NAME, the test hooks to run or skip (repeatable)")
 	logs := fs.Bool("logs", false, "print the test pods' logs")
 	fs.DurationVar(&hookTimeout, "timeout", 5*time.Minute, "how long to wait for each hook")
 	kubeVersion := fs.String("kube-version", "v1.33.0", "the Kubernetes version templates see")
-	if err := fs.Parse(args); err != nil {
+	var apiVersions multi
+	fs.Var(&apiVersions, "api-versions", "extra API versions templates see, comma-separated (repeatable)")
+	args, err := parseFlags(fs, args)
+	if err != nil {
 		return err
 	}
-	var err error
 	if caps, err = capabilities(*kubeVersion); err != nil {
 		return err
 	}
-	args = fs.Args()
+	for _, v := range apiVersions {
+		caps.APIVersions = append(caps.APIVersions, strings.Split(v, ",")...)
+	}
 	if namespace == "" {
 		namespace = kubeNamespace()
 	}
@@ -476,13 +504,39 @@ type Release struct {
 }
 
 // load reads a chart directory, or a packaged chart when dir is a file.
+// A directory's .helmignore governs its whole tree, subcharts included.
 func load(dir string) (*Chart, error) {
 	if fi, err := os.Stat(dir); err == nil && !fi.IsDir() {
 		return loadArchive(dir)
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "Chart.yaml"))
+	rules, err := ignoreRules(dir)
 	if err != nil {
-		return nil, fmt.Errorf("%s is not a chart: %w", dir, err)
+		return nil, err
+	}
+	return loadDir(dir, "", rules)
+}
+
+// loadDir reads the chart in dir, which sits at prefix inside the directory
+// whose ignore rules apply; an archive's contents are loaded with none.
+func loadDir(dir, prefix string, rules []string) (*Chart, error) {
+	skip := func(rel string, isDir bool) bool { return ignored(rules, prefix+rel, isDir) }
+	// read is a file Helm reads itself, or nil when it is absent or ignored.
+	read := func(name string) ([]byte, error) {
+		if skip(name, false) {
+			return nil, nil
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return raw, err
+	}
+	raw, err := read("Chart.yaml")
+	if err != nil {
+		return nil, err
+	}
+	if raw == nil {
+		return nil, errors.New("Chart.yaml file is missing")
 	}
 	c := &Chart{Files: Files{}}
 	if err := yaml.Unmarshal(raw, &c.Metadata); err != nil {
@@ -495,31 +549,24 @@ func load(dir string) (*Chart, error) {
 	if err := validate(c.Metadata); err != nil {
 		return nil, err
 	}
-	if raw, err := os.ReadFile(filepath.Join(dir, "values.schema.json")); err == nil {
-		c.Schema = raw
-	} else if !errors.Is(err, fs.ErrNotExist) {
+	if c.Schema, err = read("values.schema.json"); err != nil {
 		return nil, err
 	}
-	if raw, err := os.ReadFile(filepath.Join(dir, "Chart.lock")); err == nil {
+	if raw, err := read("Chart.lock"); err != nil {
+		return nil, err
+	} else if raw != nil {
 		c.Lock = &Lock{}
 		if err := yaml.Unmarshal(raw, c.Lock); err != nil {
 			return nil, fmt.Errorf("cannot load Chart.lock: %w", err)
 		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
 	}
 	c.Values = map[string]any{}
-	if raw, err := os.ReadFile(filepath.Join(dir, "values.yaml")); err == nil {
-		c.Raw = raw
-		if err := yaml.Unmarshal(raw, &c.Values); err != nil {
+	if c.Raw, err = read("values.yaml"); err != nil {
+		return nil, err
+	} else if c.Raw != nil {
+		if err := yaml.Unmarshal(c.Raw, &c.Values); err != nil {
 			return nil, fmt.Errorf("cannot load values.yaml: %w", err)
 		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
-	ignore, err := ignoreRules(dir)
-	if err != nil {
-		return nil, err
 	}
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -530,17 +577,13 @@ func load(dir string) (*Chart, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if ignored(ignore, rel, d.IsDir()) {
+		if skip(rel, d.IsDir()) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if d.IsDir() {
-			return nil
-		}
-		// Helm never loads dotfiles directly under templates/.
-		if strings.HasPrefix(rel, "templates/.") {
 			return nil
 		}
 		// Files Helm reads itself, and subcharts, are not .Files.
@@ -569,14 +612,17 @@ func load(dir string) (*Chart, error) {
 	sort.Slice(c.Templates, func(i, j int) bool { return c.Templates[i].Name < c.Templates[j].Name })
 
 	// Helm loads every entry of charts/ as a chart, packaged or not.
-	entries, err := os.ReadDir(filepath.Join(dir, "charts"))
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
+	var entries []fs.DirEntry
+	if !skip("charts", true) {
+		entries, err = os.ReadDir(filepath.Join(dir, "charts"))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
 	}
 	for _, e := range entries {
 		// Helm ignores entries starting with . or _, and keeps provenance
 		// files as plain files of the parent.
-		if strings.HasPrefix(e.Name(), ".") || strings.HasPrefix(e.Name(), "_") {
+		if strings.HasPrefix(e.Name(), ".") || strings.HasPrefix(e.Name(), "_") || skip("charts/"+e.Name(), e.IsDir()) {
 			continue
 		}
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".prov") {
@@ -590,7 +636,13 @@ func load(dir string) (*Chart, error) {
 		if !e.IsDir() && !strings.HasSuffix(e.Name(), ".tgz") {
 			return nil, fmt.Errorf("error unpacking subchart %s in %s: not a chart directory", e.Name(), c.Metadata.Name)
 		}
-		sub, err := load(filepath.Join(dir, "charts", e.Name()))
+		p := filepath.Join(dir, "charts", e.Name())
+		var sub *Chart
+		if e.IsDir() {
+			sub, err = loadDir(p, prefix+"charts/"+e.Name()+"/", rules)
+		} else {
+			sub, err = loadArchive(p)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("error unpacking subchart %s in %s: %w", e.Name(), c.Metadata.Name, err)
 		}
@@ -618,9 +670,9 @@ func validate(m Metadata) error {
 	return nil
 }
 
-// userValues merges -f files in order, then --set flags in order. A null is
-// kept here, not applied: it means "delete the chart's default", which only
-// coalesce can do.
+// userValues merges -f files in order, then the --set style flags in order.
+// A null is kept here, not applied: it means "delete the chart's default",
+// which only coalesce can do.
 func userValues(files, sets []string) (map[string]any, error) {
 	user := map[string]any{}
 	for _, f := range files {
@@ -634,21 +686,40 @@ func userValues(files, sets []string) (map[string]any, error) {
 		}
 		mergeMaps(user, m)
 	}
+	typed := func(v string) (any, error) { return typedVal(v), nil }
+	for _, s := range setJSONs {
+		if err := parseSet(user, s, nil, true); err != nil {
+			return nil, fmt.Errorf("failed parsing --set-json data %s", s)
+		}
+	}
 	for _, s := range sets {
-		if err := parseSet(user, s, typedVal); err != nil {
+		if err := parseSet(user, s, typed, false); err != nil {
 			return nil, fmt.Errorf("failed parsing --set data: %w", err)
 		}
 	}
 	for _, s := range setStrings {
-		if err := parseSet(user, s, func(v string) any { return v }); err != nil {
+		if err := parseSet(user, s, func(v string) (any, error) { return v, nil }, false); err != nil {
 			return nil, fmt.Errorf("failed parsing --set-string data: %w", err)
+		}
+	}
+	for _, s := range setFiles {
+		if err := parseSet(user, s, readSetFile, false); err != nil {
+			return nil, fmt.Errorf("failed parsing --set-file data: %w", err)
 		}
 	}
 	return user, nil
 }
 
-// setStrings are the --set-string flags, applied after every --set.
-var setStrings multi
+// The other value flags, applied in Helm's order: -f files, --set-json,
+// --set, --set-string, --set-file.
+var setStrings, setJSONs, setFiles multi
+
+// readSetFile reads a --set-file value: the named file's contents, as a string.
+// ponytail: local files only; Helm also takes - for stdin and URLs.
+func readSetFile(name string) (any, error) {
+	b, err := os.ReadFile(name)
+	return string(b), err
+}
 
 // mergeMaps overlays src onto dst: maps merge key by key, anything else,
 // lists and nulls included, replaces what was there.
@@ -883,100 +954,293 @@ func copyMap(m map[string]any) map[string]any {
 	return out
 }
 
-// parseSet applies one --set argument: comma-separated a.b.c=value pairs,
-// where a value may be a list {x,y} and a backslash escapes , . = { }.
-// typed reads each scalar.
-// ponytail: no index syntax (a[0]=x); add when a stage needs it.
-func parseSet(into map[string]any, arg string, typed func(string) any) error {
-	rest := arg
-	for rest != "" {
-		// The key runs to the first unescaped '=', split on unescaped '.'.
-		var keys []string
-		var k strings.Builder
-		i, found := 0, false
-		for ; i < len(rest); i++ {
-			switch c := rest[i]; {
-			case c == '\\' && i+1 < len(rest):
-				i++
-				k.WriteByte(rest[i])
-			case c == '.':
-				keys = append(keys, k.String())
-				k.Reset()
-			case c == ',':
-				return fmt.Errorf("key %q has no value (cannot end with ,)", rest[:i])
-			case c == '=':
-				found = true
-			default:
-				k.WriteByte(c)
-			}
-			if found {
-				break
-			}
+// parseSet applies one --set style argument: comma-separated key=value pairs,
+// where a key is a dotted path that may index lists (a[0].b, a[1][2]), a value
+// may be a list {x,y}, and a backslash escapes the next character. read turns
+// each raw value into what is stored; json decodes the value as JSON instead.
+// It follows Helm's strvals parser closely, panics included: a key that walks
+// into a value of the wrong type fails with Go's interface-conversion message.
+func parseSet(into map[string]any, arg string, read func(string) (any, error), json bool) error {
+	p := &setParser{sc: bytes.NewBufferString(arg), read: read, json: json}
+	for {
+		switch err := p.key(into, 0); err {
+		case nil:
+		case io.EOF:
+			return nil
+		default:
+			return err
 		}
-		if !found {
-			return fmt.Errorf("key %q has no value", rest)
-		}
-		keys = append(keys, k.String())
-		rest = rest[i+1:]
-
-		var val any
-		if strings.HasPrefix(rest, "{") {
-			end := strings.IndexByte(rest, '}')
-			if end < 0 {
-				return errors.New("list must terminate with '}'")
-			}
-			var list []any
-			for _, e := range splitUnescaped(rest[1:end]) {
-				list = append(list, typed(e))
-			}
-			val, rest = list, rest[end+1:]
-			if rest != "" && rest[0] != ',' {
-				return fmt.Errorf("key %q has no value", rest)
-			}
-			rest = strings.TrimPrefix(rest, ",")
-		} else {
-			var v strings.Builder
-			for i = 0; i < len(rest) && rest[i] != ','; i++ {
-				if rest[i] == '\\' && i+1 < len(rest) {
-					i++
-				}
-				v.WriteByte(rest[i])
-			}
-			val, rest = typed(v.String()), rest[min(i+1, len(rest)):]
-		}
-
-		m := into
-		for _, p := range keys[:len(keys)-1] {
-			next, ok := m[p].(map[string]any)
-			if !ok {
-				next = map[string]any{}
-				m[p] = next
-			}
-			m = next
-		}
-		m[keys[len(keys)-1]] = val
 	}
-	return nil
 }
 
-// splitUnescaped splits a list's body on commas not escaped by a backslash,
-// and drops the escapes.
-func splitUnescaped(s string) []string {
-	var out []string
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		switch {
-		case s[i] == '\\' && i+1 < len(s):
-			i++
-			b.WriteByte(s[i])
-		case s[i] == ',':
-			out = append(out, b.String())
-			b.Reset()
+type setParser struct {
+	sc   *bytes.Buffer
+	read func(string) (any, error)
+	json bool
+}
+
+const (
+	maxSetIndex = 65536
+	maxSetDepth = 30
+)
+
+var errNotList = errors.New("not a list")
+
+func (p *setParser) key(data map[string]any, depth int) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("unable to parse key: %s", r)
+		}
+	}()
+	k, last, err := runesUntil(p.sc, "=[,.")
+	switch {
+	case err != nil:
+		if k == "" {
+			return err
+		}
+		return fmt.Errorf("key %q has no value", k)
+	case last == '[':
+		i, err := p.keyIndex()
+		if err != nil {
+			return fmt.Errorf("error parsing index: %w", err)
+		}
+		list := []any{}
+		if _, ok := data[k]; ok {
+			list = data[k].([]any)
+		}
+		list, err = p.listItem(list, i, depth)
+		setKey(data, k, list)
+		return err
+	case last == '=':
+		if p.json {
+			v, done, err := p.jsonVal()
+			if err == nil || done {
+				setKey(data, k, v)
+			}
+			return err
+		}
+		vl, err := p.valList()
+		switch err {
+		case nil:
+			setKey(data, k, vl)
+			return nil
+		case io.EOF:
+			setKey(data, k, "")
+			return err
+		case errNotList:
+			raw, err := runesUntil1(p.sc, ",")
+			if err != nil && err != io.EOF {
+				return err
+			}
+			v, err := p.read(raw)
+			setKey(data, k, v)
+			return err
 		default:
-			b.WriteByte(s[i])
+			return err
+		}
+	case last == ',':
+		setKey(data, k, "")
+		return fmt.Errorf("key %q has no value (cannot end with ,)", k)
+	default: // '.'
+		if depth++; depth > maxSetDepth {
+			return fmt.Errorf("value name nested level is greater than maximum supported nested level of %d", maxSetDepth)
+		}
+		inner := map[string]any{}
+		if _, ok := data[k]; ok {
+			inner = data[k].(map[string]any)
+		}
+		err := p.key(inner, depth)
+		if err == nil && len(inner) == 0 {
+			return fmt.Errorf("key map %q has no value", k)
+		}
+		if len(inner) != 0 {
+			setKey(data, k, inner)
+		}
+		return err
+	}
+}
+
+// jsonVal decodes one JSON value after '=' and the comma that ends it. An
+// empty value is a null; done reports that the value is ready to store.
+func (p *setParser) jsonVal() (v any, done bool, err error) {
+	if p.emptyVal() {
+		return nil, true, nil
+	}
+	dec := json.NewDecoder(strings.NewReader(p.sc.String()))
+	if err := dec.Decode(&v); err != nil {
+		return nil, false, err
+	}
+	p.sc.Next(int(dec.InputOffset()))
+	p.emptyVal()
+	return v, true, nil
+}
+
+// emptyVal consumes spaces up to a comma or the end, reporting whether that
+// is all there was; anything else is left unread.
+func (p *setParser) emptyVal() bool {
+	for {
+		r, _, err := p.sc.ReadRune()
+		if err != nil || r == ',' {
+			return true
+		}
+		if !unicode.IsSpace(r) {
+			p.sc.UnreadRune()
+			return false
 		}
 	}
-	return append(out, b.String())
+}
+
+func (p *setParser) keyIndex() (int, error) {
+	v, _, err := runesUntil(p.sc, "]")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(v)
+}
+
+func (p *setParser) listItem(list []any, i, depth int) ([]any, error) {
+	if i < 0 {
+		return list, fmt.Errorf("negative %d index not allowed", i)
+	}
+	k, last, err := runesUntil(p.sc, "[.=")
+	switch {
+	case k != "":
+		return list, fmt.Errorf("unexpected data at end of array index: %q", []rune(k))
+	case err != nil:
+		return list, err
+	case last == '=':
+		if p.json {
+			v, done, err := p.jsonVal()
+			if !done {
+				return list, err
+			}
+			return setIndex(list, i, v)
+		}
+		vl, err := p.valList()
+		switch err {
+		case nil:
+			return setIndex(list, i, vl)
+		case io.EOF:
+			return setIndex(list, i, "")
+		case errNotList:
+			raw, err := runesUntil1(p.sc, ",")
+			if err != nil && err != io.EOF {
+				return list, err
+			}
+			v, err := p.read(raw)
+			if err != nil {
+				return list, err
+			}
+			return setIndex(list, i, v)
+		default:
+			return list, err
+		}
+	case last == '[':
+		next, err := p.keyIndex()
+		if err != nil {
+			return list, fmt.Errorf("error parsing index: %w", err)
+		}
+		var inner []any
+		if len(list) > i && list[i] != nil {
+			inner = list[i].([]any)
+		}
+		inner, err = p.listItem(inner, next, depth)
+		if err != nil {
+			return list, err
+		}
+		return setIndex(list, i, inner)
+	default: // '.'
+		inner := map[string]any{}
+		if len(list) > i {
+			var ok bool
+			if inner, ok = list[i].(map[string]any); !ok {
+				inner = map[string]any{}
+				list[i] = inner
+			}
+		}
+		if err := p.key(inner, depth); err != nil {
+			return list, err
+		}
+		return setIndex(list, i, inner)
+	}
+}
+
+// valList reads a {x,y} list, or reports errNotList with nothing consumed.
+func (p *setParser) valList() ([]any, error) {
+	r, _, err := p.sc.ReadRune()
+	if err != nil {
+		return []any{}, err
+	}
+	if r != '{' {
+		p.sc.UnreadRune()
+		return []any{}, errNotList
+	}
+	list := []any{}
+	for {
+		raw, last, err := runesUntil(p.sc, ",}")
+		if err == io.EOF {
+			return list, errors.New("list must terminate with '}'")
+		}
+		v, rerr := p.read(raw)
+		if last == '}' {
+			if r, _, err := p.sc.ReadRune(); err == nil && r != ',' {
+				p.sc.UnreadRune()
+			}
+			return append(list, v), rerr
+		}
+		if rerr != nil {
+			return list, rerr
+		}
+		list = append(list, v)
+	}
+}
+
+func setKey(data map[string]any, k string, v any) {
+	if k != "" {
+		data[k] = v
+	}
+}
+
+func setIndex(list []any, i int, v any) ([]any, error) {
+	if i < 0 {
+		return list, fmt.Errorf("negative %d index not allowed", i)
+	}
+	if i > maxSetIndex {
+		return list, fmt.Errorf("index of %d is greater than maximum supported index of %d", i, maxSetIndex)
+	}
+	if len(list) <= i {
+		list = append(list, make([]any, i+1-len(list))...)
+	}
+	list[i] = v
+	return list, nil
+}
+
+// runesUntil reads up to the first unescaped rune in stop, returning what it
+// read with the escapes dropped and the rune it stopped on.
+func runesUntil(sc *bytes.Buffer, stop string) (string, rune, error) {
+	var v strings.Builder
+	for {
+		r, _, err := sc.ReadRune()
+		switch {
+		case err != nil:
+			return v.String(), r, err
+		case strings.ContainsRune(stop, r):
+			return v.String(), r, nil
+		case r == '\\':
+			next, _, err := sc.ReadRune()
+			if err != nil {
+				return v.String(), next, err
+			}
+			v.WriteRune(next)
+		default:
+			v.WriteRune(r)
+		}
+	}
+}
+
+func runesUntil1(sc *bytes.Buffer, stop string) (string, error) {
+	v, _, err := runesUntil(sc, stop)
+	return v, err
 }
 
 // typedVal reads a --set value the way Helm does: booleans, null and integers
@@ -1052,7 +1316,7 @@ func render(c *Chart, vals map[string]any, rel Release) ([]File, string, error) 
 			"Chart":        top["Chart"],
 			"Files":        top["Files"],
 			"Template":     map[string]string{"Name": name, "BasePath": top["BasePath"].(string)},
-			"Capabilities": caps,
+			"Capabilities": &caps,
 		}
 		var b strings.Builder
 		if err := t.ExecuteTemplate(&b, name, d); err != nil {
@@ -1218,18 +1482,19 @@ func funcMap() template.FuncMap {
 	f["toYaml"] = toYAML
 	f["required"] = required
 	f["fail"] = func(msg string) (string, error) { return "", errors.New(warnWrap(msg)) }
-	// ponytail: never asks the cluster, which is what helm template does;
-	// install and upgrade would need a live lookup to match helm there.
 	f["lookup"] = func(apiVersion, kind, namespace, name string) (map[string]any, error) {
-		return map[string]any{}, nil
+		if lookupKube == nil {
+			return map[string]any{}, nil
+		}
+		return lookupKube.lookup(apiVersion, kind, namespace, name)
 	}
 	return f
 }
 
-// Capabilities is what .Capabilities shows a template. Like helm template, it
-// reports the Kubernetes version helm was built against unless --kube-version
-// names another, and every API version and kind the client knows.
-// ponytail: install reports the same instead of asking the cluster.
+// Capabilities is what .Capabilities shows a template. template reports the
+// Kubernetes version helm was built against unless --kube-version names
+// another, and the group/versions the client knows; install and upgrade ask
+// the cluster instead (useCluster).
 type Capabilities struct {
 	KubeVersion KubeVersion
 	APIVersions APIVersions
@@ -1237,7 +1502,10 @@ type Capabilities struct {
 
 type KubeVersion struct{ Version, Major, Minor string }
 
-func (v KubeVersion) String() string { return v.Version }
+// Pointer receivers, as Helm's: a piped KubeVersion is a copy, so
+// `.Capabilities.KubeVersion | quote` prints the struct, not the version.
+func (v *KubeVersion) String() string     { return v.Version }
+func (v *KubeVersion) GitVersion() string { return v.Version }
 
 type APIVersions []string
 
@@ -1251,10 +1519,12 @@ func capabilities(kube string) (Capabilities, error) {
 	if err != nil {
 		return Capabilities{}, fmt.Errorf("invalid kube version '%s': %s", kube, err)
 	}
-	var apis APIVersions
-	for gvk := range scheme.Scheme.AllKnownTypes() {
-		gv := gvk.GroupVersion().String()
-		apis = append(apis, gv, gv+"/"+gvk.Kind)
+	// Group/versions only, no kinds, plus the CRD API, as Helm's default set.
+	apis := APIVersions{"apiextensions.k8s.io/v1", "apiextensions.k8s.io/v1beta1"}
+	for _, gv := range scheme.Scheme.PrioritizedVersionsAllGroups() {
+		if !slices.Contains(apis, gv.String()) {
+			apis = append(apis, gv.String())
+		}
 	}
 	return Capabilities{
 		KubeVersion: KubeVersion{"v" + v.String(), strconv.FormatUint(v.Major(), 10), strconv.FormatUint(v.Minor(), 10)},
@@ -1412,6 +1682,9 @@ func install(name, dir, ns string, files, sets []string, replace bool) error {
 		if st := last.Info.Status; !replace || (st != "uninstalled" && st != "failed") {
 			return errors.New("cannot re-use a name that is still in use")
 		}
+	}
+	if err := k.useCluster(); err != nil {
+		return err
 	}
 	rel := Release{Name: name, Namespace: ns, Revision: 1, IsInstall: true, Service: "Helm"}
 	r, err := renderRelease(dir, files, sets, rel)
@@ -1730,6 +2003,77 @@ func connect() (*kube, error) {
 		mapper: restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))}, nil
 }
 
+// lookupKube is the cluster the lookup function reads; nil, as for template,
+// makes every lookup an empty map.
+var lookupKube *kube
+
+// useCluster points .Capabilities and lookup at the cluster, as helm install
+// and upgrade do: the server's version, and every group/version and
+// group/version/Kind discovery lists.
+func (k *kube) useCluster() error {
+	dc := k.cs.Discovery()
+	sv, err := dc.ServerVersion()
+	if err != nil {
+		return fmt.Errorf("could not get server version from Kubernetes: %w", err)
+	}
+	groups, resources, err := dc.ServerGroupsAndResources()
+	if err != nil && !discovery.IsGroupDiscoveryFailedError(err) {
+		return fmt.Errorf("could not get apiVersions from Kubernetes: %w", err)
+	}
+	seen := map[string]bool{}
+	for _, g := range groups {
+		for _, v := range g.Versions {
+			seen[v.GroupVersion] = true
+		}
+	}
+	for _, r := range resources {
+		for _, a := range r.APIResources {
+			seen[path.Join(r.GroupVersion, a.Kind)] = true
+		}
+	}
+	caps.KubeVersion = KubeVersion{sv.GitVersion, sv.Major, sv.Minor}
+	caps.APIVersions = slices.Collect(maps.Keys(seen))
+	lookupKube = k
+	return nil
+}
+
+// lookup is Helm's lookup: one object by name, or the whole list when name
+// is empty, across every namespace when a namespaced kind is given none. A
+// missing object is an empty map, so `if not (lookup ...)` works.
+func (k *kube) lookup(apiVersion, kind, ns, name string) (map[string]any, error) {
+	gv, err := schema.ParseGroupVersion(apiVersion)
+	if err != nil {
+		return map[string]any{}, err
+	}
+	m, err := k.mapper.RESTMapping(gv.WithKind(kind).GroupKind(), gv.Version)
+	if err != nil {
+		return map[string]any{}, err
+	}
+	var res dynamic.ResourceInterface = k.dyn.Resource(m.Resource)
+	if m.Scope.Name() == meta.RESTScopeNameNamespace && ns != "" {
+		res = k.dyn.Resource(m.Resource).Namespace(ns)
+	}
+	var out map[string]any
+	if name != "" {
+		var o *unstructured.Unstructured
+		if o, err = res.Get(k.ctx, name, metav1.GetOptions{}); err == nil {
+			out = o.Object
+		}
+	} else {
+		var l *unstructured.UnstructuredList
+		if l, err = res.List(k.ctx, metav1.ListOptions{}); err == nil {
+			out = l.UnstructuredContent()
+		}
+	}
+	if apierrors.IsNotFound(err) {
+		return map[string]any{}, nil
+	}
+	if err != nil {
+		return map[string]any{}, err
+	}
+	return out, nil
+}
+
 // object is one manifest parsed, with the endpoint that serves it.
 type object struct {
 	obj *unstructured.Unstructured
@@ -1934,6 +2278,9 @@ func upgradeRelease(k *kube, h []*Record, name, dir, ns string, files, sets []st
 		user = current.Config
 	}
 	rel := Release{Name: name, Namespace: ns, Revision: last.Version + 1, IsUpgrade: true, Service: "Helm"}
+	if err := k.useCluster(); err != nil {
+		return err
+	}
 	r, err := renderWith(dir, user, rel)
 	if err != nil {
 		return err
@@ -2666,10 +3013,10 @@ func runPackaging(cmd string, args []string) error {
 	var update bool
 	fs.BoolVar(&update, "u", false, "update dependencies before packaging")
 	fs.BoolVar(&update, "dependency-update", false, "update dependencies before packaging")
-	if err := fs.Parse(args); err != nil {
+	args, err := parseFlags(fs, args)
+	if err != nil {
 		return err
 	}
-	args = fs.Args()
 	if cmd == "package" {
 		if len(args) == 0 {
 			return fmt.Errorf(`"helm package" requires at least 1 argument`)
@@ -2830,6 +3177,7 @@ func depUpdate(dir string, out io.Writer) error {
 	if err := checkRepos(dir, reqs); err != nil {
 		return err
 	}
+	updateRepos(reqs, out)
 	lock, err := resolveDeps(dir, reqs)
 	if err != nil {
 		return err
@@ -2857,6 +3205,9 @@ func depBuild(dir string, out io.Writer) error {
 	if c.Lock == nil {
 		return depUpdate(dir, out)
 	}
+	if err := checkRepos(dir, c.Metadata.Dependencies); err != nil {
+		return err
+	}
 	sum, err := hashDeps(c.Metadata.Dependencies, c.Lock.Dependencies)
 	if err != nil {
 		return err
@@ -2864,31 +3215,169 @@ func depBuild(dir string, out io.Writer) error {
 	if sum != c.Lock.Digest {
 		return errors.New("the lock file (Chart.lock) is out of sync with the dependencies file (Chart.yaml). Please update the dependencies")
 	}
-	if err := checkRepos(dir, c.Metadata.Dependencies); err != nil {
-		return err
-	}
-	return fetchDeps(dir, c.Lock.Dependencies, out)
-}
-
-// checkRepos insists every file:// repository exists. Chart repositories over
-// HTTP or OCI would need `helm repo add`, which this program has no store for.
-func checkRepos(dir string, reqs []Dependency) error {
+	// Build fetches only from repositories `helm repo add` knows, and this
+	// program keeps no such list, so a locked chart repository is refused.
 	var missing []string
-	for _, d := range reqs {
-		switch {
-		case d.Repository == "":
-		case strings.HasPrefix(d.Repository, "file://"):
-			if _, err := localPath(d.Repository, dir); err != nil {
-				return err
-			}
-		default:
+	for _, d := range c.Lock.Dependencies {
+		if d.Repository != "" && !strings.HasPrefix(d.Repository, "file://") && !strings.HasPrefix(d.Repository, "oci://") {
 			missing = append(missing, d.Repository)
 		}
 	}
 	if missing != nil {
 		return fmt.Errorf("no repository definition for %s. Please add the missing repos via 'helm repo add'", strings.Join(missing, ", "))
 	}
+	return fetchDeps(dir, c.Lock.Dependencies, out)
+}
+
+// checkRepos is Helm's first pass over the dependencies: a file://
+// repository must exist, and one that is not a URL names a repository
+// `helm repo add` would have to know, which this program keeps no list of.
+func checkRepos(dir string, reqs []Dependency) error {
+	var missing []string
+	note := false
+	for _, d := range reqs {
+		r := d.Repository
+		if r == "" {
+			continue
+		}
+		if strings.HasPrefix(r, "file://") {
+			if _, err := localPath(r, dir); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := url.ParseRequestURI(r); err == nil {
+			continue
+		}
+		missing = append(missing, r)
+		if !strings.Contains(r, "//") && !strings.HasPrefix(r, "@") && !strings.HasPrefix(r, "alias:") {
+			note = true
+		}
+	}
+	if missing == nil {
+		return nil
+	}
+	msg := fmt.Sprintf("no repository definition for %s. Please add them via 'helm repo add'", strings.Join(missing, ", "))
+	if note {
+		msg += `
+Note that repositories must be URLs or aliases. For example, to refer to the "example"
+repository, use "https://charts.example.com/" or "@example" instead of
+"example". Don't forget to add the repo, too ('helm repo add').`
+	}
+	return errors.New(msg)
+}
+
+func isRemote(repo string) bool {
+	return strings.HasPrefix(repo, "http://") || strings.HasPrefix(repo, "https://")
+}
+
+// Index is a chart repository's index.yaml: every version of every chart,
+// with the URLs its archive can be fetched from.
+type Index struct {
+	APIVersion string `json:"apiVersion"`
+	Entries    map[string][]struct {
+		Version string   `json:"version"`
+		URLs    []string `json:"urls"`
+	} `json:"entries"`
+}
+
+// repoCache is where Helm keeps downloaded repository indexes.
+func repoCache() string {
+	if d := os.Getenv("HELM_REPOSITORY_CACHE"); d != "" {
+		return d
+	}
+	if d := os.Getenv("HELM_CACHE_HOME"); d != "" {
+		return filepath.Join(d, "repository")
+	}
+	d, _ := os.UserCacheDir()
+	return filepath.Join(d, "helm", "repository")
+}
+
+// managerName is the name Helm files a repository it was never told about
+// under: helm-manager- and the sha256 of its URL as written.
+func managerName(repo string) string {
+	return fmt.Sprintf("helm-manager-%x", sha256.Sum256([]byte(repo)))
+}
+
+// fetch GETs a URL, wanting 200.
+func fetch(u string) ([]byte, error) {
+	resp, err := http.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch %s : %s", u, resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// updateRepos downloads the index of each dependency's chart repository into
+// the cache. A failure is reported and passed over: resolving the dependency
+// then finds no cached index. Helm fetches them in parallel, so the lines
+// come in no fixed order, and a dependency whose name an earlier one already
+// has is skipped.
+func updateRepos(reqs []Dependency, out io.Writer) {
+	var repos []string
+	seen := map[string]bool{}
+	for _, d := range reqs {
+		if isRemote(d.Repository) && !seen[d.Name] {
+			seen[d.Name] = true
+			repos = append(repos, d.Repository)
+		}
+	}
+	if repos == nil {
+		return
+	}
+	fmt.Fprintln(out, "Getting updates for unmanaged Helm repositories...")
+	for _, r := range repos {
+		data, err := fetch(strings.TrimSuffix(r, "/") + "/index.yaml")
+		if err == nil {
+			err = parseIndex(data, &Index{})
+		}
+		if err == nil {
+			err = os.MkdirAll(repoCache(), 0o755)
+		}
+		if err == nil {
+			err = os.WriteFile(filepath.Join(repoCache(), managerName(r)+"-index.yaml"), data, 0o644)
+		}
+		if err != nil {
+			fmt.Fprintf(out, "...Unable to get an update from the %q chart repository:\n\t%s\n", r, err)
+			continue
+		}
+		fmt.Fprintf(out, "...Successfully got an update from the %q chart repository\n", r)
+	}
+}
+
+// parseIndex reads an index, newest version of each chart first.
+func parseIndex(data []byte, idx *Index) error {
+	if err := yaml.Unmarshal(data, idx); err != nil {
+		return err
+	}
+	if idx.APIVersion == "" {
+		return errors.New("no API version specified")
+	}
+	for _, vs := range idx.Entries {
+		sort.SliceStable(vs, func(i, j int) bool {
+			a, errA := semver.NewVersion(vs[i].Version)
+			b, errB := semver.NewVersion(vs[j].Version)
+			return errA == nil && (errB != nil || a.GreaterThan(b))
+		})
+	}
 	return nil
+}
+
+// cachedIndex is a repository's index as the last update saved it.
+func cachedIndex(repo string) (*Index, error) {
+	name := managerName(repo)
+	data, err := os.ReadFile(filepath.Join(repoCache(), name+"-index.yaml"))
+	if err == nil {
+		idx := &Index{}
+		if err = parseIndex(data, idx); err == nil {
+			return idx, nil
+		}
+	}
+	return nil, fmt.Errorf("no cached repository for %s found. (try 'helm repo update'): %w", name, err)
 }
 
 // localPath resolves a file:// repository against the chart's directory.
@@ -2921,6 +3410,27 @@ func resolveDeps(dir string, reqs []Dependency) (*Lock, error) {
 				return nil, err
 			}
 			locked[i] = Dependency{Name: d.Name, Version: d.Version}
+			continue
+		}
+		if isRemote(d.Repository) {
+			idx, err := cachedIndex(d.Repository)
+			if err != nil {
+				return nil, err
+			}
+			vs, ok := idx.Entries[d.Name]
+			if !ok {
+				return nil, fmt.Errorf("%s chart not found in repo %s", d.Name, d.Repository)
+			}
+			locked[i] = Dependency{Name: d.Name, Repository: d.Repository}
+			for _, e := range vs {
+				if v, err := semver.NewVersion(e.Version); err == nil && len(e.URLs) > 0 && constraint.Check(v) {
+					locked[i].Version = v.Original()
+					break
+				}
+			}
+			if locked[i].Version == "" {
+				missing = append(missing, fmt.Sprintf("%q (repository %q, version %q)", d.Name, d.Repository, d.Version))
+			}
 			continue
 		}
 		p, err := localPath(d.Repository, dir)
@@ -2980,6 +3490,14 @@ func fetchDeps(dir string, deps []Dependency, out io.Writer) error {
 	fmt.Fprintf(out, "Saving %d charts\n", len(deps))
 	local := map[string]bool{}
 	for _, d := range deps {
+		if isRemote(d.Repository) {
+			fmt.Fprintf(out, "Downloading %s from repo %s\n", d.Name, d.Repository)
+			if err := fetchRemote(d, tmp); err != nil {
+				fmt.Fprintln(out, "Save error occurred: ", err)
+				return err
+			}
+			continue
+		}
 		if d.Repository != "" {
 			if err := fetchLocal(dir, d, tmp); err != nil {
 				fmt.Fprintln(out, "Save error occurred: ", err)
@@ -3034,6 +3552,38 @@ func fetchDeps(dir string, deps []Dependency, out io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// fetchRemote downloads a locked chart into dest, named as its URL ends. A
+// relative URL in the index is relative to the repository.
+func fetchRemote(d Dependency, dest string) error {
+	idx, err := cachedIndex(d.Repository)
+	if err != nil {
+		return err
+	}
+	var ref string
+	for _, e := range idx.Entries[d.Name] {
+		if e.Version == d.Version && len(e.URLs) > 0 {
+			ref = e.URLs[0]
+			break
+		}
+	}
+	if ref == "" {
+		return fmt.Errorf("chart %s version %s not found in repo %s", d.Name, d.Version, d.Repository)
+	}
+	base, err := url.Parse(strings.TrimSuffix(d.Repository, "/") + "/")
+	if err != nil {
+		return err
+	}
+	u, err := base.Parse(ref)
+	if err != nil {
+		return err
+	}
+	data, err := fetch(u.String())
+	if err != nil {
+		return fmt.Errorf("could not download %s: %w", u, err)
+	}
+	return os.WriteFile(filepath.Join(dest, path.Base(u.Path)), data, 0o644)
 }
 
 // fetchLocal packages a file:// dependency into dest, if its chart still has
@@ -3225,44 +3775,54 @@ func loadArchive(file string) (*Chart, error) {
 			return nil, err
 		}
 	}
-	return load(tmp)
+	return loadDir(tmp, "", nil)
 }
 
-// ignoreRules reads the chart's .helmignore, if it has one.
+// ignoreRules reads the chart's .helmignore, if it has one, and appends
+// Helm's default rule: no dotfiles directly under templates/.
 func ignoreRules(dir string) ([]string, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, ".helmignore"))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	var rules []string
 	for _, l := range strings.Split(string(raw), "\n") {
-		if l = strings.TrimSpace(l); l != "" && !strings.HasPrefix(l, "#") {
-			rules = append(rules, l)
-		}
-	}
-	return rules, nil
-}
-
-// ignored applies .helmignore to a slash path: a pattern without a slash
-// matches the base name, one with a slash the whole path, and a trailing
-// slash only directories.
-// ponytail: no ! negation; add it with Helm's odd rule that a non-matching
-// negation ignores the path.
-func ignored(rules []string, rel string, isDir bool) bool {
-	for _, p := range rules {
-		dirOnly := strings.HasSuffix(p, "/")
-		p = strings.TrimSuffix(p, "/")
-		if dirOnly && !isDir {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "#") {
 			continue
 		}
+		if strings.Contains(l, "**") {
+			return nil, errors.New("double-star (**) syntax is not supported")
+		}
+		if _, err := filepath.Match(l, "abc"); err != nil {
+			return nil, err
+		}
+		rules = append(rules, l)
+	}
+	return append(rules, "templates/.?*"), nil
+}
+
+// ignored applies .helmignore to a slash path relative to the directory the
+// rules came from. A pattern starting with / or holding a slash matches the
+// whole path, any other the base name; a trailing slash means directories
+// only. A negation ignores every path it does not match, as Helm's does.
+func ignored(rules []string, rel string, isDir bool) bool {
+	for _, p := range rules {
+		negate := strings.HasPrefix(p, "!")
+		p = strings.TrimPrefix(p, "!")
+		dirOnly := strings.HasSuffix(p, "/")
+		p = strings.TrimSuffix(p, "/")
 		name := rel
 		if !strings.Contains(p, "/") {
-			name = filepath.Base(rel)
+			name = path.Base(rel)
 		}
-		if ok, _ := filepath.Match(strings.TrimPrefix(p, "/"), name); ok {
+		match, _ := filepath.Match(strings.TrimPrefix(p, "/"), name)
+		switch {
+		case negate && (dirOnly && !isDir || !match):
+			return true
+		case negate, dirOnly && !isDir:
+			continue
+		case match:
 			return true
 		}
 	}

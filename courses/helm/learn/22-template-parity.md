@@ -1,6 +1,6 @@
 ---
 title: Agree with helm
-concepts: [byte-for-byte parity, error rewording, --set syntax, .Capabilities]
+concepts: [byte-for-byte parity, error rewording, --set syntax, .Capabilities, lookup]
 ---
 
 ## Core concept
@@ -8,11 +8,14 @@ concepts: [byte-for-byte parity, error rewording, --set syntax, .Capabilities]
 Every earlier stage graded one feature. This one grades `template` the way a
 user notices a difference: run the same command through the real helm and
 your program, and stdout, stderr and the exit code must be **identical**.
-Flags go before NAME, as in every stage.
+Helm reads flags anywhere among the arguments, so from here on yours does
+too: `template rel ./chart --set a=1` is the same command as
+`template --set a=1 rel ./chart`.
 
 ```
 app template [-n NS] [-f FILE]... [--set k=v]... [--set-string k=v]...
-             [-s TEMPLATE]... [--kube-version V] NAME DIR
+             [--set-json k=JSON]... [--set-file k=FILE]...
+             [-s TEMPLATE]... [--kube-version V] [--api-versions V,...]... NAME DIR
 ```
 
 The chart the grader renders packs in the traps: chomping with `-}}` and
@@ -22,13 +25,21 @@ every kind of empty, a document that is only a comment (kept, and printed
 last because it has no kind). If your earlier stages are faithful, most of
 it already matches. What follows is what is new.
 
-**What templates can still ask.** `template` never talks to the cluster:
+**What templates can ask.** `template` never talks to the cluster; install
+and upgrade do, so the same chart can render differently:
 
-| | gives |
-|---|---|
-| `lookup "v1" "ConfigMap" NS NAME` | an empty map, `map[]`, so `if not (lookup ...)` is true |
-| `.Capabilities.KubeVersion.Version` | `v1.33.0`, the version helm was built against; `--kube-version 1.29.3` makes it `v1.29.3` |
-| `.Capabilities.APIVersions.Has "apps/v1"` | true for every group/version (and group/version/Kind) the client knows |
+| | `template` | `install`, `upgrade` |
+|---|---|---|
+| `lookup "v1" "ConfigMap" NS NAME` | `map[]`, so `if not (lookup ...)` is true | the live object, or `map[]` if there is none |
+| `lookup "v1" "ConfigMap" NS ""` | `map[]` | the list (`kind: ConfigMapList`, `items`); an empty NS lists every namespace |
+| `.Capabilities.KubeVersion.Version` | `v1.33.0`, helm's build; `--kube-version 1.29.3` makes it `v1.29.3` | the server's `gitVersion` |
+| `.Capabilities.APIVersions.Has "apps/v1"` | true for the group/versions client-go knows, plus `apiextensions.k8s.io/v1` and `v1beta1`, plus each `--api-versions` entry verbatim | true for every group/version discovery lists |
+| `.Capabilities.APIVersions.Has "apps/v1/Deployment"` | false: no kinds offline | true for every group/version/Kind discovery lists |
+
+`KubeVersion`'s `String` and `GitVersion` methods take a pointer, as Helm's
+do: `{{ .Capabilities.KubeVersion }}` prints `v1.33.0`, but
+`{{ .Capabilities.KubeVersion | quote }}` hands `quote` a copy and prints
+`"{v1.33.0 1 33}"`. Hand the templates `&caps`, not `caps`.
 
 `.Files` gains Helm's methods: `Glob PATTERN` (a `Files` of the matches),
 `.AsConfig` and `.AsSecrets` (base name to contents, as YAML; base64 for
@@ -66,8 +77,30 @@ before rendering (bad values, a schema, `-s` matching nothing) do not.
 | `x` | `failed parsing --set data: key "x" has no value` |
 | `x={a` | `failed parsing --set data: list must terminate with '}'` |
 
-`--set-string` is the same syntax with every value a string, applied after
-all the `--set` flags.
+A key may index a list, and lists grow to fit, padded with nulls:
+
+| `--set` | value |
+|---|---|
+| `a[2].b=y` | `a: [null, null, {b: y}]` |
+| `m[1][1]=z` | `m: [null, [null, z]]` |
+| `a[0]=x` then `a[1]=y` | `a: [x, y]`: later flags write into the same list |
+| `a[0]=x` then `a.b=1` | `unable to parse key: interface conversion: interface {} is []interface {}, not map[string]interface {}` |
+| `a[-1]=x` | `negative -1 index not allowed` |
+| `a[65537]=x` | `index of 65537 is greater than maximum supported index of 65536` |
+| `a[0]b=1` | `unexpected data at end of array index: ['b']` |
+
+A list given with `--set` replaces the chart's list whole; it is never
+merged index by index with the default.
+
+Three more flags share the syntax, and helm applies them in this order
+after the `-f` files, whatever order they were typed in:
+
+1. `--set-json k=JSON`: the value is JSON, so `k=[1,"a"]` is a list and
+   `k={"x":1}` a map. A bad value fails with only
+   `failed parsing --set-json data ARG`.
+2. `--set`
+3. `--set-string`: every value a string.
+4. `--set-file k=PATH`: the value is the file's contents.
 
 **Output edges.** A chart that renders only hooks prints an empty line
 first: helm prints the trimmed manifest and a newline, then the hooks. And
@@ -77,7 +110,9 @@ first: helm prints the trimmed manifest and a newline, then the hooks. And
 
 - `errors.As(err, &template.ExecError{})` tells run-time errors from the rest.
 - `semver.NewVersion` for `--kube-version`, then `"v" + v.String()`.
-- `scheme.Scheme.AllKnownTypes()` lists the group/version/kinds client-go knows.
+- `scheme.Scheme.PrioritizedVersionsAllGroups()` lists the group/versions client-go knows.
+- `discovery.ServerVersion()` and `ServerGroupsAndResources()` for install's
+  `.Capabilities`; the RESTMapper and the dynamic client for `lookup`.
 - `path.Match` for `Files.Glob`.
 
 ## Hints
@@ -100,5 +135,6 @@ unescaped comma.
 ## Further reading
 
 - [The template engine's error rewording](https://github.com/helm/helm/blob/v3.18.6/pkg/engine/engine.go)
+- [lookup](https://github.com/helm/helm/blob/v3.18.6/pkg/engine/lookup_func.go) and [capabilities](https://github.com/helm/helm/blob/v3.18.6/pkg/action/action.go)
 - [strvals, the --set parser](https://github.com/helm/helm/blob/v3.18.6/pkg/strvals/parser.go)
 - [helm template](https://helm.sh/docs/helm/helm_template/)

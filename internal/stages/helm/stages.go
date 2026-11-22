@@ -3,8 +3,9 @@
 //
 // Every stage writes a chart to a temporary directory, runs the learner's
 // built binary on it, and judges exit code, stdout and, from install onwards,
-// what the cluster holds. Flags always come before positional arguments, as
-// both Go's flag package and the real helm accept.
+// what the cluster holds. Flags come before positional arguments, as both
+// Go's flag package and the real helm accept, until template-parity, which
+// also puts them after.
 package helm
 
 import (
@@ -2375,6 +2376,15 @@ func stageListStatus(ctx context.Context, env *kube.Env, bin string) error {
 	// A release caught mid-install, which list hides unless -a.
 	if err := setStatus(ctx, env, "ls-pending", 1, "pending-install"); err != nil {
 		return err
+	}
+	// A record that does not decode, which helm's list passes over.
+	if _, err := env.Client.CoreV1().Secrets(ns).Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "sh.helm.release.v1.ls-corrupt.v1",
+			Labels: map[string]string{"owner": "helm", "name": "ls-corrupt", "status": "deployed", "version": "1"}},
+		Type: "helm.sh/release.v1",
+		Data: map[string][]byte{"release": []byte("not base64!")},
+	}, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("seed an undecodable release record: %w", err)
 	}
 
 	for _, args := range [][]string{

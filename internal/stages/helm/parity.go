@@ -3,6 +3,7 @@ package helm
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -11,8 +12,11 @@ import (
 
 // stageTemplateParity — template agrees with the real helm byte for byte,
 // stdout, stderr and exit code, on a chart full of whitespace, typing and
-// function traps, on every way a render fails, on --set's typing and syntax,
-// and on charts that render nothing but hooks. Nothing touches the cluster.
+// function traps, on every way a render fails, on --set's typing and syntax
+// (list indexes, --set-json and --set-file too), on flags placed after the
+// positional arguments, and on charts that render nothing but hooks; then
+// install and upgrade, which read .Capabilities and lookup from the cluster
+// where template never does.
 func stageTemplateParity(ctx context.Context, env *kube.Env, bin string) error {
 	w, err := newWork(ctx, env, bin)
 	if err != nil {
@@ -311,6 +315,8 @@ metadata:
 `,
 	})
 	big := w.file("big.yaml", "v: 1000000\n")
+	note := w.file("note.txt", "line1\nline2\n")
+	missing := filepath.Join(w.dir, "missing.txt")
 
 	set := func(v ...string) []string {
 		return append(append([]string{"--set", "case=set"}, v...), "-s", "templates/cm.yaml", "rel", perr)
@@ -348,13 +354,29 @@ metadata:
 		{"--set", "case=json", "--set", "x", "rel", perr},
 		{"rel", phook},
 		{"-s", "templates/hook.yaml", "rel", phook},
+		// List indexes, JSON and file values, applied in helm's order.
+		{"--set", "case=json", "--set", "a[2].b=y,a[0]=x,a[2].c[1]=z", "--set", "m[1][1]=1", "--set", "m[0]={1,2}", "rel", perr},
+		{"--set", "case=json", "--set", "a[1]=y", "--set", "a[0]=x", "--set", "a[3]", "--set", "b[0]=1,b[0]=2", "rel", perr},
+		{"--set", "case=json", "--set-json", `j={"x":[1,2],"y":null,"z":1.5},k=[1,"a"]`, "--set-json", "l[1]=true", "--set", "j.w=2", "rel", perr},
+		{"--set", "case=json,o=set,p=set", "--set-json", "o=1", "--set-string", "p=str", "--set-file", "p=" + note, "rel", perr},
+		{"--set", "case=json", "--set-file", "f=" + note + ",g[1]=" + note, "rel", perr},
+		{"--set", "case=json", "--set", "a[0]=x", "--set", "a.b=1", "rel", perr},
+		{"--set", "case=json", "--set", "a[-1]=x", "rel", perr},
+		{"--set", "case=json", "--set", "a[0]b=1", "rel", perr},
+		{"--set", "case=json", "--set", "a[x]=1", "rel", perr},
+		{"--set", "case=json", "--set", "a[65537]=1", "rel", perr},
+		{"--set", "case=json", "--set-json", "j={x", "rel", perr},
+		{"--set", "case=json", "--set-file", "f=" + missing, "rel", perr},
+		// Flags anywhere among the arguments, and -- to end them.
+		{"rel", "--set", "case=json", perr, "--set", "a[0]=1", "-n", "after"},
+		{"--set", "case=json", "--", "rel", perr},
 	}
 	for _, c := range cases {
 		if err := sameTemplate(w, append([]string{"template"}, c...)); err != nil {
 			return err
 		}
 	}
-	return nil
+	return liveRender(ctx, env, w)
 }
 
 // sameTemplate runs one command on both and wants the same exit code, stdout
