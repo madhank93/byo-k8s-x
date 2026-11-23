@@ -41,9 +41,9 @@ entries:
 
   - slug: runtime
     name: Build your own container runtime
-    status: planned
+    status: shipped
     tier: the node plane
-    blurb: Image layers, namespaces, cgroups, and the CRI a kubelet can drive.
+    blurb: Registry pulls, image layers, overlayfs, and mount and pid namespaces.
 
   - slug: kubelet
     name: Build your own kubelet

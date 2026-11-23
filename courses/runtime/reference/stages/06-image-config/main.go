@@ -1,3 +1,5 @@
+//go:build linux
+
 // A container runtime: pull an image from a registry, turn its layers into a
 // root filesystem, and run its process in namespaces of its own.
 //
