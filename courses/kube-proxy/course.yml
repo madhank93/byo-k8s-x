@@ -24,9 +24,6 @@ stages:
   - slug: named-ports
     name: The port a pod calls by name
     difficulty: medium
-  - slug: endpoint-changes
-    name: Follow the pods as they come and go
-    difficulty: easy
   - slug: no-endpoints
     name: Refuse, do not hang
     difficulty: medium

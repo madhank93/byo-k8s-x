@@ -214,11 +214,12 @@ const graderManager = "byok8s-grader"
 // backendScript serves the same answer over HTTP on 8080 and 8081 and over
 // UDP on 9000: the pod's name, the address the request came from, and the
 // port it arrived on. Those three are everything a stage judges a proxy by.
-const backendScript = `mkdir -p /www/cgi-bin
-printf '#!/bin/sh\necho Content-Type: text/plain\necho\necho "$(hostname) $REMOTE_ADDR $SERVER_PORT"\n' > /www/cgi-bin/id
-chmod +x /www/cgi-bin/id
-httpd -p 8080 -h /www
-httpd -p 8081 -h /www
+const backendScript = `for port in 8080 8081; do
+  mkdir -p /www$port/cgi-bin
+  printf '#!/bin/sh\necho Content-Type: text/plain\necho\necho "$(hostname) $REMOTE_ADDR %s"\n' $port > /www$port/cgi-bin/id
+  chmod +x /www$port/cgi-bin/id
+  httpd -p $port -h /www$port
+done
 while true; do nc -u -l -p 9000 -e hostname; done`
 
 // backend is a pod answering on 8080, 8081 and udp/9000, pinned to a node
@@ -257,6 +258,39 @@ func client(name, nodeName string, hostNetwork bool) *corev1.Pod {
 			}},
 		},
 	}
+}
+
+// gated makes a backend Ready only once /tmp/ready exists in it, so a stage
+// can hold it serving but not ready, then let it in.
+func gated(pod *corev1.Pod) *corev1.Pod {
+	pod.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+		ProbeHandler:  corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"test", "-f", "/tmp/ready"}}},
+		PeriodSeconds: 1,
+	}
+	return pod
+}
+
+// started makes a pod and waits for its container to be running, ready or
+// not.
+func (f fixture) started(ctx context.Context, pod *corev1.Pod) (*corev1.Pod, error) {
+	if _, err := f.env.Client.CoreV1().Pods(f.env.Namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return nil, fmt.Errorf("create pod %s: %w", pod.Name, err)
+	}
+	var out *corev1.Pod
+	err := waitFor(ctx, "pod "+pod.Name+" to start", 90*time.Second, func(ctx context.Context) (bool, error) {
+		p, err := f.pod(ctx, pod.Name)
+		if err != nil {
+			return false, nil
+		}
+		out = p
+		for _, c := range p.Status.ContainerStatuses {
+			if c.State.Running != nil && p.Status.PodIP != "" {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	return out, err
 }
 
 // create makes pods and waits for every one of them to be Ready.
@@ -452,7 +486,13 @@ func (f fixture) tally(ctx context.Context, from, script string, n int) (answers
 		return a, fmt.Errorf("run requests in pod %s: %w\n%s", from, err, out)
 	}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		line = strings.TrimSpace(line)
+		// An exec stream can carry stray control bytes; they are not output.
+		line = strings.TrimSpace(strings.Map(func(r rune) rune {
+			if r < ' ' && r != '\t' {
+				return -1
+			}
+			return r
+		}, line))
 		switch {
 		case line == "":
 		case line == "FAIL":
@@ -471,6 +511,15 @@ func (f fixture) tally(ctx context.Context, from, script string, n int) (answers
 				a.port[fields[0]] = fields[2]
 			}
 		}
+	}
+	// Every request ends in an answer or FAIL; fewer means the exec stream
+	// lost output, which says nothing about the proxy.
+	got := a.failed
+	for _, c := range a.by {
+		got += c
+	}
+	if got != n {
+		return a, fmt.Errorf("pod %s reported %d of %d requests:\n%s", from, got, n, tail(out))
 	}
 	return a, nil
 }

@@ -133,15 +133,20 @@ func (p *proxier) sync() error {
 			return err
 		}
 		var ips []string
-		for _, e := range eps {
-			ips = append(ips, e.ip)
+		for _, list := range eps {
+			for _, e := range list {
+				if !slices.Contains(ips, e.ip) {
+					ips = append(ips, e.ip)
+				}
+			}
 		}
+		sort.Strings(ips)
 		if joined := strings.Join(ips, ","); p.reportedE[key(s)] != joined {
 			p.reportedE[key(s)] = joined
 			fmt.Printf("endpoints %s %s\n", key(s), joined)
 		}
 		for _, sp := range s.Spec.Ports {
-			ports = append(ports, servicePort{svc: s, port: sp, endpoints: eps})
+			ports = append(ports, servicePort{svc: s, port: sp, endpoints: eps[sp.Name]})
 		}
 	}
 	return p.apply(render(ports))
@@ -158,6 +163,12 @@ type servicePort struct {
 // are DNS labels, and nft accepts '/' and '.' in a chain name.
 func (sp servicePort) chain() string {
 	return fmt.Sprintf("svc-%s/%s/%d", key(sp.svc), proto(sp.port.Protocol), sp.port.Port)
+}
+
+// endpointChain names the chain that sends a service port's traffic to one
+// endpoint.
+func (sp servicePort) endpointChain(ep endpoint) string {
+	return fmt.Sprintf("ep-%s/%s/%d/%s", key(sp.svc), proto(sp.port.Protocol), sp.port.Port, ep.ip)
 }
 
 func proto(p corev1.Protocol) string { return strings.ToLower(string(p)) }
@@ -186,19 +197,51 @@ func render(ports []servicePort) string {
 	chain services {
 		ip daddr . meta l4proto . th dport vmap @service-ips
 	}
+	map no-endpoint-services {
+		type ipv4_addr . inet_proto . inet_service : verdict
+	}
+	chain filter-forward {
+		type filter hook forward priority filter; policy accept;
+		jump no-endpoints
+	}
+	chain filter-output {
+		type filter hook output priority filter; policy accept;
+		jump no-endpoints
+	}
+	chain no-endpoints {
+		ip daddr . meta l4proto . th dport vmap @no-endpoint-services
+	}
+	chain reject-chain {
+		reject
+	}
 `)
 	for _, sp := range ports {
 		if len(sp.endpoints) == 0 {
 			continue
 		}
-		ep := sp.endpoints[0]
+		// numgen picks an endpoint per new connection; conntrack keeps the
+		// rest of the connection on it.
+		var picks []string
+		for i, ep := range sp.endpoints {
+			picks = append(picks, fmt.Sprintf("%d : goto %s", i, sp.endpointChain(ep)))
+		}
 		fmt.Fprintf(&b, "\tchain %s {\n", sp.chain())
-		fmt.Fprintf(&b, "\t\tmeta l4proto %s dnat to %s:%d\n", proto(sp.port.Protocol), ep.ip, sp.port.TargetPort.IntValue())
+		fmt.Fprintf(&b, "\t\tnumgen random mod %d vmap { %s }\n", len(sp.endpoints), strings.Join(picks, ", "))
 		b.WriteString("\t}\n")
+		for _, ep := range sp.endpoints {
+			fmt.Fprintf(&b, "\tchain %s {\n", sp.endpointChain(ep))
+			fmt.Fprintf(&b, "\t\tmeta l4proto %s dnat to %s:%d\n", proto(sp.port.Protocol), ep.ip, ep.port)
+			b.WriteString("\t}\n")
+		}
 	}
 	b.WriteString("}\n")
 	for _, sp := range ports {
+		// A cluster IP with nothing behind it is not DNATed, so its packets
+		// reach the filter hooks with the address unchanged and are refused
+		// there, instead of being routed out of the node to time out.
 		if len(sp.endpoints) == 0 {
+			fmt.Fprintf(&b, "add element ip %s no-endpoint-services { %s . %s . %d : goto reject-chain }\n",
+				table, sp.svc.Spec.ClusterIP, proto(sp.port.Protocol), sp.port.Port)
 			continue
 		}
 		fmt.Fprintf(&b, "add element ip %s service-ips { %s . %s . %d : goto %s }\n",
@@ -216,37 +259,52 @@ func (p *proxier) apply(ruleset string) error {
 	return nil
 }
 
-// endpoint is one ready address behind a Service.
+// endpoint is one ready address behind a service port, and the port number
+// that pod gives it. A targetPort can be a name, and each pod may give the
+// name a different number; the slice records each pod's.
 type endpoint struct {
-	ip string
+	ip   string
+	port int32
 }
 
-// endpoints joins every EndpointSlice of a Service into one sorted list. A
-// Service with many pods has many slices, and an address can briefly appear
-// in two of them while the controller moves it.
-func (p *proxier) endpoints(s *corev1.Service) ([]endpoint, error) {
+// endpoints joins every EndpointSlice of a Service into one sorted list per
+// service port, keyed by port name. A Service with many pods has many
+// slices, pods that number a named port differently land in different ones,
+// and an address can briefly appear in two while the controller moves it.
+func (p *proxier) endpoints(s *corev1.Service) (map[string][]endpoint, error) {
 	sel := labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: s.Name})
 	list, err := p.slices.EndpointSlices(s.Namespace).List(sel)
 	if err != nil {
 		return nil, err
 	}
-	var out []endpoint
+	out := map[string][]endpoint{}
 	for _, sl := range list {
 		if sl.AddressType != discoveryv1.AddressTypeIPv4 {
 			continue
 		}
-		for _, e := range sl.Endpoints {
-			// A nil condition means ready: the field is newer than the API.
-			if e.Conditions.Ready != nil && !*e.Conditions.Ready {
+		for _, port := range sl.Ports {
+			if port.Port == nil {
 				continue
 			}
-			ep := endpoint{ip: e.Addresses[0]}
-			if !slices.Contains(out, ep) {
-				out = append(out, ep)
+			name := ""
+			if port.Name != nil {
+				name = *port.Name
+			}
+			for _, e := range sl.Endpoints {
+				// A nil condition means ready: the field is newer than the API.
+				if e.Conditions.Ready != nil && !*e.Conditions.Ready {
+					continue
+				}
+				ep := endpoint{ip: e.Addresses[0], port: *port.Port}
+				if !slices.Contains(out[name], ep) {
+					out[name] = append(out[name], ep)
+				}
 			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ip < out[j].ip })
+	for _, eps := range out {
+		sort.Slice(eps, func(i, j int) bool { return eps[i].ip < eps[j].ip })
+	}
 	return out, nil
 }
 
