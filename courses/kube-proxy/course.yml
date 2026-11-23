@@ -1,0 +1,68 @@
+slug: kube-proxy
+name: Build your own kube-proxy
+language: go
+entrypoint: main.go
+# The program runs inside one worker and the stages send traffic across the
+# others: a client on one node, the proxy on a second, a backend on a third.
+workers: 3
+stages:
+  - slug: watch-services
+    name: The Services that are yours
+    difficulty: easy
+  - slug: watch-endpointslices
+    name: Where each Service's pods are
+    difficulty: medium
+  - slug: nft-table
+    name: A table of your own
+    difficulty: medium
+  - slug: clusterip
+    name: An address with nothing behind it
+    difficulty: medium
+  - slug: load-balance
+    name: More than one backend
+    difficulty: medium
+  - slug: named-ports
+    name: The port a pod calls by name
+    difficulty: medium
+  - slug: endpoint-changes
+    name: Follow the pods as they come and go
+    difficulty: easy
+  - slug: no-endpoints
+    name: Refuse, do not hang
+    difficulty: medium
+  - slug: nodeport
+    name: A port on every node
+    difficulty: medium
+  - slug: masquerade
+    name: Replies that find their way back
+    difficulty: hard
+  - slug: session-affinity
+    name: The same client, the same pod
+    difficulty: medium
+  - slug: terminating-endpoints
+    name: Still serving on the way out
+    difficulty: medium
+  - slug: internal-traffic-policy
+    name: Stay on this node
+    difficulty: medium
+  - slug: external-traffic-policy
+    name: Keep the client's address
+    difficulty: hard
+  - slug: loadbalancer
+    name: An address from outside the cluster
+    difficulty: easy
+  - slug: health-check-node-port
+    name: Tell the load balancer where to send
+    difficulty: medium
+  - slug: udp
+    name: Datagrams and stale connections
+    difficulty: hard
+  - slug: partial-sync
+    name: Change only what changed
+    difficulty: hard
+  - slug: cleanup
+    name: Leave the node as you found it
+    difficulty: easy
+  - slug: kube-proxy-parity
+    name: Side by side with the real one
+    difficulty: medium

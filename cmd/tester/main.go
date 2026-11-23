@@ -28,6 +28,7 @@ import (
 	apiserverstages "github.com/madhank93/byo-k8s-x/internal/stages/apiserver"
 	controllerstages "github.com/madhank93/byo-k8s-x/internal/stages/controller"
 	helmstages "github.com/madhank93/byo-k8s-x/internal/stages/helm"
+	kubeproxystages "github.com/madhank93/byo-k8s-x/internal/stages/kube-proxy"
 	kubectlstages "github.com/madhank93/byo-k8s-x/internal/stages/kubectl"
 	kustomizestages "github.com/madhank93/byo-k8s-x/internal/stages/kustomize"
 	runtimestages "github.com/madhank93/byo-k8s-x/internal/stages/runtime"
@@ -57,6 +58,7 @@ var courses = map[string]course{
 	"apiserver":  {lookup: apiserverstages.Lookup},
 	"safe-apply": {lookup: safeapplystages.Lookup, cluster: true},
 	"helm":       {lookup: helmstages.Lookup, cluster: true},
+	"kube-proxy": {lookup: kubeproxystages.Lookup, cluster: true, node: true},
 	"kustomize":  {lookup: kustomizestages.Lookup},
 	"runtime":    {lookup: runtimestages.Lookup, node: true},
 }
