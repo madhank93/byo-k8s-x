@@ -59,6 +59,8 @@ func main() {
 		err = cmdConfig(args)
 	case "run":
 		err = cmdRun(args)
+	case "init":
+		err = cmdInit(args)
 	default:
 		err = fmt.Errorf("unknown command %q", cmd)
 	}
@@ -254,28 +256,62 @@ func cmdRun(args []string) error {
 
 // runContainer runs the process in a fresh rootfs for the image, waits for it,
 // removes the container, and returns the process's exit code.
+//
+// The process is started by this program re-executed as `init` in new
+// namespaces: setting up the container's view takes system calls made from
+// inside them, after the clone and before the image's program replaces init.
 func runContainer(root string, m manifest, id string, p process) (int, error) {
 	defer removeContainer(root, id)
-	rootfs, err := mountRootfs(root, m, id)
+	rootfs, opts, err := prepareRootfs(root, m, id)
 	if err != nil {
 		return 0, err
 	}
-	// Path, Dir and every lookup the process makes resolve inside the chroot.
-	cmd := &exec.Cmd{
-		Path:        p.args[0],
-		Args:        p.args,
-		Env:         p.env,
-		Dir:         p.cwd,
-		Stdin:       os.Stdin,
-		Stdout:      os.Stdout,
-		Stderr:      os.Stderr,
-		SysProcAttr: &syscall.SysProcAttr{Chroot: rootfs},
+	spec, err := json.Marshal(initSpec{Rootfs: rootfs, Overlay: opts, Args: p.args, Env: p.env, Cwd: p.cwd})
+	if err != nil {
+		return 0, err
 	}
+	cmd := exec.Command("/proc/self/exe", "init", string(spec))
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
 	err = cmd.Run()
 	if exit, ok := err.(*exec.ExitError); ok {
 		return exit.ExitCode(), nil
 	}
 	return 0, err
+}
+
+// initSpec is what `init` needs to finish building the container and exec
+// its process.
+type initSpec struct {
+	Rootfs, Overlay string
+	Args, Env       []string
+	Cwd             string
+}
+
+// cmdInit runs inside the container's new namespaces and becomes its process.
+func cmdInit(args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: init SPEC")
+	}
+	var s initSpec
+	if err := json.Unmarshal([]byte(args[0]), &s); err != nil {
+		return err
+	}
+	// The new mount namespace is a copy of the node's, and on a node with
+	// shared propagation its mounts would still appear there. Privatize first.
+	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
+		return fmt.Errorf("make / private: %w", err)
+	}
+	if err := syscall.Mount("overlay", s.Rootfs, "overlay", 0, s.Overlay); err != nil {
+		return fmt.Errorf("mount overlay at %s: %w", s.Rootfs, err)
+	}
+	if err := syscall.Chroot(s.Rootfs); err != nil {
+		return err
+	}
+	if err := syscall.Chdir(s.Cwd); err != nil {
+		return err
+	}
+	return syscall.Exec(s.Args[0], s.Args, s.Env)
 }
 
 // process is what a container runs: its argv, working directory and
@@ -337,16 +373,29 @@ func containerDir(root, id string) string {
 	return filepath.Join(root, "containers", filepath.Base(id))
 }
 
-// mountRootfs makes sure each of the image's layers is extracted in its own
-// directory, and mounts an overlay of them under the container's directory
-// with a writable layer of its own on top. It returns the mount point.
+// mountRootfs mounts the container's rootfs and returns the mount point.
 func mountRootfs(root string, m manifest, id string) (string, error) {
+	rootfs, opts, err := prepareRootfs(root, m, id)
+	if err != nil {
+		return "", err
+	}
+	if err := syscall.Mount("overlay", rootfs, "overlay", 0, opts); err != nil {
+		return "", fmt.Errorf("mount overlay at %s: %w", rootfs, err)
+	}
+	return rootfs, nil
+}
+
+// prepareRootfs makes sure each of the image's layers is extracted in its own
+// directory, and lays out the container's directory: a writable layer of its
+// own, overlayfs's workdir, and the mount point. It returns the mount point
+// and the overlay options that stack the layers there.
+func prepareRootfs(root string, m manifest, id string) (string, string, error) {
 	// overlayfs lists lowerdirs top first; the manifest lists layers bottom first.
 	lower := make([]string, len(m.Layers))
 	for i, l := range m.Layers {
 		dir, err := layerDir(root, l.Digest)
 		if err != nil {
-			return "", fmt.Errorf("layer %s: %w", l.Digest, err)
+			return "", "", fmt.Errorf("layer %s: %w", l.Digest, err)
 		}
 		lower[len(m.Layers)-1-i] = dir
 	}
@@ -354,14 +403,10 @@ func mountRootfs(root string, m manifest, id string) (string, error) {
 	upper, work, rootfs := filepath.Join(c, "upper"), filepath.Join(c, "work"), filepath.Join(c, "rootfs")
 	for _, d := range []string{upper, work, rootfs} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(lower, ":"), upper, work)
-	if err := syscall.Mount("overlay", rootfs, "overlay", 0, opts); err != nil {
-		return "", fmt.Errorf("mount overlay at %s: %w", rootfs, err)
-	}
-	return rootfs, nil
+	return rootfs, fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(lower, ":"), upper, work), nil
 }
 
 // removeContainer unmounts a container's rootfs and deletes its directory,

@@ -1025,14 +1025,16 @@ func stageMountNS(ctx context.Context, _ *kube.Env, bin string) error {
 	if err != nil {
 		return err
 	}
-	nodeNS, err := w.sh(`readlink /proc/1/ns/mnt`)
+	// Read from the node's side: until stage pivot-root there is no /proc
+	// inside the container for the probe to read its own namespace from.
+	ns, err := w.sh(fmt.Sprintf(`readlink /proc/1/ns/mnt /proc/%s/ns/mnt`, c.pid))
 	if err != nil {
 		w.stop(c)
 		return err
 	}
-	if c.report.mntns == "" || c.report.mntns == strings.TrimSpace(nodeNS) {
+	if f := strings.Fields(ns); len(f) != 2 || f[0] == f[1] {
 		w.stop(c)
-		return fmt.Errorf("the container is in the node's mount namespace (%s); start it with CLONE_NEWNS", c.report.mntns)
+		return fmt.Errorf("the container is in the node's mount namespace (%s); start it with CLONE_NEWNS", strings.Join(f, " vs "))
 	}
 	leaked, err := w.mountsUnder()
 	if err != nil {
