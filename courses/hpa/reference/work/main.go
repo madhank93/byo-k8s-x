@@ -3,24 +3,37 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	certutil "k8s.io/client-go/util/cert"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: app summary|scrape <node> | app pods")
+		fmt.Fprintln(os.Stderr, "usage: app summary|scrape <node> | app pods | app serve --port P --external-host H")
 		os.Exit(2)
 	}
 	loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
@@ -57,6 +70,14 @@ func main() {
 				fmt.Printf("%s %dm %d\n", pod, pods[k].cpuMilli, pods[k].mem)
 			}
 		}
+	case "serve":
+		fs := flag.NewFlagSet("serve", flag.ExitOnError)
+		port := fs.Int("port", 6443, "port to listen on")
+		host := fs.String("external-host", "host.docker.internal", "the name the cluster reaches this machine by")
+		fs.Parse(os.Args[2:])
+		ns, _, err := loader.Namespace()
+		check(err)
+		check(serve(cs, cfg, ns, *port, *host))
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		os.Exit(2)
@@ -221,6 +242,125 @@ func byPod(containers map[string]usage) map[string]usage {
 		pods[pod] = p
 	}
 	return pods
+}
+
+const (
+	group       = "metrics.k8s.io"
+	version     = "v1beta1"
+	serviceName = "byok8s-metrics"
+)
+
+var apiServiceName = version + "." + group
+
+// serve answers metrics.k8s.io over TLS and registers it with the API
+// server's aggregator for as long as it runs.
+func serve(cs *kubernetes.Clientset, cfg *rest.Config, ns string, port int, host string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	// The aggregator dials the Service and checks the certificate against
+	// the Service's DNS name, so that is the name the certificate carries.
+	certPEM, keyPEM, err := certutil.GenerateSelfSignedCertKey(host, nil, []string{serviceName + "." + ns + ".svc"})
+	if err != nil {
+		return err
+	}
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return err
+	}
+	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{Handler: routes(), TLSConfig: &tls.Config{Certificates: []tls.Certificate{pair}}}
+	go srv.ServeTLS(l, "", "")
+
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if err := register(ctx, cs, dyn, ns, port, host, certPEM); err != nil {
+		unregister(cs, dyn, ns)
+		return err
+	}
+	fmt.Printf("serving %s on :%d\n", apiServiceName, port)
+	<-ctx.Done()
+
+	// An APIService with nothing behind it fails discovery for every client
+	// on the cluster, so it goes before the server does.
+	unregister(cs, dyn, ns)
+	return srv.Close()
+}
+
+var apiServicesGVR = schema.GroupVersionResource{Group: "apiregistration.k8s.io", Version: "v1", Resource: "apiservices"}
+
+// register points the aggregator at this process: an ExternalName Service
+// naming this machine, and an APIService trusting this certificate.
+func register(ctx context.Context, cs *kubernetes.Clientset, dyn dynamic.Interface, ns string, port int, host string, ca []byte) error {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: serviceName},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeExternalName, ExternalName: host,
+			Ports: []corev1.ServicePort{{Port: int32(port)}}},
+	}
+	cs.CoreV1().Services(ns).Delete(ctx, serviceName, metav1.DeleteOptions{})
+	if _, err := cs.CoreV1().Services(ns).Create(ctx, svc, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create service: %w", err)
+	}
+	as := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiregistration.k8s.io/v1", "kind": "APIService",
+		"metadata": map[string]any{"name": apiServiceName},
+		"spec": map[string]any{
+			"group": group, "version": version, "groupPriorityMinimum": int64(100), "versionPriority": int64(100),
+			"caBundle": base64.StdEncoding.EncodeToString(ca),
+			"service":  map[string]any{"namespace": ns, "name": serviceName, "port": int64(port)},
+		},
+	}}
+	_, err := dyn.Resource(apiServicesGVR).Create(ctx, as, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		var old *unstructured.Unstructured
+		if old, err = dyn.Resource(apiServicesGVR).Get(ctx, apiServiceName, metav1.GetOptions{}); err == nil {
+			as.SetResourceVersion(old.GetResourceVersion())
+			_, err = dyn.Resource(apiServicesGVR).Update(ctx, as, metav1.UpdateOptions{})
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("register %s: %w", apiServiceName, err)
+	}
+	return nil
+}
+
+func unregister(cs *kubernetes.Clientset, dyn dynamic.Interface, ns string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := dyn.Resource(apiServicesGVR).Delete(ctx, apiServiceName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		fmt.Fprintln(os.Stderr, "unregister:", err)
+	}
+	cs.CoreV1().Services(ns).Delete(ctx, serviceName, metav1.DeleteOptions{})
+}
+
+// routes serves discovery: the aggregator asks for the group version's
+// resource list to decide the API is Available, and clients ask the same
+// question through the API server.
+func routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /apis/"+group+"/"+version, func(w http.ResponseWriter, r *http.Request) {
+		verbs := []string{"get", "list"}
+		writeJSON(w, http.StatusOK, metav1.APIResourceList{
+			TypeMeta:     metav1.TypeMeta{Kind: "APIResourceList", APIVersion: "v1"},
+			GroupVersion: group + "/" + version,
+			APIResources: []metav1.APIResource{
+				{Name: "pods", Kind: "PodMetrics", Namespaced: true, Verbs: verbs},
+				{Name: "nodes", Kind: "NodeMetrics", Namespaced: false, Verbs: verbs},
+			},
+		})
+	})
+	return mux
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
 }
 
 func nodeNames(ctx context.Context, cs *kubernetes.Clientset) ([]string, error) {
