@@ -55,6 +55,8 @@ func init() {
 	register(Stage{Slug: "name-references", Run: stageNameReferences})
 	register(Stage{Slug: "strategic-merge-patch", Run: stageStrategicMergePatch})
 	register(Stage{Slug: "json6902-patch", Run: stageJSON6902Patch})
+	register(Stage{Slug: "patch-targets", Run: stagePatchTargets})
+	register(Stage{Slug: "overlays", Run: stageOverlays})
 }
 
 // tree is a kustomization directory as slash paths to contents.
@@ -1546,6 +1548,218 @@ func stageJSON6902Patch(ctx context.Context, _ *kube.Env, bin string) error {
 		{"a JSON patch has no name of its own to match, so it needs a target", ".", tree{
 			"kustomization.yaml": "resources: [app.yaml]\npatches:\n- patch: '[{\"op\": \"remove\", \"path\": \"/spec\"}]'\n", "app.yaml": app,
 		}},
+	})
+}
+
+// fleet is several resources sharing names, kinds and labels in different
+// combinations, for telling target selectors apart.
+const fleet = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    tier: front
+  annotations:
+    team: shop
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-canary
+  labels:
+    tier: front
+    canary: "true"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+  labels:
+    tier: back
+  annotations:
+    team: data
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jobs
+  namespace: batch
+---
+apiVersion: example.com/v1beta1
+kind: Deployment
+metadata:
+  name: web
+`
+
+// stagePatchTargets — a target is a set of filters: anchored regular
+// expressions on group, version, kind, name and namespace, and label and
+// annotation selectors. One patch, strategic or JSON, applies to every
+// resource the target selects.
+func stagePatchTargets(ctx context.Context, _ *kube.Env, bin string) error {
+	mark := func(target, key string) string {
+		return "- target:\n    " + strings.ReplaceAll(target, "\n", "\n    ") + "\n  patch: '[{\"op\": \"add\", \"path\": \"/metadata/annotations/" + key + "\", \"value\": \"hit\"}]'\n"
+	}
+	return runChecks(ctx, bin, []check{
+		{"each filter is a regular expression matched against the whole field: web is not web-canary, Deploy is not Deployment, but web.* and Deployment|StatefulSet are what they look like; version v1 matches apps/v1 and v1 alike", ".", tree{
+			"kustomization.yaml": "resources: [fleet.yaml]\npatches:\n" +
+				mark("name: web", "exact") + mark("name: web.*\ngroup: apps", "prefix") + mark("kind: Deploy", "partial") +
+				mark("kind: Deployment|StatefulSet", "either") + mark("version: v1", "v1") + mark("group: example.com", "group") +
+				mark("namespace: bat.*", "ns"),
+			"fleet.yaml": fleet,
+		}},
+		{"labelSelector and annotationSelector take Kubernetes selector syntax: =, ==, !=, in, notin, a bare key and !key, joined by commas", ".", tree{
+			"kustomization.yaml": "resources: [fleet.yaml]\npatches:\n" +
+				mark("labelSelector: tier=front", "eq") + mark("labelSelector: tier==front,canary!=true", "ne") +
+				mark("labelSelector: tier in (front, back)", "in") + mark("labelSelector: tier notin (front)", "notin") +
+				mark("labelSelector: canary", "has") + mark("labelSelector: '!tier'", "hasnot") +
+				mark("annotationSelector: team=data", "ann") + mark("kind: Deployment\nlabelSelector: tier", "both"),
+			"fleet.yaml": fleet,
+		}},
+		{"a strategic merge patch with a target applies to every resource it selects; the patch's own kind and name are ignored, and each resource keeps its own", ".", tree{
+			"kustomization.yaml": "resources: [fleet.yaml]\npatches:\n- target:\n    group: apps\n    labelSelector: tier\n  patch: |-\n    kind: Anything\n    metadata:\n      name: anything\n      labels:\n        patched: \"yes\"\n    spec:\n      replicas: 2\n",
+			"fleet.yaml":         fleet,
+		}},
+		{"$patch: delete with a target deletes every resource selected", ".", tree{
+			"kustomization.yaml": "resources: [fleet.yaml]\npatches:\n- target:\n    name: web\n  patch: |-\n    kind: Gone\n    metadata:\n      name: gone\n    $patch: delete\n",
+			"fleet.yaml":         fleet,
+		}},
+		{"a target can name a base's resource by its name before the base's prefix", "overlay", tree{
+			"base/kustomization.yaml":    "namePrefix: base-\nresources: [fleet.yaml]\n",
+			"base/fleet.yaml":            fleet,
+			"overlay/kustomization.yaml": "resources: [../base]\npatches:\n" + mark("name: db", "first") + mark("name: base-db", "current"),
+		}},
+		{"one patches entry with a target may hold one strategic merge patch, not two", ".", tree{
+			"kustomization.yaml": "resources: [fleet.yaml]\npatches:\n- target:\n    kind: StatefulSet\n  patch: |-\n    kind: A\n    metadata:\n      name: a\n    ---\n    kind: B\n    metadata:\n      name: b\n",
+			"fleet.yaml":         fleet,
+		}},
+		{"a label selector that does not parse", ".", tree{
+			"kustomization.yaml": "resources: [fleet.yaml]\npatches:\n" + mark("labelSelector: tier in front", "bad"),
+			"fleet.yaml":         fleet,
+		}},
+	})
+}
+
+// shopBase is a small application as a base: a Deployment wired to a
+// generated ConfigMap and Secret, and the Service in front of it.
+var shopBase = tree{
+	"base/kustomization.yaml": `labels:
+- pairs:
+    app: shop
+  includeSelectors: true
+resources: [deployment.yaml, service.yaml]
+configMapGenerator:
+- name: settings
+  literals: [mode=fast, level=1]
+  options:
+    labels:
+      from: base
+secretGenerator:
+- name: credentials
+  literals: [user=shop]
+`,
+	"base/deployment.yaml": `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: web
+        image: shop/web:1.0
+        envFrom:
+        - configMapRef:
+            name: settings
+        - secretRef:
+            name: credentials
+`,
+	"base/service.yaml": `apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  ports:
+  - port: 80
+`,
+}
+
+// stageOverlays — an overlay is a kustomization whose resources include a
+// base. Everything the overlay does applies on top of the base's finished
+// output, and a generator can merge into or replace what the base generated.
+func stageOverlays(ctx context.Context, _ *kube.Env, bin string) error {
+	prod := `namespace: prod
+namePrefix: prod-
+labels:
+- pairs:
+    env: prod
+resources: [../base]
+replicas:
+- name: web
+  count: 3
+images:
+- name: shop/web
+  newTag: "2.0"
+patches:
+- patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: web
+    spec:
+      template:
+        spec:
+          containers:
+          - name: web
+            resources:
+              limits:
+                memory: 512Mi
+configMapGenerator:
+- name: settings
+  behavior: merge
+  literals: [level=3, region=eu]
+  options:
+    labels:
+      from: prod
+    annotations:
+      tuned: "true"
+`
+	return runChecks(ctx, bin, []check{
+		{"prod overlays the base: its namespace, prefix, labels, replica count, image tag and patch all land on the base's resources; its ConfigMap generator merges into the base's settings, and the Deployment follows the merged ConfigMap's new hash", "prod", shopBase.with(tree{
+			"prod/kustomization.yaml": prod,
+		})},
+		{"behavior: replace swaps the generated data whole but keeps the base's labels; a Secret generator merges, and its type is the overlay's", "dev", shopBase.with(tree{
+			"dev/kustomization.yaml": "resources: [../base]\nconfigMapGenerator:\n- name: settings\n  behavior: replace\n  literals: [debug=true]\nsecretGenerator:\n- name: credentials\n  behavior: merge\n  type: kubernetes.io/basic-auth\n  literals: [password=dev]\n",
+		})},
+		{"bases, the older field, lists bases just as resources does", "dev", shopBase.with(tree{
+			"dev/kustomization.yaml": "bases: [../base]\nnameSuffix: -dev\n",
+		})},
+		{"overlays stack: top builds on mid, which builds on base; prefixes compose, and a generator two levels up still finds settings by the name the base gave it", "top", shopBase.with(tree{
+			"mid/kustomization.yaml": "namePrefix: mid-\nresources: [../base]\ncommonAnnotations:\n  layer: mid\n",
+			"top/kustomization.yaml": "namePrefix: top-\nresources: [../mid]\nconfigMapGenerator:\n- name: settings\n  behavior: merge\n  literals: [layer=top]\n",
+		})},
+		{"one kustomization can hold two overlays of the same base, each built separately, so long as they end up with different names or namespaces", "all", shopBase.with(tree{
+			"prod/kustomization.yaml": prod,
+			"dev/kustomization.yaml":  "namespace: dev\nresources: [../base]\n",
+			"all/kustomization.yaml":  "resources: [../prod, ../dev]\n",
+		})},
+		{"two copies of the base with nothing to tell them apart collide", "all", shopBase.with(tree{
+			"a/kustomization.yaml":   "resources: [../base]\n",
+			"b/kustomization.yaml":   "resources: [../base]\n",
+			"all/kustomization.yaml": "resources: [../a, ../b]\n",
+		})},
+		{"a generator without behavior creates, and settings already exists in the base — even though mid has since renamed it mid-settings", "dev", shopBase.with(tree{
+			"mid/kustomization.yaml": "namePrefix: mid-\nresources: [../base]\n",
+			"dev/kustomization.yaml": "resources: [../mid]\nconfigMapGenerator:\n- name: settings\n  literals: [level=2]\n",
+		})},
+		{"merge needs something to merge into, and the base generated no ConfigMap called flags", "dev", shopBase.with(tree{
+			"dev/kustomization.yaml": "resources: [../base]\nconfigMapGenerator:\n- name: flags\n  behavior: merge\n  literals: [level=2]\n",
+		})},
 	})
 }
 

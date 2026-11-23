@@ -27,6 +27,7 @@ type Kustomization struct {
 	APIVersion string   `json:"apiVersion,omitempty"`
 	Kind       string   `json:"kind,omitempty"`
 	Resources  []string `json:"resources,omitempty"`
+	Bases      []string `json:"bases,omitempty"`
 	Namespace  string   `json:"namespace,omitempty"`
 	NamePrefix string   `json:"namePrefix,omitempty"`
 	NameSuffix string   `json:"nameSuffix,omitempty"`
@@ -63,6 +64,9 @@ type Target struct {
 	Kind      string `json:"kind,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
+
+	LabelSelector      string `json:"labelSelector,omitempty"`
+	AnnotationSelector string `json:"annotationSelector,omitempty"`
 }
 
 // Generator is one entry of configMapGenerator.
@@ -73,6 +77,7 @@ type Generator struct {
 	Files     []string          `json:"files,omitempty"`
 	Envs      []string          `json:"envs,omitempty"`
 	Options   *GeneratorOptions `json:"options,omitempty"`
+	Behavior  string            `json:"behavior,omitempty"`
 }
 
 // SecretGenerator is one entry of secretGenerator: a Generator with a type.
@@ -273,7 +278,7 @@ func build(dir string, visiting map[string]bool) ([]*resource, error) {
 		return nil, err
 	}
 	var rs []*resource
-	for _, r := range k.Resources {
+	for _, r := range append(k.Resources, k.Bases...) {
 		more, err := accumulate(abs, r, visiting)
 		if err != nil {
 			return nil, fmt.Errorf("accumulating resources from %q: %w", r, err)
@@ -298,10 +303,25 @@ func build(dir string, visiting map[string]bool) ([]*resource, error) {
 		if err != nil {
 			return nil, err
 		}
-		hash := !mergeOptions(k.GeneratorOptions, g.Options).DisableNameSuffixHash
-		r := newResource(o)
-		r.hash = hash
-		rs = append(rs, r)
+		var old *resource
+		for _, r := range rs {
+			if str(r.o, "kind") == str(o, "kind") && r.was(g.Name, g.Namespace) {
+				old = r
+			}
+		}
+		switch {
+		case g.Behavior == "merge" || g.Behavior == "replace":
+			if old == nil {
+				return nil, fmt.Errorf("%s %s does not exist; cannot merge or replace", str(o, "kind"), g.Name)
+			}
+			mergeGenerated(old.o, o, g.Behavior == "replace")
+		case old != nil:
+			return nil, fmt.Errorf("%s %s exists; behavior must be merge or replace", str(o, "kind"), g.Name)
+		default:
+			r := newResource(o)
+			r.hash = !mergeOptions(k.GeneratorOptions, g.Options).DisableNameSuffixHash
+			rs = append(rs, r)
+		}
 	}
 	if err := unique(objects(rs)); err != nil {
 		return nil, fmt.Errorf("may not add resource with an already registered id: %w", err)
@@ -519,6 +539,36 @@ func contentHash(o obj) (string, error) {
 	}
 	sum := fmt.Sprintf("%x", sha256.Sum256(b))
 	return strings.NewReplacer("0", "g", "1", "h", "3", "k", "a", "m", "e", "t").Replace(sum[:10]), nil
+}
+
+// mergeGenerated folds a generator's output into the object an earlier
+// kustomization generated: labels and annotations merge, the type is the new
+// one, and the data merges or, with replace, is the new data alone.
+func mergeGenerated(old, o obj, replace bool) {
+	for _, f := range []string{"labels", "annotations"} {
+		if m, ok := meta(o)[f].(obj); ok {
+			pairs := map[string]string{}
+			for k, v := range m {
+				pairs[k], _ = v.(string)
+			}
+			setPairs(pairs)(meta(old), f)
+		}
+	}
+	if t, ok := o["type"]; ok {
+		old["type"] = t
+	}
+	for _, f := range []string{"data", "binaryData"} {
+		m, _ := o[f].(obj)
+		if replace {
+			delete(old, f)
+		}
+		if len(m) > 0 {
+			setPairs(nil)(old, f)
+			for k, v := range m {
+				old[f].(obj)[k] = v
+			}
+		}
+	}
 }
 
 // mergeOptions lays a generator's own options over the global ones.
@@ -893,8 +943,9 @@ func kindRank(kind string) int {
 	return 0
 }
 
-// sortKey orders by group, version and kind, then by name and namespace,
-// with kustomize's placeholders for the empty ones ('~' sorts after letters).
+// sortKey orders by group, version and kind, then by namespace and name,
+// with kustomize's placeholders for the empty ones ('~' sorts after letters,
+// and '|' after every character a name can hold).
 func sortKey(o obj) string {
 	group, version, ok := strings.Cut(str(o, "apiVersion"), "/")
 	if !ok {
@@ -910,7 +961,7 @@ func sortKey(o obj) string {
 	if ns == "" {
 		ns = "~X"
 	}
-	return group + "_" + version + "_" + str(o, "kind") + "|" + str(o, "metadata", "name") + "_" + ns
+	return group + "_" + version + "_" + str(o, "kind") + "|" + ns + "|" + str(o, "metadata", "name")
 }
 
 func sortLegacy(objs []obj) {
@@ -1021,6 +1072,15 @@ func patchAll(root string, k *Kustomization, rs []*resource) ([]*resource, error
 		if err != nil {
 			return nil, fmt.Errorf("unable to parse SM or JSON patch: %w", err)
 		}
+		if p.Target != nil {
+			if len(patches) != 1 {
+				return nil, errors.New("multiple strategic merge patches in one patches entry may not set a target")
+			}
+			if rs, err = patchTargets(rs, *p.Target, patches[0]); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		for _, p := range patches {
 			if str(p, "kind") == "" {
 				return nil, errors.New("unable to parse SM or JSON patch: missing kind")
@@ -1072,22 +1132,34 @@ func patchBody(root string, p Patch) (string, error) {
 // jsonPatchAll applies JSON patch operations to every resource t selects.
 func jsonPatchAll(rs []*resource, t Target, ops []obj) error {
 	for _, r := range rs {
-		if !selects(t, r) {
+		if ok, err := selects(t, r); err != nil {
+			return err
+		} else if !ok {
 			continue
+		}
+		// kustomize keeps bookkeeping annotations on every resource while it
+		// builds, so to a JSON patch metadata.annotations always exists.
+		md := meta(r.o)
+		if _, ok := md["annotations"]; !ok {
+			md["annotations"] = obj{}
 		}
 		for _, op := range ops {
 			if err := jsonOp(r.o, op); err != nil {
 				return fmt.Errorf("%s %s: %w", str(r.o, "kind"), str(r.o, "metadata", "name"), err)
 			}
 		}
+		if a, ok := md["annotations"].(obj); ok && len(a) == 0 {
+			delete(md, "annotations")
+		}
 	}
 	return nil
 }
 
-// selects is whether t picks r: each field it sets must equal r's, and the
-// name and namespace may be r's first or its current ones. A resource with no
-// namespace is in "default".
-func selects(t Target, r *resource) bool {
+// selects is whether t picks r. Group, version, kind, name and namespace
+// are regular expressions that must match the whole field; the name and
+// namespace may be r's first or its current ones, and a resource with no
+// namespace is in "default". The selectors are label selectors.
+func selects(t Target, r *resource) (bool, error) {
 	version := str(r.o, "apiVersion")
 	if i := strings.Index(version, "/"); i >= 0 {
 		version = version[i+1:]
@@ -1099,11 +1171,87 @@ func selects(t Target, r *resource) bool {
 		}
 		return s
 	}
-	return (t.Group == "" || t.Group == group(r.o)) &&
-		(t.Version == "" || t.Version == version) &&
-		(t.Kind == "" || t.Kind == str(r.o, "kind")) &&
-		(t.Name == "" || t.Name == first[0] || t.Name == cur[0]) &&
-		(t.Namespace == "" || t.Namespace == ns(first[1]) || t.Namespace == ns(cur[1]))
+	for _, f := range []struct {
+		re     string
+		values []string
+	}{
+		{t.Group, []string{group(r.o)}},
+		{t.Version, []string{version}},
+		{t.Kind, []string{str(r.o, "kind")}},
+		{t.Name, []string{first[0], cur[0]}},
+		{t.Namespace, []string{ns(first[1]), ns(cur[1])}},
+	} {
+		if f.re == "" {
+			continue
+		}
+		re, err := regexp.Compile("^(?:" + f.re + ")$")
+		if err != nil {
+			return false, err
+		}
+		if !re.MatchString(f.values[0]) && !re.MatchString(f.values[len(f.values)-1]) {
+			return false, nil
+		}
+	}
+	for _, s := range []struct{ sel, field string }{{t.LabelSelector, "labels"}, {t.AnnotationSelector, "annotations"}} {
+		if s.sel == "" {
+			continue
+		}
+		m, _ := meta(r.o)[s.field].(obj)
+		ok, err := matchSelector(s.sel, m)
+		if !ok || err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+var selectorTerm = regexp.MustCompile(`^\s*(!?)\s*([\w./-]+)\s*(?:(==|=|!=)\s*([\w./-]*)|\s(in|notin)\s*\(([^)]*)\))?\s*$`)
+
+// matchSelector matches a label selector — key=value, key==value,
+// key!=value, key in (a,b), key notin (a,b), key, !key, joined by commas —
+// against a map of labels or annotations.
+func matchSelector(sel string, m obj) (bool, error) {
+	var terms []string
+	depth, start := 0, 0
+	for i, c := range sel + "," {
+		switch {
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case c == ',' && depth == 0:
+			terms = append(terms, sel[start:i])
+			start = i + 1
+		}
+	}
+	for _, term := range terms {
+		g := selectorTerm.FindStringSubmatch(term)
+		if g == nil {
+			return false, fmt.Errorf("unable to parse requirement %q", term)
+		}
+		v, has := m[g[2]].(string)
+		var ok bool
+		switch {
+		case g[1] == "!":
+			ok = !has
+		case g[3] == "=" || g[3] == "==":
+			ok = has && v == g[4]
+		case g[3] == "!=":
+			ok = v != g[4] || !has
+		case g[5] != "":
+			in := false
+			for _, x := range strings.Split(g[6], ",") {
+				in = in || (has && strings.TrimSpace(x) == v)
+			}
+			ok = in == (g[5] == "in")
+		default:
+			ok = has
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // jsonOp applies one RFC 6902 operation to doc.
@@ -1270,6 +1418,28 @@ func deepCopy(v any) any {
 	return v
 }
 
+// patchTargets lays one strategic merge patch over every resource t
+// selects; the patch's own kind and name are not consulted.
+func patchTargets(rs []*resource, t Target, p obj) ([]*resource, error) {
+	var out []*resource
+	for _, r := range rs {
+		ok, err := selects(t, r)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			out = append(out, r)
+			continue
+		}
+		if p["$patch"] == "delete" {
+			continue
+		}
+		mergeKept(r, deepCopy(p).(obj))
+		out = append(out, r)
+	}
+	return out, nil
+}
+
 // patchOne lays a strategic merge patch over the one resource with its
 // apiVersion, kind, name and namespace, now or earlier in the build.
 func patchOne(rs []*resource, p obj) ([]*resource, error) {
@@ -1284,9 +1454,19 @@ func patchOne(rs []*resource, p obj) ([]*resource, error) {
 		return nil, fmt.Errorf("no resource matches strategic merge patch %s %s/%s: failed to find unique target for patch",
 			str(p, "kind"), str(p, "metadata", "namespace"), str(p, "metadata", "name"))
 	}
-	r := rs[hit[0]]
 	if p["$patch"] == "delete" {
 		return append(rs[:hit[0]:hit[0]], rs[hit[0]+1:]...), nil
+	}
+	mergeKept(rs[hit[0]], p)
+	return rs, nil
+}
+
+// mergeKept merges a patch into r, which keeps its apiVersion, kind, name
+// and namespace whatever the patch says.
+func mergeKept(r *resource, p obj) {
+	keep := map[string]any{}
+	for _, f := range []string{"apiVersion", "kind"} {
+		keep[f] = r.o[f]
 	}
 	name, ns := str(r.o, "metadata", "name"), str(r.o, "metadata", "namespace")
 	kind := ""
@@ -1294,12 +1474,14 @@ func patchOne(rs []*resource, p obj) ([]*resource, error) {
 		kind = str(r.o, "kind")
 	}
 	mergeMap(r.o, p, "", kind)
+	for f, v := range keep {
+		r.o[f] = v
+	}
 	meta(r.o)["name"] = name
 	delete(meta(r.o), "namespace")
 	if ns != "" {
 		meta(r.o)["namespace"] = ns
 	}
-	return rs, nil
 }
 
 // builtin is whether kustomize knows the kind's schema, and so which lists
