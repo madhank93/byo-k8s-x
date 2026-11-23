@@ -29,6 +29,7 @@ import (
 	controllerstages "github.com/madhank93/byo-k8s-x/internal/stages/controller"
 	helmstages "github.com/madhank93/byo-k8s-x/internal/stages/helm"
 	kubectlstages "github.com/madhank93/byo-k8s-x/internal/stages/kubectl"
+	kustomizestages "github.com/madhank93/byo-k8s-x/internal/stages/kustomize"
 	runtimestages "github.com/madhank93/byo-k8s-x/internal/stages/runtime"
 	safeapplystages "github.com/madhank93/byo-k8s-x/internal/stages/safe-apply"
 	schedulerstages "github.com/madhank93/byo-k8s-x/internal/stages/scheduler"
@@ -47,7 +48,7 @@ type course struct {
 // courses maps a course slug to that — the one line a new course adds to this
 // command. The apiserver course builds the thing the others are clients of, so
 // its stages talk to the learner's own server over HTTP and there is no
-// cluster for the harness to prepare.
+// cluster for the harness to prepare; kustomize renders offline.
 var courses = map[string]course{
 	"kubectl":    {lookup: kubectlstages.Lookup, cluster: true},
 	"controller": {lookup: controllerstages.Lookup, cluster: true},
@@ -56,6 +57,7 @@ var courses = map[string]course{
 	"apiserver":  {lookup: apiserverstages.Lookup},
 	"safe-apply": {lookup: safeapplystages.Lookup, cluster: true},
 	"helm":       {lookup: helmstages.Lookup, cluster: true},
+	"kustomize":  {lookup: kustomizestages.Lookup},
 	"runtime":    {lookup: runtimestages.Lookup, node: true},
 }
 

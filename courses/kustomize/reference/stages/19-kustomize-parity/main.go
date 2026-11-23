@@ -1,0 +1,1946 @@
+// A kustomize: `build DIR` reads DIR's kustomization and prints the resources
+// it produces as one YAML stream.
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	yaml3 "go.yaml.in/yaml/v3"
+	"sigs.k8s.io/yaml"
+)
+
+// Kustomization is the kustomization file. Decoding is strict, so a field
+// missing here is a field kustomize users would see rejected.
+type Kustomization struct {
+	APIVersion string   `json:"apiVersion,omitempty"`
+	Kind       string   `json:"kind,omitempty"`
+	Resources  []string `json:"resources,omitempty"`
+	Bases      []string `json:"bases,omitempty"`
+	Components []string `json:"components,omitempty"`
+	Namespace  string   `json:"namespace,omitempty"`
+	NamePrefix string   `json:"namePrefix,omitempty"`
+	NameSuffix string   `json:"nameSuffix,omitempty"`
+
+	CommonLabels map[string]string `json:"commonLabels,omitempty"`
+	Labels       []Label           `json:"labels,omitempty"`
+
+	CommonAnnotations map[string]string `json:"commonAnnotations,omitempty"`
+
+	Images   []Image   `json:"images,omitempty"`
+	Replicas []Replica `json:"replicas,omitempty"`
+
+	PatchesStrategicMerge []string `json:"patchesStrategicMerge,omitempty"`
+	Patches               []Patch  `json:"patches,omitempty"`
+	PatchesJson6902       []Patch  `json:"patchesJson6902,omitempty"`
+
+	Replacements []Replacement `json:"replacements,omitempty"`
+
+	ConfigMapGenerator []Generator       `json:"configMapGenerator,omitempty"`
+	SecretGenerator    []SecretGenerator `json:"secretGenerator,omitempty"`
+	GeneratorOptions   *GeneratorOptions `json:"generatorOptions,omitempty"`
+}
+
+// Patch is one entry of patches: a patch in a file, or inline, and the
+// resources it is for.
+type Patch struct {
+	Path   string  `json:"path,omitempty"`
+	Patch  string  `json:"patch,omitempty"`
+	Target *Target `json:"target,omitempty"`
+}
+
+// Target picks the resources a patch applies to.
+type Target struct {
+	Group     string `json:"group,omitempty"`
+	Version   string `json:"version,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+
+	LabelSelector      string `json:"labelSelector,omitempty"`
+	AnnotationSelector string `json:"annotationSelector,omitempty"`
+}
+
+// Replacement copies one field of one resource into fields of others, or
+// names a file holding such a replacement.
+type Replacement struct {
+	Path    string              `json:"path,omitempty"`
+	Source  *ReplacementSource  `json:"source,omitempty"`
+	Targets []ReplacementTarget `json:"targets,omitempty"`
+}
+
+// ReplacementSource is the resource a value comes from, and where in it.
+type ReplacementSource struct {
+	Group     string        `json:"group,omitempty"`
+	Version   string        `json:"version,omitempty"`
+	Kind      string        `json:"kind,omitempty"`
+	Name      string        `json:"name,omitempty"`
+	Namespace string        `json:"namespace,omitempty"`
+	FieldPath string        `json:"fieldPath,omitempty"`
+	Options   *FieldOptions `json:"options,omitempty"`
+}
+
+// ReplacementTarget is which resources receive a value, and where.
+type ReplacementTarget struct {
+	Select     *Target       `json:"select,omitempty"`
+	Reject     []Target      `json:"reject,omitempty"`
+	FieldPaths []string      `json:"fieldPaths,omitempty"`
+	Options    *FieldOptions `json:"options,omitempty"`
+}
+
+// FieldOptions narrow a value to one part of a delimited string, and let a
+// target field be created.
+type FieldOptions struct {
+	Delimiter string `json:"delimiter,omitempty"`
+	Index     int    `json:"index,omitempty"`
+	Create    bool   `json:"create,omitempty"`
+}
+
+// Generator is one entry of configMapGenerator.
+type Generator struct {
+	Name      string            `json:"name,omitempty"`
+	Namespace string            `json:"namespace,omitempty"`
+	Literals  []string          `json:"literals,omitempty"`
+	Files     []string          `json:"files,omitempty"`
+	Envs      []string          `json:"envs,omitempty"`
+	Options   *GeneratorOptions `json:"options,omitempty"`
+	Behavior  string            `json:"behavior,omitempty"`
+}
+
+// SecretGenerator is one entry of secretGenerator: a Generator with a type.
+type SecretGenerator struct {
+	Generator
+	Type string `json:"type,omitempty"`
+}
+
+// GeneratorOptions apply to every generator, or to one, which wins.
+type GeneratorOptions struct {
+	Labels                map[string]string `json:"labels,omitempty"`
+	Annotations           map[string]string `json:"annotations,omitempty"`
+	DisableNameSuffixHash bool              `json:"disableNameSuffixHash,omitempty"`
+	Immutable             bool              `json:"immutable,omitempty"`
+}
+
+// Replica is one entry of replicas.
+type Replica struct {
+	Name  string `json:"name,omitempty"`
+	Count int64  `json:"count"`
+}
+
+// Image is one entry of images: which image, and what to change in it.
+type Image struct {
+	Name    string `json:"name,omitempty"`
+	NewName string `json:"newName,omitempty"`
+	NewTag  string `json:"newTag,omitempty"`
+	Digest  string `json:"digest,omitempty"`
+}
+
+// Label is one entry of labels: pairs, and how far into the object they go.
+type Label struct {
+	Pairs            map[string]string `json:"pairs,omitempty"`
+	IncludeSelectors bool              `json:"includeSelectors,omitempty"`
+	IncludeTemplates bool              `json:"includeTemplates,omitempty"`
+}
+
+// obj is one resource, as decoded YAML.
+type obj = map[string]any
+
+// resource is an object and every name and namespace it has had, the
+// current ones last, so a reference to an older name can still find it.
+type resource struct {
+	o    obj
+	ids  [][2]string
+	hash bool // a generated name, suffixed with a content hash at the end
+}
+
+func newResource(o obj) *resource {
+	r := &resource{o: o}
+	r.remember()
+	return r
+}
+
+func (r *resource) remember() {
+	r.ids = append(r.ids, [2]string{str(r.o, "metadata", "name"), str(r.o, "metadata", "namespace")})
+}
+
+func (r *resource) rename(name string) {
+	meta(r.o)["name"] = name
+	r.remember()
+}
+
+// hasName is whether the resource is, or once was, called name.
+func (r *resource) hasName(name string) bool {
+	for _, id := range r.ids {
+		if id[0] == name {
+			return true
+		}
+	}
+	return false
+}
+
+// was is whether the resource is, or once was, name in namespace ns.
+func (r *resource) was(name, ns string) bool {
+	for _, id := range r.ids {
+		if id == [2]string{name, ns} {
+			return true
+		}
+	}
+	return false
+}
+
+func objects(rs []*resource) []obj {
+	var out []obj
+	for _, r := range rs {
+		out = append(out, r.o)
+	}
+	return out
+}
+
+func main() {
+	if len(os.Args) != 3 || os.Args[1] != "build" {
+		fmt.Fprintln(os.Stderr, "usage: app build DIR")
+		os.Exit(2)
+	}
+	rs, err := build(os.Args[2], map[string]bool{}, nil, "")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		os.Exit(1)
+	}
+	for _, r := range rs {
+		if r.hash {
+			h, err := contentHash(r.o)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			r.rename(str(r.o, "metadata", "name") + "-" + h)
+		}
+	}
+	fixReferences(rs)
+	objs := objects(rs)
+	sortLegacy(objs)
+	out, err := render(objs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		os.Exit(1)
+	}
+	fmt.Print(out)
+}
+
+func render(objs []obj) (string, error) {
+	var docs []string
+	for _, o := range objs {
+		b, err := yaml.Marshal(o)
+		if err != nil {
+			return "", err
+		}
+		docs = append(docs, string(b))
+	}
+	return strings.Join(docs, "---\n"), nil
+}
+
+// kustomizationNames are the file names kustomize looks for, in its order.
+var kustomizationNames = []string{"kustomization.yaml", "kustomization.yml", "Kustomization"}
+
+func load(dir string) (*Kustomization, error) {
+	var found []string
+	for _, n := range kustomizationNames {
+		if _, err := os.Stat(filepath.Join(dir, n)); err == nil {
+			found = append(found, n)
+		}
+	}
+	switch len(found) {
+	case 0:
+		return nil, fmt.Errorf("unable to find one of %s in directory %q", strings.Join(kustomizationNames, ", "), dir)
+	case 1:
+	default:
+		return nil, fmt.Errorf("found multiple kustomization files under %s", dir)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, found[0]))
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return nil, fmt.Errorf("%s is empty", found[0])
+	}
+	// YAMLToJSON first: yaml.Unmarshal into a struct would quietly turn a
+	// number into the string a field wants, which kustomize refuses.
+	js, err := yaml.YAMLToJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	var k Kustomization
+	dec := json.NewDecoder(bytes.NewReader(js))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&k); err != nil {
+		return nil, fmt.Errorf("invalid Kustomization: %w", err)
+	}
+	switch {
+	case k.Kind == "Component":
+		if k.APIVersion != "" && k.APIVersion != "kustomize.config.k8s.io/v1alpha1" {
+			return nil, errors.New("apiVersion for Component should be kustomize.config.k8s.io/v1alpha1")
+		}
+	case k.Kind != "" && k.Kind != "Kustomization":
+		return nil, errors.New("kind should be Kustomization or Component")
+	case k.APIVersion != "" && k.APIVersion != "kustomize.config.k8s.io/v1beta1":
+		return nil, errors.New("apiVersion for Kustomization should be kustomize.config.k8s.io/v1beta1")
+	}
+	if k.Kind == "" {
+		k.Kind = "Kustomization"
+	}
+	return &k, nil
+}
+
+// build produces a kustomization directory's resources, added to rs. as is
+// the kind the directory must hold, Kustomization or Component, or "" for
+// either. visiting holds the directories being built further up, so a cycle
+// is caught, not recursed.
+//
+// A Kustomization starts from nothing. A Component starts from its parent's
+// resources and generated objects, and its transformers apply to them all.
+func build(dir string, visiting map[string]bool, rs []*resource, as string) ([]*resource, error) {
+	abs, err := filepath.Abs(dir)
+	if err == nil {
+		abs, err = filepath.EvalSymlinks(abs)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if visiting[abs] {
+		return nil, fmt.Errorf("cycle detected: %s includes itself", abs)
+	}
+	visiting[abs] = true
+	defer delete(visiting, abs)
+
+	k, err := load(abs)
+	if err != nil {
+		return nil, err
+	}
+	if kind := k.Kind; as != "" && kind != as && (kind == "Component" || as == "Component") {
+		return nil, fmt.Errorf("expected kind %s for path %s, but got %s", as, abs, kind)
+	}
+	for _, r := range append(k.Resources, k.Bases...) {
+		more, err := accumulate(abs, r, visiting)
+		if err != nil {
+			return nil, fmt.Errorf("accumulating resources from %q: %w", r, err)
+		}
+		rs = append(rs, more...)
+		if err := unique(objects(rs)); err != nil {
+			return nil, fmt.Errorf("may not add resource with an already registered id: %w", err)
+		}
+	}
+	var gens []SecretGenerator
+	for _, g := range k.ConfigMapGenerator {
+		gens = append(gens, SecretGenerator{Generator: g})
+	}
+	for _, g := range k.SecretGenerator {
+		if g.Type == "" {
+			g.Type = "Opaque"
+		}
+		gens = append(gens, g)
+	}
+	for _, g := range gens {
+		o, err := generate(abs, g, k.GeneratorOptions)
+		if err != nil {
+			return nil, err
+		}
+		var old *resource
+		for _, r := range rs {
+			if str(r.o, "kind") == str(o, "kind") && r.was(g.Name, g.Namespace) {
+				old = r
+			}
+		}
+		switch {
+		case g.Behavior == "merge" || g.Behavior == "replace":
+			if old == nil {
+				return nil, fmt.Errorf("%s %s does not exist; cannot merge or replace", str(o, "kind"), g.Name)
+			}
+			mergeGenerated(old.o, o, g.Behavior == "replace")
+		case old != nil:
+			return nil, fmt.Errorf("%s %s exists; behavior must be merge or replace", str(o, "kind"), g.Name)
+		default:
+			r := newResource(o)
+			r.hash = !mergeOptions(k.GeneratorOptions, g.Options).DisableNameSuffixHash
+			rs = append(rs, r)
+		}
+	}
+	if err := unique(objects(rs)); err != nil {
+		return nil, fmt.Errorf("may not add resource with an already registered id: %w", err)
+	}
+	for _, c := range k.Components {
+		if rs, err = build(filepath.Join(abs, c), visiting, rs, "Component"); err != nil {
+			return nil, fmt.Errorf("accumulating components: %w", err)
+		}
+	}
+	if rs, err = patchAll(abs, k, rs); err != nil {
+		return nil, err
+	}
+	if k.Namespace != "" {
+		setNamespace(rs, k.Namespace)
+		if err := unique(objects(rs)); err != nil {
+			return nil, fmt.Errorf("namespace transformation produces ID conflict: %w", err)
+		}
+	}
+	for _, r := range rs {
+		if !fixedName[str(r.o, "kind")] && k.NamePrefix+k.NameSuffix != "" {
+			r.rename(k.NamePrefix + str(r.o, "metadata", "name") + k.NameSuffix)
+		}
+	}
+	out := objects(rs)
+	if len(k.CommonLabels) > 0 {
+		apply(out, labelSpecs, setPairs(k.CommonLabels))
+	}
+	for _, l := range k.Labels {
+		specs := labelSpecs[:1]
+		switch {
+		case l.IncludeSelectors:
+			specs = labelSpecs
+		case l.IncludeTemplates:
+			specs = nil
+			for _, fs := range labelSpecs {
+				if strings.HasSuffix(fs.path, "metadata/labels") {
+					specs = append(specs, fs)
+				}
+			}
+		}
+		apply(out, specs, setPairs(l.Pairs))
+	}
+	if len(k.CommonAnnotations) > 0 {
+		apply(out, annotationSpecs, setPairs(k.CommonAnnotations))
+	}
+	if err := patchJson6902(abs, k, rs); err != nil {
+		return nil, err
+	}
+	for _, img := range k.Images {
+		for _, o := range out {
+			setImages(o, img)
+		}
+	}
+	for _, rep := range k.Replicas {
+		found := false
+		for _, r := range rs {
+			if scalable[str(r.o, "kind")] && r.hasName(rep.Name) {
+				spec, ok := r.o["spec"].(obj)
+				if !ok {
+					spec = obj{}
+					r.o["spec"] = spec
+				}
+				spec["replicas"] = rep.Count
+				found = true
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("resource with name %s does not match a config with a scalable kind", rep.Name)
+		}
+	}
+	if err := replaceAll(abs, k.Replacements, rs); err != nil {
+		return nil, err
+	}
+	return rs, nil
+}
+
+// replaceAll runs replacements, the last thing a kustomization does.
+func replaceAll(root string, reps []Replacement, rs []*resource) error {
+	for _, rp := range reps {
+		if rp.Path != "" {
+			b, err := readInRoot(root, rp.Path)
+			if err != nil {
+				return err
+			}
+			js, err := yaml.YAMLToJSON(b)
+			if err != nil {
+				return err
+			}
+			dec := json.NewDecoder(bytes.NewReader(js))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&rp); err != nil {
+				return fmt.Errorf("replacement %s: %w", rp.Path, err)
+			}
+		}
+		if rp.Source == nil {
+			return errors.New("a replacement needs a source")
+		}
+		v, err := replacementValue(*rp.Source, rs)
+		if err != nil {
+			return err
+		}
+		for _, t := range rp.Targets {
+			if err := replaceIn(t, v, rs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// replacementValue is the value at the source's field path in the one
+// resource the source selects.
+func replacementValue(s ReplacementSource, rs []*resource) (any, error) {
+	sel := Target{Group: s.Group, Version: s.Version, Kind: s.Kind, Name: s.Name, Namespace: s.Namespace}
+	var hits []*resource
+	for _, r := range rs {
+		ok, err := selects(sel, r)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			hits = append(hits, r)
+		}
+	}
+	switch len(hits) {
+	case 0:
+		return nil, fmt.Errorf("nothing selected by %s %s", s.Kind, s.Name)
+	case 1:
+	default:
+		return nil, fmt.Errorf("multiple matches for selector %s %s", s.Kind, s.Name)
+	}
+	fp := s.FieldPath
+	if fp == "" {
+		fp = "metadata.name"
+	}
+	var v any
+	found := false
+	err := fieldPath(hits[0].o, splitFieldPath(fp), false, func(parent any, key string) error {
+		v, found = lookup(parent, key)
+		return nil
+	})
+	if err != nil || !found {
+		return nil, fmt.Errorf("fieldPath `%s` is missing for replacement source %s %s", fp, s.Kind, s.Name)
+	}
+	if o := s.Options; o != nil && o.Delimiter != "" {
+		parts := strings.Split(scalar(v), o.Delimiter)
+		if o.Index < 0 || o.Index >= len(parts) {
+			return nil, fmt.Errorf("options.index %d is out of bounds for value %s", o.Index, scalar(v))
+		}
+		v = parts[o.Index]
+	}
+	return v, nil
+}
+
+// replaceIn writes v at every field path of every resource t selects and
+// none of its rejects do.
+func replaceIn(t ReplacementTarget, v any, rs []*resource) error {
+	opts := FieldOptions{}
+	if t.Options != nil {
+		opts = *t.Options
+	}
+	for _, r := range rs {
+		ok := t.Select != nil
+		var err error
+		if ok {
+			if ok, err = selects(*t.Select, r); err != nil {
+				return err
+			}
+		}
+		for _, rej := range t.Reject {
+			hit, err := selects(rej, r)
+			if err != nil {
+				return err
+			}
+			ok = ok && !hit
+		}
+		if !ok {
+			continue
+		}
+		for _, fp := range t.FieldPaths {
+			err := fieldPath(r.o, splitFieldPath(fp), opts.Create, func(parent any, key string) error {
+				old, found := lookup(parent, key)
+				if !found && !opts.Create {
+					return fmt.Errorf("unable to find field %q in replacement target", fp)
+				}
+				nv := v
+				if opts.Delimiter != "" {
+					parts := strings.Split(scalar(old), opts.Delimiter)
+					if opts.Index >= 0 && opts.Index < len(parts) {
+						parts[opts.Index] = scalar(v)
+					} else {
+						parts = append(parts, scalar(v))
+					}
+					nv = strings.Join(parts, opts.Delimiter)
+				} else if found {
+					nv = retype(v, old)
+				}
+				store(parent, key, nv)
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// splitFieldPath splits a dotted field path, keeping a bracketed segment
+// such as [example.com/owner] or [name=web] whole.
+func splitFieldPath(fp string) []string {
+	var out []string
+	depth, start := 0, 0
+	for i, c := range fp + "." {
+		switch {
+		case c == '[':
+			depth++
+		case c == ']':
+			depth--
+		case c == '.' && depth == 0:
+			out = append(out, fp[start:i])
+			start = i + 1
+		}
+	}
+	return out
+}
+
+// fieldPath walks segments to every place they name and calls set with the
+// container and the last segment there. A segment is a map key (bracketed
+// when it holds dots), a list index, [field=value] for the list items with
+// that field, or * for every item. With create, missing map keys on the way
+// are made.
+func fieldPath(v any, segs []string, create bool, set func(parent any, key string) error) error {
+	if len(segs) == 1 {
+		return set(v, segs[0])
+	}
+	seg := segs[0]
+	if l, ok := v.([]any); ok {
+		k, val, isMatch := strings.Cut(strings.Trim(seg, "[]"), "=")
+		matched := false
+		for i, item := range l {
+			m, _ := item.(obj)
+			if seg == "*" || seg == strconv.Itoa(i) || (isMatch && m != nil && scalar(m[k]) == val) {
+				matched = true
+				if err := fieldPath(item, segs[1:], create, set); err != nil {
+					return err
+				}
+			}
+		}
+		if !matched && seg != "*" {
+			return fmt.Errorf("unable to find field %q", seg)
+		}
+		return nil
+	}
+	m, ok := v.(obj)
+	if !ok {
+		return fmt.Errorf("unable to find field %q", seg)
+	}
+	key := strings.Trim(seg, "[]")
+	next, ok := m[key]
+	if !ok || next == nil {
+		if !create {
+			return fmt.Errorf("unable to find field %q in replacement target", strings.Join(segs, "."))
+		}
+		next = obj{}
+		m[key] = next
+	}
+	return fieldPath(next, segs[1:], create, set)
+}
+
+// lookup reads key from a map, or an index from a list.
+func lookup(parent any, key string) (any, bool) {
+	switch p := parent.(type) {
+	case obj:
+		v, ok := p[strings.Trim(key, "[]")]
+		return v, ok
+	case []any:
+		if i, err := strconv.Atoi(key); err == nil && i >= 0 && i < len(p) {
+			return p[i], true
+		}
+	}
+	return nil, false
+}
+
+// store writes a looked-up place.
+func store(parent any, key string, v any) {
+	switch p := parent.(type) {
+	case obj:
+		p[strings.Trim(key, "[]")] = v
+	case []any:
+		if i, err := strconv.Atoi(key); err == nil && i >= 0 && i < len(p) {
+			p[i] = v
+		}
+	}
+}
+
+// scalar is a value as YAML would write it, unquoted.
+func scalar(v any) string {
+	switch v := v.(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case nil:
+		return ""
+	}
+	return fmt.Sprint(v)
+}
+
+// retype gives a scalar the type of the value it replaces, as kustomize
+// keeps the target field's YAML tag: "3" into replicas is the number 3, and
+// 1 into a string field is "1".
+func retype(v, old any) any {
+	s := scalar(v)
+	switch old.(type) {
+	case string:
+		if _, isMap := v.(obj); !isMap {
+			if _, isList := v.([]any); !isList {
+				return s
+			}
+		}
+	case float64:
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+	case bool:
+		if b, err := strconv.ParseBool(s); err == nil {
+			return b
+		}
+	}
+	return v
+}
+
+// scalable are the kinds replicas may set, in any API group.
+var scalable = map[string]bool{"Deployment": true, "ReplicaSet": true, "StatefulSet": true, "ReplicationController": true}
+
+// generate builds the ConfigMap, or with a type the Secret, one generator
+// describes.
+func generate(root string, g SecretGenerator, global *GeneratorOptions) (obj, error) {
+	kind := "ConfigMap"
+	if g.Type != "" {
+		kind = "Secret"
+	}
+	pairs, err := keyValues(root, g.Generator)
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", kind, g.Name, err)
+	}
+	data, binary := obj{}, obj{}
+	for _, kv := range pairs {
+		_, dup := data[kv[0]]
+		if _, dupBinary := binary[kv[0]]; dup || dupBinary {
+			return nil, fmt.Errorf("%s %s illegally repeats the key `%s`", kind, g.Name, kv[0])
+		}
+		if kind == "Secret" {
+			data[kv[0]] = base64.StdEncoding.EncodeToString([]byte(kv[1]))
+		} else if utf8.ValidString(kv[1]) {
+			data[kv[0]] = kv[1]
+		} else {
+			binary[kv[0]] = base64.StdEncoding.EncodeToString([]byte(kv[1]))
+		}
+	}
+	md := obj{"name": g.Name}
+	if g.Namespace != "" {
+		md["namespace"] = g.Namespace
+	}
+	o := obj{"apiVersion": "v1", "kind": kind, "metadata": md}
+	if len(data) > 0 || kind == "Secret" {
+		o["data"] = data
+	}
+	if kind == "Secret" {
+		o["type"] = g.Type
+	}
+	if len(binary) > 0 {
+		o["binaryData"] = binary
+	}
+	opts := mergeOptions(global, g.Options)
+	if len(opts.Labels) > 0 {
+		setPairs(opts.Labels)(md, "labels")
+	}
+	if len(opts.Annotations) > 0 {
+		setPairs(opts.Annotations)(md, "annotations")
+	}
+	if opts.Immutable {
+		o["immutable"] = true
+	}
+	return o, nil
+}
+
+// ref is a field naming another object of kind target, in referrers of a
+// group and kind ("" matches any). An empty target means the kind field
+// beside the name says what it names.
+type ref struct {
+	group, kind, path, target string
+}
+
+// podSpecAt is where each workload kind keeps its pod spec.
+var podSpecAt = map[string]string{
+	"Pod": "spec", "Deployment": "spec/template/spec", "ReplicaSet": "spec/template/spec",
+	"DaemonSet": "spec/template/spec", "StatefulSet": "spec/template/spec", "Job": "spec/template/spec",
+	"ReplicationController": "spec/template/spec", "CronJob": "spec/jobTemplate/spec/template/spec",
+}
+
+// refs is every reference kustomize keeps up to date here.
+var refs = func() []ref {
+	inPod := map[string]string{
+		"volumes/configMap/name":                   "ConfigMap",
+		"volumes/secret/secretName":                "Secret",
+		"volumes/persistentVolumeClaim/claimName":  "PersistentVolumeClaim",
+		"volumes/projected/sources/configMap/name": "ConfigMap",
+		"volumes/projected/sources/secret/name":    "Secret",
+		"imagePullSecrets/name":                    "Secret",
+		"serviceAccountName":                       "ServiceAccount",
+	}
+	for _, c := range []string{"containers", "initContainers"} {
+		inPod[c+"/env/valueFrom/configMapKeyRef/name"] = "ConfigMap"
+		inPod[c+"/env/valueFrom/secretKeyRef/name"] = "Secret"
+		inPod[c+"/envFrom/configMapRef/name"] = "ConfigMap"
+		inPod[c+"/envFrom/secretRef/name"] = "Secret"
+	}
+	out := []ref{
+		{"networking.k8s.io", "Ingress", "spec/rules/http/paths/backend/service/name", "Service"},
+		{"networking.k8s.io", "Ingress", "spec/defaultBackend/service/name", "Service"},
+		{"networking.k8s.io", "Ingress", "spec/tls/secretName", "Secret"},
+		{"apps", "StatefulSet", "spec/serviceName", "Service"},
+		{"rbac.authorization.k8s.io", "RoleBinding", "roleRef/name", ""},
+		{"rbac.authorization.k8s.io", "ClusterRoleBinding", "roleRef/name", ""},
+		{"autoscaling", "HorizontalPodAutoscaler", "spec/scaleTargetRef/name", ""},
+	}
+	for kind, at := range podSpecAt {
+		for path, target := range inPod {
+			out = append(out, ref{"", kind, at + "/" + path, target})
+		}
+	}
+	return out
+}()
+
+// fixReferences points every reference to a name a resource used to have at
+// the name it has now. Only a resource in the referrer's own namespace, or a
+// cluster-scoped one, can answer.
+func fixReferences(rs []*resource) {
+	for _, r := range rs {
+		for _, rf := range refs {
+			if (rf.group != "" && rf.group != group(r.o)) || rf.kind != str(r.o, "kind") {
+				continue
+			}
+			walk(r.o, strings.Split(rf.path, "/"), false, func(parent obj, key string) {
+				name, _ := parent[key].(string)
+				target := rf.target
+				if target == "" {
+					target, _ = parent["kind"].(string)
+				}
+				for _, c := range rs {
+					if str(c.o, "kind") == target && c.hasName(name) &&
+						(clusterScoped(c.o) || str(c.o, "metadata", "namespace") == str(r.o, "metadata", "namespace")) {
+						parent[key] = str(c.o, "metadata", "name")
+						return
+					}
+				}
+			})
+		}
+	}
+}
+
+// contentHash is kustomize's name suffix: the SHA-256 of the object's kind,
+// data and type as JSON, cut to ten characters and respelled so it cannot
+// read as a word or a number. kustomize's encoding carries an empty name.
+func contentHash(o obj) (string, error) {
+	m := map[string]any{"kind": o["kind"], "name": "", "data": o["data"]}
+	if m["data"] == nil {
+		m["data"] = ""
+	}
+	for _, k := range []string{"binaryData", "type"} {
+		if v, ok := o[k]; ok {
+			m[k] = v
+		}
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	sum := fmt.Sprintf("%x", sha256.Sum256(b))
+	return strings.NewReplacer("0", "g", "1", "h", "3", "k", "a", "m", "e", "t").Replace(sum[:10]), nil
+}
+
+// mergeGenerated folds a generator's output into the object an earlier
+// kustomization generated: labels and annotations merge, the type is the new
+// one, and the data merges or, with replace, is the new data alone.
+func mergeGenerated(old, o obj, replace bool) {
+	for _, f := range []string{"labels", "annotations"} {
+		if m, ok := meta(o)[f].(obj); ok {
+			pairs := map[string]string{}
+			for k, v := range m {
+				pairs[k], _ = v.(string)
+			}
+			setPairs(pairs)(meta(old), f)
+		}
+	}
+	if t, ok := o["type"]; ok {
+		old["type"] = t
+	}
+	for _, f := range []string{"data", "binaryData"} {
+		m, _ := o[f].(obj)
+		if replace {
+			delete(old, f)
+		}
+		if len(m) > 0 {
+			setPairs(nil)(old, f)
+			for k, v := range m {
+				old[f].(obj)[k] = v
+			}
+		}
+	}
+}
+
+// mergeOptions lays a generator's own options over the global ones.
+func mergeOptions(global, own *GeneratorOptions) GeneratorOptions {
+	var out GeneratorOptions
+	for _, o := range []*GeneratorOptions{global, own} {
+		if o == nil {
+			continue
+		}
+		for k, v := range o.Labels {
+			if out.Labels == nil {
+				out.Labels = map[string]string{}
+			}
+			out.Labels[k] = v
+		}
+		for k, v := range o.Annotations {
+			if out.Annotations == nil {
+				out.Annotations = map[string]string{}
+			}
+			out.Annotations[k] = v
+		}
+		out.DisableNameSuffixHash = out.DisableNameSuffixHash || o.DisableNameSuffixHash
+		out.Immutable = out.Immutable || o.Immutable
+	}
+	return out
+}
+
+// keyValues reads a generator's sources in kustomize's order: literals,
+// then files, then env files.
+func keyValues(root string, g Generator) ([][2]string, error) {
+	var out [][2]string
+	for _, l := range g.Literals {
+		k, v, ok := strings.Cut(l, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid literal source %s, expected key=value", l)
+		}
+		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		out = append(out, [2]string{k, v})
+	}
+	for _, f := range g.Files {
+		k, path, ok := strings.Cut(f, "=")
+		if !ok {
+			k, path = filepath.Base(f), f
+		}
+		b, err := readInRoot(root, path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, [2]string{k, string(b)})
+	}
+	for _, e := range g.Envs {
+		b, err := readInRoot(root, e)
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimLeft(line, " \t\r")
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			k, v, ok := strings.Cut(line, "=")
+			if !ok {
+				if v, ok = os.LookupEnv(k); !ok {
+					continue
+				}
+			}
+			out = append(out, [2]string{k, v})
+		}
+	}
+	return out, nil
+}
+
+// readInRoot reads a file that must sit inside root.
+func readInRoot(root, path string) ([]byte, error) {
+	full := filepath.Join(root, path)
+	if rel, err := filepath.Rel(root, full); err != nil || strings.HasPrefix(rel, "..") {
+		return nil, fmt.Errorf("security; file %q is not in or below %q", full, root)
+	}
+	return os.ReadFile(full)
+}
+
+// setImages rewrites every container image matching img, wherever the
+// containers and initContainers lists sit in the object.
+func setImages(v any, img Image) {
+	switch v := v.(type) {
+	case []any:
+		for _, item := range v {
+			setImages(item, img)
+		}
+	case obj:
+		for key, val := range v {
+			if key == "containers" || key == "initContainers" {
+				list, _ := val.([]any)
+				for _, c := range list {
+					if c, ok := c.(obj); ok {
+						if ref, ok := c["image"].(string); ok {
+							c["image"] = retag(ref, img)
+						}
+					}
+				}
+				continue
+			}
+			setImages(val, img)
+		}
+	}
+}
+
+// retag applies img to one image reference, name[:tag][@digest].
+func retag(ref string, img Image) string {
+	name, digest, _ := strings.Cut(ref, "@")
+	tag := ""
+	if i := strings.LastIndex(name, ":"); i > strings.LastIndex(name, "/") {
+		name, tag = name[:i], name[i+1:]
+	}
+	if name != img.Name {
+		return ref
+	}
+	if img.NewName != "" {
+		name = img.NewName
+	}
+	switch {
+	case img.Digest != "":
+		tag, digest = img.NewTag, img.Digest
+	case img.NewTag != "":
+		tag, digest = img.NewTag, ""
+	}
+	if tag != "" {
+		name += ":" + tag
+	}
+	if digest != "" {
+		name += "@" + digest
+	}
+	return name
+}
+
+// fieldSpec is a field kustomize knows to change: a slash path, in objects of
+// a group and kind ("" matches any), created when missing only if create.
+// A path segment that meets a list applies to every item.
+type fieldSpec struct {
+	group, kind, path string
+	create            bool
+}
+
+// apply runs set on the field each matching spec names.
+func apply(objs []obj, specs []fieldSpec, set func(parent obj, key string)) {
+	for _, o := range objs {
+		for _, fs := range specs {
+			if (fs.group == "" || fs.group == group(o)) && (fs.kind == "" || fs.kind == str(o, "kind")) {
+				walk(o, strings.Split(fs.path, "/"), fs.create, set)
+			}
+		}
+	}
+}
+
+func walk(v any, path []string, create bool, set func(parent obj, key string)) {
+	switch v := v.(type) {
+	case []any:
+		for _, item := range v {
+			walk(item, path, create, set)
+		}
+	case obj:
+		key := strings.TrimSuffix(path[0], "[]")
+		if len(path) == 1 {
+			if _, ok := v[key]; ok || create {
+				set(v, key)
+			}
+			return
+		}
+		next, ok := v[key]
+		if !ok || next == nil {
+			if !create {
+				return
+			}
+			next = obj{}
+			v[key] = next
+		}
+		walk(next, path[1:], create, set)
+	}
+}
+
+// setPairs merges pairs into the map at parent[key], creating it.
+func setPairs(pairs map[string]string) func(obj, string) {
+	return func(parent obj, key string) {
+		m, ok := parent[key].(obj)
+		if !ok {
+			m = obj{}
+			parent[key] = m
+		}
+		for k, v := range pairs {
+			m[k] = v
+		}
+	}
+}
+
+// selectorTerms are the optional label selectors inside a pod template.
+var selectorTerms = []string{
+	"spec/template/spec/affinity/podAffinity/preferredDuringSchedulingIgnoredDuringExecution/podAffinityTerm/labelSelector/matchLabels",
+	"spec/template/spec/affinity/podAffinity/requiredDuringSchedulingIgnoredDuringExecution/labelSelector/matchLabels",
+	"spec/template/spec/affinity/podAntiAffinity/preferredDuringSchedulingIgnoredDuringExecution/podAffinityTerm/labelSelector/matchLabels",
+	"spec/template/spec/affinity/podAntiAffinity/requiredDuringSchedulingIgnoredDuringExecution/labelSelector/matchLabels",
+	"spec/template/spec/topologySpreadConstraints/labelSelector/matchLabels",
+}
+
+// labelSpecs is where commonLabels goes; metadata/labels comes first.
+var labelSpecs = func() []fieldSpec {
+	specs := []fieldSpec{
+		{"", "", "metadata/labels", true},
+		{"", "ReplicationController", "spec/selector", true},
+		{"", "ReplicationController", "spec/template/metadata/labels", true},
+		{"", "Service", "spec/selector", true},
+		{"", "Deployment", "spec/selector/matchLabels", true},
+		{"", "Deployment", "spec/template/metadata/labels", true},
+		{"", "ReplicaSet", "spec/selector/matchLabels", true},
+		{"", "ReplicaSet", "spec/template/metadata/labels", true},
+		{"", "DaemonSet", "spec/selector/matchLabels", true},
+		{"", "DaemonSet", "spec/template/metadata/labels", true},
+		{"apps", "StatefulSet", "spec/selector/matchLabels", true},
+		{"apps", "StatefulSet", "spec/template/metadata/labels", true},
+		{"apps", "StatefulSet", "spec/volumeClaimTemplates[]/metadata/labels", true},
+		{"batch", "Job", "spec/selector/matchLabels", false},
+		{"batch", "Job", "spec/template/metadata/labels", true},
+		{"batch", "CronJob", "spec/jobTemplate/spec/selector/matchLabels", false},
+		{"batch", "CronJob", "spec/jobTemplate/metadata/labels", true},
+		{"batch", "CronJob", "spec/jobTemplate/spec/template/metadata/labels", true},
+		{"policy", "PodDisruptionBudget", "spec/selector/matchLabels", false},
+		{"networking.k8s.io", "NetworkPolicy", "spec/podSelector/matchLabels", false},
+		{"networking.k8s.io", "NetworkPolicy", "spec/ingress/from/podSelector/matchLabels", false},
+		{"networking.k8s.io", "NetworkPolicy", "spec/egress/to/podSelector/matchLabels", false},
+	}
+	for _, kind := range []string{"Deployment", "StatefulSet"} {
+		for _, p := range selectorTerms {
+			specs = append(specs, fieldSpec{"apps", kind, p, false})
+		}
+	}
+	return specs
+}()
+
+// annotationSpecs is where commonAnnotations goes: metadata and pod templates.
+var annotationSpecs = []fieldSpec{
+	{"", "", "metadata/annotations", true},
+	{"", "ReplicationController", "spec/template/metadata/annotations", true},
+	{"", "Deployment", "spec/template/metadata/annotations", true},
+	{"", "ReplicaSet", "spec/template/metadata/annotations", true},
+	{"", "DaemonSet", "spec/template/metadata/annotations", true},
+	{"apps", "StatefulSet", "spec/template/metadata/annotations", true},
+	{"batch", "Job", "spec/template/metadata/annotations", true},
+	{"batch", "CronJob", "spec/jobTemplate/metadata/annotations", true},
+	{"batch", "CronJob", "spec/jobTemplate/spec/template/metadata/annotations", true},
+}
+
+// fixedName are the kinds whose names the API server derives from their
+// content, so a prefix would break them.
+var fixedName = map[string]bool{"Namespace": true, "CustomResourceDefinition": true, "APIService": true}
+
+// unique refuses two resources with one identity.
+func unique(objs []obj) error {
+	seen := map[string]bool{}
+	for _, o := range objs {
+		if seen[id(o)] {
+			return errors.New(id(o))
+		}
+		seen[id(o)] = true
+	}
+	return nil
+}
+
+// clusterKinds are the built-in kinds with no namespace, by group/kind.
+var clusterKinds = map[string]bool{
+	"/Namespace": true, "/Node": true, "/PersistentVolume": true, "/ComponentStatus": true,
+	"rbac.authorization.k8s.io/ClusterRole": true, "rbac.authorization.k8s.io/ClusterRoleBinding": true,
+	"apiextensions.k8s.io/CustomResourceDefinition": true, "apiregistration.k8s.io/APIService": true,
+	"storage.k8s.io/StorageClass": true, "storage.k8s.io/CSIDriver": true, "storage.k8s.io/CSINode": true,
+	"storage.k8s.io/VolumeAttachment": true, "scheduling.k8s.io/PriorityClass": true,
+	"node.k8s.io/RuntimeClass": true, "networking.k8s.io/IngressClass": true,
+	"admissionregistration.k8s.io/MutatingWebhookConfiguration":     true,
+	"admissionregistration.k8s.io/ValidatingWebhookConfiguration":   true,
+	"admissionregistration.k8s.io/ValidatingAdmissionPolicy":        true,
+	"admissionregistration.k8s.io/ValidatingAdmissionPolicyBinding": true,
+	"certificates.k8s.io/CertificateSigningRequest":                 true,
+	"flowcontrol.apiserver.k8s.io/FlowSchema":                       true,
+	"flowcontrol.apiserver.k8s.io/PriorityLevelConfiguration":       true,
+}
+
+func group(o obj) string {
+	g, _, ok := strings.Cut(str(o, "apiVersion"), "/")
+	if !ok {
+		return ""
+	}
+	return g
+}
+
+func clusterScoped(o obj) bool { return clusterKinds[group(o)+"/"+str(o, "kind")] }
+
+// meta is the object's metadata, created if it is missing.
+func meta(o obj) obj {
+	m, ok := o["metadata"].(obj)
+	if !ok {
+		m = obj{}
+		o["metadata"] = m
+	}
+	return m
+}
+
+// setNamespace moves every namespaced resource into ns. A Namespace object is
+// renamed to match, and a binding's subjects named default follow it too.
+func setNamespace(rs []*resource, ns string) {
+	for _, r := range rs {
+		o := r.o
+		if group(o) == "rbac.authorization.k8s.io" && strings.HasSuffix(str(o, "kind"), "RoleBinding") {
+			subjects, _ := o["subjects"].([]any)
+			for _, sub := range subjects {
+				if m, ok := sub.(obj); ok && m["name"] == "default" {
+					m["namespace"] = ns
+				}
+			}
+		}
+		switch {
+		case group(o) == "" && str(o, "kind") == "Namespace":
+			r.rename(ns)
+		case !clusterScoped(o):
+			meta(o)["namespace"] = ns
+			r.remember()
+		}
+	}
+}
+
+// accumulate reads one entry of resources: a directory is another
+// kustomization, and a file must sit inside the kustomization's own root.
+func accumulate(root, entry string, visiting map[string]bool) ([]*resource, error) {
+	path := filepath.Join(root, entry)
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if fi.IsDir() {
+		return build(path, visiting, nil, "Kustomization")
+	}
+	if rel, err := filepath.Rel(root, path); err != nil || strings.HasPrefix(rel, "..") {
+		return nil, fmt.Errorf("security; file %q is not in or below %q", path, root)
+	}
+	return readResources(path)
+}
+
+// id is what makes a resource unique: group, version, kind, namespace, name.
+func id(o obj) string {
+	return str(o, "apiVersion") + "|" + str(o, "kind") + "|" + str(o, "metadata", "namespace") + "|" + str(o, "metadata", "name")
+}
+
+// Kinds kustomize prints first, in this order, and last; everything else
+// sits between them.
+var (
+	orderFirst = []string{"Namespace", "ResourceQuota", "StorageClass", "CustomResourceDefinition",
+		"ServiceAccount", "PodSecurityPolicy", "Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding",
+		"ConfigMap", "Secret", "Endpoints", "Service", "LimitRange", "PriorityClass", "PersistentVolume",
+		"PersistentVolumeClaim", "Deployment", "StatefulSet", "CronJob", "PodDisruptionBudget"}
+	orderLast = []string{"MutatingWebhookConfiguration", "ValidatingWebhookConfiguration"}
+)
+
+func kindRank(kind string) int {
+	for i, k := range orderFirst {
+		if k == kind {
+			return i - len(orderFirst)
+		}
+	}
+	for i, k := range orderLast {
+		if k == kind {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// sortKey orders by group, version and kind, then by namespace and name,
+// with kustomize's placeholders for the empty ones ('~' sorts after letters,
+// and '|' after every character a name can hold).
+func sortKey(o obj) string {
+	group, version, ok := strings.Cut(str(o, "apiVersion"), "/")
+	if !ok {
+		group, version = "", group
+	}
+	ns := str(o, "metadata", "namespace")
+	if group == "" {
+		group = "~G"
+	}
+	if version == "" {
+		version = "~V"
+	}
+	if ns == "" {
+		ns = "~X"
+	}
+	return group + "_" + version + "_" + str(o, "kind") + "|" + ns + "|" + str(o, "metadata", "name")
+}
+
+func sortLegacy(objs []obj) {
+	sort.SliceStable(objs, func(i, j int) bool {
+		ri, rj := kindRank(str(objs[i], "kind")), kindRank(str(objs[j], "kind"))
+		if ri != rj {
+			return ri < rj
+		}
+		return sortKey(objs[i]) < sortKey(objs[j])
+	})
+}
+
+var docSep = regexp.MustCompile(`(?m)^---[ \t]*$`)
+
+// readDocs decodes every non-empty document of a YAML stream the way
+// kustomize does: as YAML 1.2, where yes and on are strings, then through
+// JSON, where a date becomes an RFC 3339 timestamp.
+func readDocs(data string) ([]obj, error) {
+	var out []obj
+	for _, doc := range docSep.Split(data, -1) {
+		var v any
+		if err := yaml3.Unmarshal([]byte(doc), &v); err != nil {
+			return nil, err
+		}
+		if v == nil {
+			continue
+		}
+		js, err := json.Marshal(stringKeys(v))
+		if err != nil {
+			return nil, err
+		}
+		var o obj
+		if err := json.Unmarshal(js, &o); err != nil {
+			return nil, fmt.Errorf("a document is not a map: %w", err)
+		}
+		out = append(out, o)
+	}
+	return out, nil
+}
+
+// stringKeys turns the map[any]any YAML gives a mapping with a non-string
+// key into a map JSON can encode.
+func stringKeys(v any) any {
+	switch v := v.(type) {
+	case map[string]any:
+		for k, x := range v {
+			v[k] = stringKeys(x)
+		}
+	case map[any]any:
+		m := map[string]any{}
+		for k, x := range v {
+			m[fmt.Sprint(k)] = stringKeys(x)
+		}
+		return m
+	case []any:
+		for i, x := range v {
+			v[i] = stringKeys(x)
+		}
+	}
+	return v
+}
+
+// readResources decodes every document of a YAML file.
+func readResources(path string) ([]*resource, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	docs, err := readDocs(string(data))
+	if err != nil {
+		return nil, err
+	}
+	var objs []obj
+	for _, o := range docs {
+		items, ok := o["items"].([]any)
+		if !ok || !strings.HasSuffix(str(o, "kind"), "List") {
+			objs = append(objs, o)
+			continue
+		}
+		for _, it := range items {
+			m, ok := it.(obj)
+			if !ok {
+				return nil, errors.New("a List item is not an object")
+			}
+			objs = append(objs, m)
+		}
+	}
+	var out []*resource
+	for _, o := range objs {
+		if str(o, "kind") == "" {
+			return nil, errors.New("missing kind in object")
+		}
+		if str(o, "metadata", "name") == "" {
+			return nil, errors.New("missing metadata.name in object")
+		}
+		out = append(out, newResource(o))
+	}
+	return out, nil
+}
+
+// str reads the string at a path of map keys, or "".
+func str(o obj, path ...string) string {
+	var v any = o
+	for _, p := range path {
+		m, ok := v.(obj)
+		if !ok {
+			return ""
+		}
+		v = m[p]
+	}
+	s, _ := v.(string)
+	return s
+}
+
+// patchAll applies patchesStrategicMerge, then patches, in the order listed.
+func patchAll(root string, k *Kustomization, rs []*resource) ([]*resource, error) {
+	var all []Patch
+	for _, p := range k.PatchesStrategicMerge {
+		// An entry is a file when one exists by that name, and a patch otherwise.
+		if b, err := readInRoot(root, p); err == nil {
+			p = string(b)
+		}
+		all = append(all, Patch{Patch: p})
+	}
+	for _, p := range append(all, k.Patches...) {
+		body, err := patchBody(root, p)
+		if err != nil {
+			return nil, err
+		}
+		var ops []obj
+		if yaml.Unmarshal([]byte(body), &ops) == nil && ops != nil {
+			if p.Target == nil {
+				return nil, errors.New("must specify a target for JSON patch")
+			}
+			if err := jsonPatchAll(rs, *p.Target, ops); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		patches, err := readDocs(body)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse SM or JSON patch: %w", err)
+		}
+		if p.Target != nil {
+			if len(patches) != 1 {
+				return nil, errors.New("multiple strategic merge patches in one patches entry may not set a target")
+			}
+			if rs, err = patchTargets(rs, *p.Target, patches[0]); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		for _, p := range patches {
+			if str(p, "kind") == "" {
+				return nil, errors.New("unable to parse SM or JSON patch: missing kind")
+			}
+			if rs, err = patchOne(rs, p); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return rs, nil
+}
+
+// patchJson6902 applies patchesJson6902, the older field, which kustomize
+// runs after labels and annotations.
+func patchJson6902(root string, k *Kustomization, rs []*resource) error {
+	for _, p := range k.PatchesJson6902 {
+		body, err := patchBody(root, p)
+		if err != nil {
+			return err
+		}
+		var ops []obj
+		if err := yaml.Unmarshal([]byte(body), &ops); err != nil {
+			return fmt.Errorf("a JSON patch is a list of operations: %w", err)
+		}
+		if p.Target == nil {
+			return errors.New("must specify a target for JSON patch")
+		}
+		if err := jsonPatchAll(rs, *p.Target, ops); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// patchBody is a patch entry's text, read from its file or given inline.
+func patchBody(root string, p Patch) (string, error) {
+	switch {
+	case p.Path != "" && p.Patch != "":
+		return "", errors.New("patch and path can't be set at the same time")
+	case p.Path != "":
+		b, err := readInRoot(root, p.Path)
+		return string(b), err
+	case p.Patch != "":
+		return p.Patch, nil
+	}
+	return "", errors.New("must specify one of patch and path")
+}
+
+// jsonPatchAll applies JSON patch operations to every resource t selects.
+func jsonPatchAll(rs []*resource, t Target, ops []obj) error {
+	for _, r := range rs {
+		if ok, err := selects(t, r); err != nil {
+			return err
+		} else if !ok {
+			continue
+		}
+		// kustomize keeps bookkeeping annotations on every resource while it
+		// builds, so to a JSON patch metadata.annotations always exists.
+		md := meta(r.o)
+		if _, ok := md["annotations"]; !ok {
+			md["annotations"] = obj{}
+		}
+		for _, op := range ops {
+			if err := jsonOp(r.o, op); err != nil {
+				return fmt.Errorf("%s %s: %w", str(r.o, "kind"), str(r.o, "metadata", "name"), err)
+			}
+		}
+		if a, ok := md["annotations"].(obj); ok && len(a) == 0 {
+			delete(md, "annotations")
+		}
+	}
+	return nil
+}
+
+// selects is whether t picks r. Group, version, kind, name and namespace
+// are regular expressions that must match the whole field; the name and
+// namespace may be r's first or its current ones, and a resource with no
+// namespace is in "default". The selectors are label selectors.
+func selects(t Target, r *resource) (bool, error) {
+	version := str(r.o, "apiVersion")
+	if i := strings.Index(version, "/"); i >= 0 {
+		version = version[i+1:]
+	}
+	first, cur := r.ids[0], r.ids[len(r.ids)-1]
+	ns := func(s string) string {
+		if s == "" {
+			return "default"
+		}
+		return s
+	}
+	for _, f := range []struct {
+		re     string
+		values []string
+	}{
+		{t.Group, []string{group(r.o)}},
+		{t.Version, []string{version}},
+		{t.Kind, []string{str(r.o, "kind")}},
+		{t.Name, []string{first[0], cur[0]}},
+		{t.Namespace, []string{ns(first[1]), ns(cur[1])}},
+	} {
+		if f.re == "" {
+			continue
+		}
+		re, err := regexp.Compile("^(?:" + f.re + ")$")
+		if err != nil {
+			return false, err
+		}
+		if !re.MatchString(f.values[0]) && !re.MatchString(f.values[len(f.values)-1]) {
+			return false, nil
+		}
+	}
+	for _, s := range []struct{ sel, field string }{{t.LabelSelector, "labels"}, {t.AnnotationSelector, "annotations"}} {
+		if s.sel == "" {
+			continue
+		}
+		m, _ := meta(r.o)[s.field].(obj)
+		ok, err := matchSelector(s.sel, m)
+		if !ok || err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+var selectorTerm = regexp.MustCompile(`^\s*(!?)\s*([\w./-]+)\s*(?:(==|=|!=)\s*([\w./-]*)|\s(in|notin)\s*\(([^)]*)\))?\s*$`)
+
+// matchSelector matches a label selector — key=value, key==value,
+// key!=value, key in (a,b), key notin (a,b), key, !key, joined by commas —
+// against a map of labels or annotations.
+func matchSelector(sel string, m obj) (bool, error) {
+	var terms []string
+	depth, start := 0, 0
+	for i, c := range sel + "," {
+		switch {
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case c == ',' && depth == 0:
+			terms = append(terms, sel[start:i])
+			start = i + 1
+		}
+	}
+	for _, term := range terms {
+		g := selectorTerm.FindStringSubmatch(term)
+		if g == nil {
+			return false, fmt.Errorf("unable to parse requirement %q", term)
+		}
+		v, has := m[g[2]].(string)
+		var ok bool
+		switch {
+		case g[1] == "!":
+			ok = !has
+		case g[3] == "=" || g[3] == "==":
+			ok = has && v == g[4]
+		case g[3] == "!=":
+			ok = v != g[4] || !has
+		case g[5] != "":
+			in := false
+			for _, x := range strings.Split(g[6], ",") {
+				in = in || (has && strings.TrimSpace(x) == v)
+			}
+			ok = in == (g[5] == "in")
+		default:
+			ok = has
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// jsonOp applies one RFC 6902 operation to doc.
+func jsonOp(doc obj, op obj) error {
+	path, _ := op["path"].(string)
+	from, _ := op["from"].(string)
+	switch op["op"] {
+	case "add":
+		return pointer(doc, path, func(c any, key string) (any, error) { return add(c, key, op["value"]) })
+	case "remove":
+		return pointer(doc, path, remove)
+	case "replace":
+		// kustomize lets replace add a missing key, but not a missing index.
+		return pointer(doc, path, func(c any, key string) (any, error) {
+			if l, ok := c.([]any); ok {
+				i, err := index(key, len(l))
+				if err != nil {
+					return nil, err
+				}
+				l[i] = op["value"]
+				return l, nil
+			}
+			return add(c, key, op["value"])
+		})
+	case "move", "copy":
+		var v any
+		err := pointer(doc, from, func(c any, key string) (any, error) {
+			var err error
+			if v, err = get(c, key); err != nil || op["op"] == "copy" {
+				return c, err
+			}
+			return remove(c, key)
+		})
+		if err != nil {
+			return err
+		}
+		if op["op"] == "copy" {
+			v = deepCopy(v)
+		}
+		return pointer(doc, path, func(c any, key string) (any, error) { return add(c, key, v) })
+	case "test":
+		return pointer(doc, path, func(c any, key string) (any, error) {
+			v, err := get(c, key)
+			if err == nil && !reflect.DeepEqual(v, op["value"]) {
+				err = fmt.Errorf("testing value %s failed", path)
+			}
+			return c, err
+		})
+	}
+	return fmt.Errorf("unexpected operation %v", op["op"])
+}
+
+// pointer walks a JSON pointer to the container of its last token and
+// replaces that container with what edit returns.
+func pointer(doc obj, path string, edit func(c any, key string) (any, error)) error {
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("path %q is not a JSON pointer", path)
+	}
+	var toks []string
+	for _, t := range strings.Split(path[1:], "/") {
+		toks = append(toks, strings.NewReplacer("~1", "/", "~0", "~").Replace(t))
+	}
+	var walk func(c any, toks []string) (any, error)
+	walk = func(c any, toks []string) (any, error) {
+		if len(toks) == 1 {
+			return edit(c, toks[0])
+		}
+		child, err := get(c, toks[0])
+		if err != nil {
+			return nil, err
+		}
+		if child, err = walk(child, toks[1:]); err != nil {
+			return nil, err
+		}
+		switch c := c.(type) {
+		case obj:
+			c[toks[0]] = child
+		case []any:
+			i, _ := index(toks[0], len(c))
+			c[i] = child
+		}
+		return c, nil
+	}
+	_, err := walk(doc, toks)
+	return err
+}
+
+// index parses a list index, which must be below n.
+func index(tok string, n int) (int, error) {
+	i, err := strconv.Atoi(tok)
+	if err != nil || i < 0 || i >= n {
+		return 0, fmt.Errorf("index %s is out of range", tok)
+	}
+	return i, nil
+}
+
+func get(c any, key string) (any, error) {
+	switch c := c.(type) {
+	case obj:
+		v, ok := c[key]
+		if !ok {
+			return nil, fmt.Errorf("missing key %q", key)
+		}
+		return v, nil
+	case []any:
+		i, err := index(key, len(c))
+		if err != nil {
+			return nil, err
+		}
+		return c[i], nil
+	}
+	return nil, fmt.Errorf("cannot step into %q", key)
+}
+
+func add(c any, key string, v any) (any, error) {
+	switch c := c.(type) {
+	case obj:
+		c[key] = v
+		return c, nil
+	case []any:
+		if key == "-" {
+			return append(c, v), nil
+		}
+		i, err := index(key, len(c)+1)
+		if err != nil {
+			return nil, err
+		}
+		return append(c[:i:i], append([]any{v}, c[i:]...)...), nil
+	}
+	return nil, fmt.Errorf("cannot add %q", key)
+}
+
+func remove(c any, key string) (any, error) {
+	if _, err := get(c, key); err != nil {
+		return nil, fmt.Errorf("unable to remove: %w", err)
+	}
+	switch c := c.(type) {
+	case obj:
+		delete(c, key)
+		return c, nil
+	case []any:
+		i, _ := index(key, len(c))
+		return append(c[:i:i], c[i+1:]...), nil
+	}
+	return c, nil
+}
+
+// deepCopy copies decoded YAML, so a copied value is not shared.
+func deepCopy(v any) any {
+	switch v := v.(type) {
+	case obj:
+		out := obj{}
+		for k, x := range v {
+			out[k] = deepCopy(x)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, x := range v {
+			out[i] = deepCopy(x)
+		}
+		return out
+	}
+	return v
+}
+
+// patchTargets lays one strategic merge patch over every resource t
+// selects; the patch's own kind and name are not consulted.
+func patchTargets(rs []*resource, t Target, p obj) ([]*resource, error) {
+	var out []*resource
+	for _, r := range rs {
+		ok, err := selects(t, r)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			out = append(out, r)
+			continue
+		}
+		if p["$patch"] == "delete" {
+			continue
+		}
+		mergeKept(r, deepCopy(p).(obj))
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// patchOne lays a strategic merge patch over the one resource with its
+// apiVersion, kind, name and namespace, now or earlier in the build.
+func patchOne(rs []*resource, p obj) ([]*resource, error) {
+	var hit []int
+	for i, r := range rs {
+		if str(r.o, "apiVersion") == str(p, "apiVersion") && str(r.o, "kind") == str(p, "kind") &&
+			r.was(str(p, "metadata", "name"), str(p, "metadata", "namespace")) {
+			hit = append(hit, i)
+		}
+	}
+	if len(hit) != 1 {
+		return nil, fmt.Errorf("no resource matches strategic merge patch %s %s/%s: failed to find unique target for patch",
+			str(p, "kind"), str(p, "metadata", "namespace"), str(p, "metadata", "name"))
+	}
+	if p["$patch"] == "delete" {
+		return append(rs[:hit[0]:hit[0]], rs[hit[0]+1:]...), nil
+	}
+	mergeKept(rs[hit[0]], p)
+	return rs, nil
+}
+
+// mergeKept merges a patch into r, which keeps its apiVersion, kind, name
+// and namespace whatever the patch says.
+func mergeKept(r *resource, p obj) {
+	keep := map[string]any{}
+	for _, f := range []string{"apiVersion", "kind"} {
+		keep[f] = r.o[f]
+	}
+	name, ns := str(r.o, "metadata", "name"), str(r.o, "metadata", "namespace")
+	kind := ""
+	if builtin(r.o) {
+		kind = str(r.o, "kind")
+	}
+	mergeMap(r.o, p, "", kind)
+	for f, v := range keep {
+		r.o[f] = v
+	}
+	meta(r.o)["name"] = name
+	delete(meta(r.o), "namespace")
+	if ns != "" {
+		meta(r.o)["namespace"] = ns
+	}
+}
+
+// builtin is whether kustomize knows the kind's schema, and so which lists
+// in it merge item by item rather than being replaced.
+func builtin(o obj) bool {
+	g := group(o)
+	return !strings.Contains(g, ".") || strings.HasSuffix(g, ".k8s.io")
+}
+
+// mergeKey is the field that identifies an item of the list at path, or ""
+// when the list is replaced whole.
+func mergeKey(kind, path string) string {
+	if kind == "Service" && path == "spec/ports" {
+		return "port"
+	}
+	switch path[strings.LastIndex(path, "/")+1:] {
+	case "containers", "initContainers", "ephemeralContainers", "volumes", "env", "imagePullSecrets":
+		return "name"
+	case "volumeMounts":
+		return "mountPath"
+	case "volumeDevices":
+		return "devicePath"
+	case "ports":
+		return "containerPort"
+	}
+	return ""
+}
+
+// mergeMap merges patch into dst the strategic way: maps key by key, null
+// deletes, `$patch: replace` swaps the whole map. kind is the resource's kind
+// when kustomize knows its schema, and "" when every list is replaced whole.
+func mergeMap(dst, patch obj, path, kind string) {
+	if patch["$patch"] == "replace" {
+		for k := range dst {
+			delete(dst, k)
+		}
+	}
+	for k, v := range patch {
+		if k == "$patch" {
+			continue
+		}
+		at := strings.TrimPrefix(path+"/"+k, "/")
+		switch v := v.(type) {
+		case nil:
+			delete(dst, k)
+		case obj:
+			d, ok := dst[k].(obj)
+			if !ok {
+				d = obj{}
+				dst[k] = d
+			}
+			mergeMap(d, v, at, kind)
+		case []any:
+			old, _ := dst[k].([]any)
+			dst[k] = mergeList(old, v, at, kind)
+		default:
+			dst[k] = v
+		}
+	}
+}
+
+// mergeList merges a patch list into a list. With a merge key, the patch's
+// items come first, each merged into the item it names, then the items the
+// patch left alone; `$patch: delete` drops an item and `$patch: replace`
+// keeps only the patch's. Without one, the patch replaces the list.
+func mergeList(dst, patch []any, path, kind string) []any {
+	key := ""
+	if kind != "" {
+		key = mergeKey(kind, path)
+	}
+	replace := key == ""
+	for _, p := range patch {
+		if m, ok := p.(obj); ok && m["$patch"] == "replace" {
+			replace = true
+		}
+	}
+	var out []any
+	used := map[int]bool{}
+	for _, p := range patch {
+		m, ok := p.(obj)
+		if !ok {
+			out = append(out, p)
+			continue
+		}
+		if m["$patch"] == "replace" {
+			continue
+		}
+		item := obj{}
+		if !replace {
+			for i, d := range dst {
+				if d, ok := d.(obj); ok && !used[i] && reflect.DeepEqual(d[key], m[key]) {
+					item, used[i] = d, true
+					break
+				}
+			}
+		}
+		if m["$patch"] == "delete" {
+			continue
+		}
+		mergeMap(item, m, path, kind)
+		out = append(out, item)
+	}
+	if !replace {
+		for i, d := range dst {
+			if !used[i] {
+				out = append(out, d)
+			}
+		}
+	}
+	return out
+}

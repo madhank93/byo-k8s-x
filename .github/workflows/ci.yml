@@ -41,14 +41,21 @@ jobs:
       - uses: helm/kind-action@v1
         with:
           install_only: true
-      # The apiserver and safe-apply courses end by driving the real kubectl,
-      # so they get the version mise.toml pins, not the runner's.
+      # Courses graded against the real kubectl (and its built-in kustomize)
+      # need the version mise.toml pins. kind-action puts its own kubectl on
+      # PATH, so the pinned one is prepended after it through GITHUB_PATH.
       - name: Install the pinned kubectl
         run: |
           version=$(awk -F'"' '/^kubectl = /{print $2}' mise.toml)
-          curl -fsSLo "$RUNNER_TEMP/kubectl" "https://dl.k8s.io/release/v$version/bin/linux/amd64/kubectl"
-          sudo install -m 0755 "$RUNNER_TEMP/kubectl" /usr/local/bin/kubectl
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSLo "$RUNNER_TEMP/bin/kubectl" "https://dl.k8s.io/release/v$version/bin/linux/amd64/kubectl"
+          chmod 0755 "$RUNNER_TEMP/bin/kubectl"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Check kubectl is the pinned one
+        run: |
+          want=$(awk -F'"' '/^kubectl = /{print $2}' mise.toml)
           kubectl version --client
+          kubectl version --client -o json | grep -q "\"gitVersion\": \"v$want\"" || { echo "::error::kubectl on PATH is not v$want"; exit 1; }
       # The helm course's release stages grade against the real helm.
       - name: Install the pinned helm
         run: |

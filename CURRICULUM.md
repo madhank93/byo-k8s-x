@@ -225,13 +225,14 @@ Host processes again. Independent of tiers 2 and 3 — take them whenever.
 `list-status` · `history` · `upgrade-3way-merge` · `rollback` · `hooks` ·
 `hook-weights` · `test` · `uninstall` · `dependencies` · `template-parity`
 
-### `kustomize` — Build your own kustomize · 18 stages
+### [x] `kustomize` — Build your own kustomize · 19 stages
 
 `kustomization-load` · `resources` · `namespace` · `name-prefix` ·
 `common-labels` · `common-annotations` · `images` · `replicas` ·
 `configmap-generator` · `secret-generator` · `name-hash` ·
 `name-references` · `strategic-merge-patch` · `json6902-patch` ·
-`patch-targets` · `overlays` · `components` · `replacements`
+`patch-targets` · `overlays` · `components` · `replacements` ·
+`kustomize-parity`
 
 ### `csi` — Build your own CSI driver · 20 stages
 
@@ -293,6 +294,6 @@ harness races it.
 | A long-running learner process (start / assert / SIGTERM) | `controller`, `webhook`, `scheduler`, `apiserver` | built alongside `controller` |
 | Convergence fixtures (`WaitFor`, CRD helpers) | `controller` onward | built alongside `controller` |
 | Multi-node kind, topology from `course.yml` | `scheduler`, `cni`, `kube-proxy` | not built |
-| No-cluster courses (nothing to `kind up`) | `apiserver`, `kustomize` | not built |
+| No-cluster courses (nothing to `kind up`) | `apiserver`, `kustomize` | built alongside `apiserver` |
 | `runner.NodeExec` — cross-compile, copy into a kind node, run there | all of tier 3, `csi` | not built |
 | A non-Go course | none yet | `course.yml` carries `language`/`build`; `internal/runner` still assumes Go |
