@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -37,9 +39,30 @@ type Kustomization struct {
 	Images   []Image   `json:"images,omitempty"`
 	Replicas []Replica `json:"replicas,omitempty"`
 
+	PatchesStrategicMerge []string `json:"patchesStrategicMerge,omitempty"`
+	Patches               []Patch  `json:"patches,omitempty"`
+	PatchesJson6902       []Patch  `json:"patchesJson6902,omitempty"`
+
 	ConfigMapGenerator []Generator       `json:"configMapGenerator,omitempty"`
 	SecretGenerator    []SecretGenerator `json:"secretGenerator,omitempty"`
 	GeneratorOptions   *GeneratorOptions `json:"generatorOptions,omitempty"`
+}
+
+// Patch is one entry of patches: a patch in a file, or inline, and the
+// resources it is for.
+type Patch struct {
+	Path   string  `json:"path,omitempty"`
+	Patch  string  `json:"patch,omitempty"`
+	Target *Target `json:"target,omitempty"`
+}
+
+// Target picks the resources a patch applies to.
+type Target struct {
+	Group     string `json:"group,omitempty"`
+	Version   string `json:"version,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // Generator is one entry of configMapGenerator.
@@ -90,23 +113,43 @@ type Label struct {
 // obj is one resource, as decoded YAML.
 type obj = map[string]any
 
-// resource is an object and every name it has had, the current one last, so
-// a reference to an older name can still find it.
+// resource is an object and every name and namespace it has had, the
+// current ones last, so a reference to an older name can still find it.
 type resource struct {
-	o     obj
-	names []string
-	hash  bool // a generated name, suffixed with a content hash at the end
+	o    obj
+	ids  [][2]string
+	hash bool // a generated name, suffixed with a content hash at the end
+}
+
+func newResource(o obj) *resource {
+	r := &resource{o: o}
+	r.remember()
+	return r
+}
+
+func (r *resource) remember() {
+	r.ids = append(r.ids, [2]string{str(r.o, "metadata", "name"), str(r.o, "metadata", "namespace")})
 }
 
 func (r *resource) rename(name string) {
 	meta(r.o)["name"] = name
-	r.names = append(r.names, name)
+	r.remember()
 }
 
 // hasName is whether the resource is, or once was, called name.
 func (r *resource) hasName(name string) bool {
-	for _, n := range r.names {
-		if n == name {
+	for _, id := range r.ids {
+		if id[0] == name {
+			return true
+		}
+	}
+	return false
+}
+
+// was is whether the resource is, or once was, name in namespace ns.
+func (r *resource) was(name, ns string) bool {
+	for _, id := range r.ids {
+		if id == [2]string{name, ns} {
 			return true
 		}
 	}
@@ -256,10 +299,15 @@ func build(dir string, visiting map[string]bool) ([]*resource, error) {
 			return nil, err
 		}
 		hash := !mergeOptions(k.GeneratorOptions, g.Options).DisableNameSuffixHash
-		rs = append(rs, &resource{o: o, names: []string{g.Name}, hash: hash})
+		r := newResource(o)
+		r.hash = hash
+		rs = append(rs, r)
 	}
 	if err := unique(objects(rs)); err != nil {
 		return nil, fmt.Errorf("may not add resource with an already registered id: %w", err)
+	}
+	if rs, err = patchAll(abs, k, rs); err != nil {
+		return nil, err
 	}
 	if k.Namespace != "" {
 		setNamespace(rs, k.Namespace)
@@ -293,6 +341,9 @@ func build(dir string, visiting map[string]bool) ([]*resource, error) {
 	}
 	if len(k.CommonAnnotations) > 0 {
 		apply(out, annotationSpecs, setPairs(k.CommonAnnotations))
+	}
+	if err := patchJson6902(abs, k, rs); err != nil {
+		return nil, err
 	}
 	for _, img := range k.Images {
 		for _, o := range out {
@@ -791,6 +842,7 @@ func setNamespace(rs []*resource, ns string) {
 			r.rename(ns)
 		case !clusterScoped(o):
 			meta(o)["namespace"] = ns
+			r.remember()
 		}
 	}
 }
@@ -873,21 +925,33 @@ func sortLegacy(objs []obj) {
 
 var docSep = regexp.MustCompile(`(?m)^---[ \t]*$`)
 
+// readDocs decodes every non-empty document of a YAML stream.
+func readDocs(data string) ([]obj, error) {
+	var out []obj
+	for _, doc := range docSep.Split(data, -1) {
+		var o obj
+		if err := yaml.Unmarshal([]byte(doc), &o); err != nil {
+			return nil, err
+		}
+		if o != nil {
+			out = append(out, o)
+		}
+	}
+	return out, nil
+}
+
 // readResources decodes every document of a YAML file.
 func readResources(path string) ([]*resource, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	docs, err := readDocs(string(data))
+	if err != nil {
+		return nil, err
+	}
 	var objs []obj
-	for _, doc := range docSep.Split(string(data), -1) {
-		var o obj
-		if err := yaml.Unmarshal([]byte(doc), &o); err != nil {
-			return nil, err
-		}
-		if o == nil {
-			continue
-		}
+	for _, o := range docs {
 		items, ok := o["items"].([]any)
 		if !ok || !strings.HasSuffix(str(o, "kind"), "List") {
 			objs = append(objs, o)
@@ -909,7 +973,7 @@ func readResources(path string) ([]*resource, error) {
 		if str(o, "metadata", "name") == "" {
 			return nil, errors.New("missing metadata.name in object")
 		}
-		out = append(out, &resource{o: o, names: []string{str(o, "metadata", "name")}})
+		out = append(out, newResource(o))
 	}
 	return out, nil
 }
@@ -926,4 +990,424 @@ func str(o obj, path ...string) string {
 	}
 	s, _ := v.(string)
 	return s
+}
+
+// patchAll applies patchesStrategicMerge, then patches, in the order listed.
+func patchAll(root string, k *Kustomization, rs []*resource) ([]*resource, error) {
+	var all []Patch
+	for _, p := range k.PatchesStrategicMerge {
+		// An entry is a file when one exists by that name, and a patch otherwise.
+		if b, err := readInRoot(root, p); err == nil {
+			p = string(b)
+		}
+		all = append(all, Patch{Patch: p})
+	}
+	for _, p := range append(all, k.Patches...) {
+		body, err := patchBody(root, p)
+		if err != nil {
+			return nil, err
+		}
+		var ops []obj
+		if yaml.Unmarshal([]byte(body), &ops) == nil && ops != nil {
+			if p.Target == nil {
+				return nil, errors.New("must specify a target for JSON patch")
+			}
+			if err := jsonPatchAll(rs, *p.Target, ops); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		patches, err := readDocs(body)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse SM or JSON patch: %w", err)
+		}
+		for _, p := range patches {
+			if str(p, "kind") == "" {
+				return nil, errors.New("unable to parse SM or JSON patch: missing kind")
+			}
+			if rs, err = patchOne(rs, p); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return rs, nil
+}
+
+// patchJson6902 applies patchesJson6902, the older field, which kustomize
+// runs after labels and annotations.
+func patchJson6902(root string, k *Kustomization, rs []*resource) error {
+	for _, p := range k.PatchesJson6902 {
+		body, err := patchBody(root, p)
+		if err != nil {
+			return err
+		}
+		var ops []obj
+		if err := yaml.Unmarshal([]byte(body), &ops); err != nil {
+			return fmt.Errorf("a JSON patch is a list of operations: %w", err)
+		}
+		if p.Target == nil {
+			return errors.New("must specify a target for JSON patch")
+		}
+		if err := jsonPatchAll(rs, *p.Target, ops); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// patchBody is a patch entry's text, read from its file or given inline.
+func patchBody(root string, p Patch) (string, error) {
+	switch {
+	case p.Path != "" && p.Patch != "":
+		return "", errors.New("patch and path can't be set at the same time")
+	case p.Path != "":
+		b, err := readInRoot(root, p.Path)
+		return string(b), err
+	case p.Patch != "":
+		return p.Patch, nil
+	}
+	return "", errors.New("must specify one of patch and path")
+}
+
+// jsonPatchAll applies JSON patch operations to every resource t selects.
+func jsonPatchAll(rs []*resource, t Target, ops []obj) error {
+	for _, r := range rs {
+		if !selects(t, r) {
+			continue
+		}
+		for _, op := range ops {
+			if err := jsonOp(r.o, op); err != nil {
+				return fmt.Errorf("%s %s: %w", str(r.o, "kind"), str(r.o, "metadata", "name"), err)
+			}
+		}
+	}
+	return nil
+}
+
+// selects is whether t picks r: each field it sets must equal r's, and the
+// name and namespace may be r's first or its current ones. A resource with no
+// namespace is in "default".
+func selects(t Target, r *resource) bool {
+	version := str(r.o, "apiVersion")
+	if i := strings.Index(version, "/"); i >= 0 {
+		version = version[i+1:]
+	}
+	first, cur := r.ids[0], r.ids[len(r.ids)-1]
+	ns := func(s string) string {
+		if s == "" {
+			return "default"
+		}
+		return s
+	}
+	return (t.Group == "" || t.Group == group(r.o)) &&
+		(t.Version == "" || t.Version == version) &&
+		(t.Kind == "" || t.Kind == str(r.o, "kind")) &&
+		(t.Name == "" || t.Name == first[0] || t.Name == cur[0]) &&
+		(t.Namespace == "" || t.Namespace == ns(first[1]) || t.Namespace == ns(cur[1]))
+}
+
+// jsonOp applies one RFC 6902 operation to doc.
+func jsonOp(doc obj, op obj) error {
+	path, _ := op["path"].(string)
+	from, _ := op["from"].(string)
+	switch op["op"] {
+	case "add":
+		return pointer(doc, path, func(c any, key string) (any, error) { return add(c, key, op["value"]) })
+	case "remove":
+		return pointer(doc, path, remove)
+	case "replace":
+		// kustomize lets replace add a missing key, but not a missing index.
+		return pointer(doc, path, func(c any, key string) (any, error) {
+			if l, ok := c.([]any); ok {
+				i, err := index(key, len(l))
+				if err != nil {
+					return nil, err
+				}
+				l[i] = op["value"]
+				return l, nil
+			}
+			return add(c, key, op["value"])
+		})
+	case "move", "copy":
+		var v any
+		err := pointer(doc, from, func(c any, key string) (any, error) {
+			var err error
+			if v, err = get(c, key); err != nil || op["op"] == "copy" {
+				return c, err
+			}
+			return remove(c, key)
+		})
+		if err != nil {
+			return err
+		}
+		if op["op"] == "copy" {
+			v = deepCopy(v)
+		}
+		return pointer(doc, path, func(c any, key string) (any, error) { return add(c, key, v) })
+	case "test":
+		return pointer(doc, path, func(c any, key string) (any, error) {
+			v, err := get(c, key)
+			if err == nil && !reflect.DeepEqual(v, op["value"]) {
+				err = fmt.Errorf("testing value %s failed", path)
+			}
+			return c, err
+		})
+	}
+	return fmt.Errorf("unexpected operation %v", op["op"])
+}
+
+// pointer walks a JSON pointer to the container of its last token and
+// replaces that container with what edit returns.
+func pointer(doc obj, path string, edit func(c any, key string) (any, error)) error {
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("path %q is not a JSON pointer", path)
+	}
+	var toks []string
+	for _, t := range strings.Split(path[1:], "/") {
+		toks = append(toks, strings.NewReplacer("~1", "/", "~0", "~").Replace(t))
+	}
+	var walk func(c any, toks []string) (any, error)
+	walk = func(c any, toks []string) (any, error) {
+		if len(toks) == 1 {
+			return edit(c, toks[0])
+		}
+		child, err := get(c, toks[0])
+		if err != nil {
+			return nil, err
+		}
+		if child, err = walk(child, toks[1:]); err != nil {
+			return nil, err
+		}
+		switch c := c.(type) {
+		case obj:
+			c[toks[0]] = child
+		case []any:
+			i, _ := index(toks[0], len(c))
+			c[i] = child
+		}
+		return c, nil
+	}
+	_, err := walk(doc, toks)
+	return err
+}
+
+// index parses a list index, which must be below n.
+func index(tok string, n int) (int, error) {
+	i, err := strconv.Atoi(tok)
+	if err != nil || i < 0 || i >= n {
+		return 0, fmt.Errorf("index %s is out of range", tok)
+	}
+	return i, nil
+}
+
+func get(c any, key string) (any, error) {
+	switch c := c.(type) {
+	case obj:
+		v, ok := c[key]
+		if !ok {
+			return nil, fmt.Errorf("missing key %q", key)
+		}
+		return v, nil
+	case []any:
+		i, err := index(key, len(c))
+		if err != nil {
+			return nil, err
+		}
+		return c[i], nil
+	}
+	return nil, fmt.Errorf("cannot step into %q", key)
+}
+
+func add(c any, key string, v any) (any, error) {
+	switch c := c.(type) {
+	case obj:
+		c[key] = v
+		return c, nil
+	case []any:
+		if key == "-" {
+			return append(c, v), nil
+		}
+		i, err := index(key, len(c)+1)
+		if err != nil {
+			return nil, err
+		}
+		return append(c[:i:i], append([]any{v}, c[i:]...)...), nil
+	}
+	return nil, fmt.Errorf("cannot add %q", key)
+}
+
+func remove(c any, key string) (any, error) {
+	if _, err := get(c, key); err != nil {
+		return nil, fmt.Errorf("unable to remove: %w", err)
+	}
+	switch c := c.(type) {
+	case obj:
+		delete(c, key)
+		return c, nil
+	case []any:
+		i, _ := index(key, len(c))
+		return append(c[:i:i], c[i+1:]...), nil
+	}
+	return c, nil
+}
+
+// deepCopy copies decoded YAML, so a copied value is not shared.
+func deepCopy(v any) any {
+	switch v := v.(type) {
+	case obj:
+		out := obj{}
+		for k, x := range v {
+			out[k] = deepCopy(x)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, x := range v {
+			out[i] = deepCopy(x)
+		}
+		return out
+	}
+	return v
+}
+
+// patchOne lays a strategic merge patch over the one resource with its
+// apiVersion, kind, name and namespace, now or earlier in the build.
+func patchOne(rs []*resource, p obj) ([]*resource, error) {
+	var hit []int
+	for i, r := range rs {
+		if str(r.o, "apiVersion") == str(p, "apiVersion") && str(r.o, "kind") == str(p, "kind") &&
+			r.was(str(p, "metadata", "name"), str(p, "metadata", "namespace")) {
+			hit = append(hit, i)
+		}
+	}
+	if len(hit) != 1 {
+		return nil, fmt.Errorf("no resource matches strategic merge patch %s %s/%s: failed to find unique target for patch",
+			str(p, "kind"), str(p, "metadata", "namespace"), str(p, "metadata", "name"))
+	}
+	r := rs[hit[0]]
+	if p["$patch"] == "delete" {
+		return append(rs[:hit[0]:hit[0]], rs[hit[0]+1:]...), nil
+	}
+	name, ns := str(r.o, "metadata", "name"), str(r.o, "metadata", "namespace")
+	kind := ""
+	if builtin(r.o) {
+		kind = str(r.o, "kind")
+	}
+	mergeMap(r.o, p, "", kind)
+	meta(r.o)["name"] = name
+	delete(meta(r.o), "namespace")
+	if ns != "" {
+		meta(r.o)["namespace"] = ns
+	}
+	return rs, nil
+}
+
+// builtin is whether kustomize knows the kind's schema, and so which lists
+// in it merge item by item rather than being replaced.
+func builtin(o obj) bool {
+	g := group(o)
+	return !strings.Contains(g, ".") || strings.HasSuffix(g, ".k8s.io")
+}
+
+// mergeKey is the field that identifies an item of the list at path, or ""
+// when the list is replaced whole.
+func mergeKey(kind, path string) string {
+	if kind == "Service" && path == "spec/ports" {
+		return "port"
+	}
+	switch path[strings.LastIndex(path, "/")+1:] {
+	case "containers", "initContainers", "ephemeralContainers", "volumes", "env", "imagePullSecrets":
+		return "name"
+	case "volumeMounts":
+		return "mountPath"
+	case "volumeDevices":
+		return "devicePath"
+	case "ports":
+		return "containerPort"
+	}
+	return ""
+}
+
+// mergeMap merges patch into dst the strategic way: maps key by key, null
+// deletes, `$patch: replace` swaps the whole map. kind is the resource's kind
+// when kustomize knows its schema, and "" when every list is replaced whole.
+func mergeMap(dst, patch obj, path, kind string) {
+	if patch["$patch"] == "replace" {
+		for k := range dst {
+			delete(dst, k)
+		}
+	}
+	for k, v := range patch {
+		if k == "$patch" {
+			continue
+		}
+		at := strings.TrimPrefix(path+"/"+k, "/")
+		switch v := v.(type) {
+		case nil:
+			delete(dst, k)
+		case obj:
+			d, ok := dst[k].(obj)
+			if !ok {
+				d = obj{}
+				dst[k] = d
+			}
+			mergeMap(d, v, at, kind)
+		case []any:
+			old, _ := dst[k].([]any)
+			dst[k] = mergeList(old, v, at, kind)
+		default:
+			dst[k] = v
+		}
+	}
+}
+
+// mergeList merges a patch list into a list. With a merge key, the patch's
+// items come first, each merged into the item it names, then the items the
+// patch left alone; `$patch: delete` drops an item and `$patch: replace`
+// keeps only the patch's. Without one, the patch replaces the list.
+func mergeList(dst, patch []any, path, kind string) []any {
+	key := ""
+	if kind != "" {
+		key = mergeKey(kind, path)
+	}
+	replace := key == ""
+	for _, p := range patch {
+		if m, ok := p.(obj); ok && m["$patch"] == "replace" {
+			replace = true
+		}
+	}
+	var out []any
+	used := map[int]bool{}
+	for _, p := range patch {
+		m, ok := p.(obj)
+		if !ok {
+			out = append(out, p)
+			continue
+		}
+		if m["$patch"] == "replace" {
+			continue
+		}
+		item := obj{}
+		if !replace {
+			for i, d := range dst {
+				if d, ok := d.(obj); ok && !used[i] && reflect.DeepEqual(d[key], m[key]) {
+					item, used[i] = d, true
+					break
+				}
+			}
+		}
+		if m["$patch"] == "delete" {
+			continue
+		}
+		mergeMap(item, m, path, kind)
+		out = append(out, item)
+	}
+	if !replace {
+		for i, d := range dst {
+			if !used[i] {
+				out = append(out, d)
+			}
+		}
+	}
+	return out
 }

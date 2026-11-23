@@ -53,6 +53,8 @@ func init() {
 	register(Stage{Slug: "secret-generator", Run: stageSecretGenerator})
 	register(Stage{Slug: "name-hash", Run: stageNameHash})
 	register(Stage{Slug: "name-references", Run: stageNameReferences})
+	register(Stage{Slug: "strategic-merge-patch", Run: stageStrategicMergePatch})
+	register(Stage{Slug: "json6902-patch", Run: stageJSON6902Patch})
 }
 
 // tree is a kustomization directory as slash paths to contents.
@@ -1264,6 +1266,285 @@ secretGenerator:
 			"a/kustomization.yaml":   "namespace: a\nnamePrefix: a-\nconfigMapGenerator:\n- name: settings\n  literals: [x=1]\n",
 			"b/kustomization.yaml":   "namespace: b\nresources: [pod.yaml]\n",
 			"b/pod.yaml":             "apiVersion: v1\nkind: Pod\nmetadata:\n  name: p\nspec:\n  containers:\n  - name: c\n    image: busybox\n    envFrom:\n    - configMapRef:\n        name: settings\n",
+		}},
+	})
+}
+
+// app is a Deployment, a Service and a custom resource with lists of every
+// sort a strategic merge patch treats differently.
+const app = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+    tier: front
+spec:
+  replicas: 1
+  template:
+    spec:
+      tolerations:
+      - key: spot
+        operator: Exists
+      containers:
+      - name: web
+        image: nginx
+        args: [--port, "80"]
+        ports:
+        - containerPort: 80
+          name: http
+        env:
+        - name: A
+          value: "1"
+        - name: B
+          value: "2"
+        volumeMounts:
+        - mountPath: /data
+          name: data
+      - name: sidecar
+        image: envoy
+      volumes:
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+  - port: 81
+---
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w
+spec:
+  containers:
+  - name: one
+    size: 1
+  - name: two
+    size: 2
+`
+
+// stageStrategicMergePatch — a patch shaped like the resource it changes:
+// maps merge, null deletes, lists the schema keys merge item by item with the
+// patch's items first, other lists are replaced, and $patch directives delete
+// or replace. Patches find their target by apiVersion, kind, name and
+// namespace, and run before this kustomization's namespace and prefix.
+func stageStrategicMergePatch(ctx context.Context, _ *kube.Env, bin string) error {
+	merge := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    tier: null
+    team: shop
+spec:
+  template:
+    spec:
+      tolerations:
+      - key: gpu
+        operator: Exists
+      containers:
+      - name: init
+        image: busybox
+      - name: web
+        args: [--port, "443"]
+        ports:
+        - containerPort: 443
+        env:
+        - name: B
+          value: "22"
+        - name: C
+          value: "3"
+        volumeMounts:
+        - mountPath: /cache
+          name: cache
+      - name: sidecar
+        $patch: delete
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: NodePort
+  ports:
+  - port: 443
+    name: https
+  - port: 80
+    targetPort: 9090
+---
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w
+spec:
+  containers:
+  - name: two
+    size: 22
+`
+	settings := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  mode: slow\n  extra: \"yes\"\n"
+	return runChecks(ctx, bin, []check{
+		{"one patch file holds three patches: labels merge and tier is deleted; containers, env, ports and volume mounts merge by their keys with the patch's items first and the rest after; sidecar is deleted; tolerations and args are replaced whole; a Service's ports merge by port; a custom resource's list is replaced even when it is called containers, since kustomize knows no schema for it", ".", tree{
+			"kustomization.yaml": "resources: [app.yaml]\npatches:\n- path: merge.yaml\n", "app.yaml": app, "merge.yaml": merge,
+		}},
+		{"an inline patch: $patch: replace swaps a whole map and a whole keyed list, and replicas: null removes the field", ".", tree{
+			"kustomization.yaml": `resources: [app.yaml]
+patches:
+- patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: web
+      labels:
+        $patch: replace
+        only: me
+    spec:
+      replicas: null
+      template:
+        spec:
+          volumes:
+          - $patch: replace
+          - name: scratch
+            emptyDir: {}
+`, "app.yaml": app,
+		}},
+		{"$patch: delete at the top of a patch deletes the whole resource", ".", tree{
+			"kustomization.yaml": "resources: [app.yaml]\npatches:\n- patch: |-\n    apiVersion: v1\n    kind: Service\n    metadata:\n      name: web\n    $patch: delete\n", "app.yaml": app,
+		}},
+		{"patches run before this kustomization's namespace and prefix, so they name a resource as it arrives; a generated ConfigMap can be patched too, and its hash is of the patched data", ".", tree{
+			"kustomization.yaml": "namespace: prod\nnamePrefix: p-\nresources: [app.yaml]\nconfigMapGenerator:\n- name: settings\n  literals: [mode=fast]\npatches:\n- path: settings.yaml\n- patch: |-\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n      name: web\n    spec:\n      replicas: 3\n",
+			"app.yaml":           app, "settings.yaml": settings,
+		}},
+		{"a patch in an overlay can name a base's resource by the name it had before the base prefixed it, or by the name it has now", "overlay", tree{
+			"base/kustomization.yaml":    "namePrefix: base-\nresources: [app.yaml]\n",
+			"base/app.yaml":              app,
+			"overlay/kustomization.yaml": "resources: [../base]\npatches:\n- patch: |-\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n      name: web\n    spec:\n      replicas: 4\n- patch: |-\n    apiVersion: v1\n    kind: Service\n    metadata:\n      name: base-web\n    spec:\n      type: LoadBalancer\n",
+		}},
+		{"a patch's namespace is part of what it matches: two ConfigMaps called settings, and the patch is for the one in b", ".", tree{
+			"kustomization.yaml": "resources: [a.yaml, b.yaml]\npatches:\n- patch: |-\n    apiVersion: v1\n    kind: ConfigMap\n    metadata:\n      name: settings\n      namespace: b\n    data:\n      mode: slow\n",
+			"a.yaml":             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: a\ndata:\n  mode: fast\n",
+			"b.yaml":             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: b\ndata:\n  mode: fast\n",
+		}},
+		{"patchesStrategicMerge, the older field, takes file names and inline patches alike, and runs before patches", ".", tree{
+			"kustomization.yaml": "resources: [app.yaml]\npatchesStrategicMerge:\n- svc.yaml\n- |-\n  apiVersion: apps/v1\n  kind: Deployment\n  metadata:\n    name: web\n  spec:\n    replicas: 5\npatches:\n- patch: |-\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n      name: web\n    spec:\n      replicas: 6\n",
+			"app.yaml":           app, "svc.yaml": "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  type: NodePort\n",
+		}},
+		{"no resource is a Deployment called api", ".", tree{
+			"kustomization.yaml": "resources: [app.yaml]\npatches:\n- patch: |-\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n      name: api\n    spec:\n      replicas: 3\n", "app.yaml": app,
+		}},
+		{"apiVersion is part of the match too: there is no apps/v1beta1 Deployment here", ".", tree{
+			"kustomization.yaml": "resources: [app.yaml]\npatches:\n- patch: |-\n    apiVersion: apps/v1beta1\n    kind: Deployment\n    metadata:\n      name: web\n    spec:\n      replicas: 3\n", "app.yaml": app,
+		}},
+		{"a patch without a namespace matches only a resource without one", ".", tree{
+			"kustomization.yaml": "resources: [b.yaml]\npatches:\n- patch: |-\n    apiVersion: v1\n    kind: ConfigMap\n    metadata:\n      name: settings\n    data:\n      mode: slow\n",
+			"b.yaml":             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: b\n",
+		}},
+		{"a patch that names its target nowhere: no kind", ".", tree{
+			"kustomization.yaml": "resources: [app.yaml]\npatches:\n- patch: |-\n    metadata:\n      name: web\n    spec:\n      replicas: 3\n", "app.yaml": app,
+		}},
+		{"a patch entry with both a path and an inline patch", ".", tree{
+			"kustomization.yaml": "resources: [app.yaml]\npatches:\n- path: settings.yaml\n  patch: |-\n    kind: ConfigMap\n", "app.yaml": app, "settings.yaml": settings,
+		}},
+		{"a patch entry with neither", ".", tree{
+			"kustomization.yaml": "resources: [app.yaml]\npatches:\n- {}\n", "app.yaml": app,
+		}},
+	})
+}
+
+// stageJSON6902Patch — a JSON patch is a list of RFC 6902 operations on paths
+// into the resource, applied to the resources its target names; a step that
+// cannot be taken is an error. patchesJson6902, the older field, runs later,
+// after labels and annotations.
+func stageJSON6902Patch(ctx context.Context, _ *kube.Env, bin string) error {
+	ops := `- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: Z
+    value: "26"
+- op: add
+  path: /spec/template/spec/containers/0/args/0
+  value: --verbose
+- op: replace
+  path: /spec/replicas
+  value: 3
+- op: remove
+  path: /metadata/labels/tier
+- op: copy
+  from: /spec/template/spec/containers/0/image
+  path: /spec/template/spec/containers/1/image
+- op: move
+  from: /spec/template/spec/tolerations
+  path: /spec/template/spec/preemptedTolerations
+- op: add
+  path: /metadata/annotations
+  value:
+    example.com/owner: shop
+- op: add
+  path: /metadata/annotations/example.com~1path
+  value: a/b
+- op: replace
+  path: /spec/template/spec/containers/0/env/1
+  value:
+    name: B
+    value: "two"
+- op: remove
+  path: /spec/template/spec/containers/0/ports/0
+- op: copy
+  from: /metadata/labels
+  path: /spec/template/metadata
+- op: add
+  path: /spec/template/metadata/copied
+  value: "only here"
+- op: test
+  path: /spec/replicas
+  value: 3
+`
+	patch := func(target, body string) string {
+		return "resources: [app.yaml]\npatches:\n- target:\n    " + strings.ReplaceAll(target, "\n", "\n    ") + "\n  patch: |-\n    " + strings.ReplaceAll(strings.TrimRight(body, "\n"), "\n", "\n    ") + "\n"
+	}
+	return runChecks(ctx, bin, []check{
+		{"add (into a map, at a list index and at the end with -), remove, replace, copy, move and test, in order; ~1 in a path is a slash, and a copy is a copy, not the same map twice", ".", tree{
+			"kustomization.yaml": "resources: [app.yaml]\npatches:\n- path: ops.yaml\n  target:\n    kind: Deployment\n    name: web\n", "app.yaml": app, "ops.yaml": ops,
+		}},
+		{"the same operations written as JSON, and a target by group, version and kind", ".", tree{
+			"kustomization.yaml": patch("group: \"\"\nversion: v1\nkind: Service", `[{"op": "add", "path": "/spec/ports/1/name", "value": "metrics"}, {"op": "replace", "path": "/spec/ports/0/port", "value": 8080}]`), "app.yaml": app,
+		}},
+		{"a target that names nothing in the build is not an error; the patch just applies nowhere", ".", tree{
+			"kustomization.yaml": patch("kind: Deployment\nname: api", `[{"op": "remove", "path": "/spec"}]`), "app.yaml": app,
+		}},
+		{"patches run before the prefix, so the target is the name as written; patchesJson6902 runs after the prefix and labels, and finds the resource by its first name or its current one", ".", tree{
+			"kustomization.yaml": "namePrefix: p-\nlabels:\n- pairs:\n    team: shop\nresources: [app.yaml]\npatches:\n- target:\n    kind: Service\n    name: web\n  patch: '[{\"op\": \"add\", \"path\": \"/spec/type\", \"value\": \"NodePort\"}]'\npatchesJson6902:\n- target:\n    group: apps\n    version: v1\n    kind: Deployment\n    name: web\n  path: labels.yaml\n- target:\n    version: v1\n    kind: Service\n    name: p-web\n  patch: '[{\"op\": \"add\", \"path\": \"/metadata/labels/seen\", \"value\": \"yes\"}]'\n",
+			"app.yaml":           app, "labels.yaml": "- op: replace\n  path: /metadata/labels/team\n  value: other\n",
+		}},
+		{"a target's namespace is matched too, and a resource with none is in default", ".", tree{
+			"kustomization.yaml": patch("namespace: default", `[{"op": "add", "path": "/metadata/annotations", "value": {"seen": "yes"}}]`) + "- target:\n    namespace: b\n  patch: '[{\"op\": \"add\", \"path\": \"/data\", \"value\": {\"in\": \"b\"}}]'\n",
+			"app.yaml":           "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: plain\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: in-b\n  namespace: b\n",
+		}},
+		{"remove a path that is not there", ".", tree{
+			"kustomization.yaml": patch("kind: Deployment", "- op: remove\n  path: /spec/paused\n"), "app.yaml": app,
+		}},
+		{"replace a key that is not there, which kustomize lets through as an add", ".", tree{
+			"kustomization.yaml": patch("kind: Deployment", "- op: replace\n  path: /spec/paused\n  value: true\n"), "app.yaml": app,
+		}},
+		{"replace a list item that is not there, which it does not", ".", tree{
+			"kustomization.yaml": patch("kind: Deployment", "- op: replace\n  path: /spec/template/spec/containers/7\n  value: {name: x}\n"), "app.yaml": app,
+		}},
+		{"add past the end of a list", ".", tree{
+			"kustomization.yaml": patch("kind: Deployment", "- op: add\n  path: /spec/template/spec/containers/5\n  value: {name: x}\n"), "app.yaml": app,
+		}},
+		{"add under a parent that does not exist", ".", tree{
+			"kustomization.yaml": patch("kind: Deployment", "- op: add\n  path: /spec/strategy/type\n  value: Recreate\n"), "app.yaml": app,
+		}},
+		{"a test that fails stops the build", ".", tree{
+			"kustomization.yaml": patch("kind: Deployment", "- op: test\n  path: /spec/replicas\n  value: 9\n"), "app.yaml": app,
+		}},
+		{"a JSON patch has no name of its own to match, so it needs a target", ".", tree{
+			"kustomization.yaml": "resources: [app.yaml]\npatches:\n- patch: '[{\"op\": \"remove\", \"path\": \"/spec\"}]'\n", "app.yaml": app,
 		}},
 	})
 }
