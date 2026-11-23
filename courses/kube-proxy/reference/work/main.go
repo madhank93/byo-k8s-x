@@ -3,12 +3,14 @@
 // It runs as root on a node, watches the Services labelled
 // service.kubernetes.io/service-proxy-name=byok8s and their EndpointSlices,
 // and reports each Service with a cluster IP and the ready addresses behind it.
+// Its rules live in one nftables table, ip byok8s, and nowhere else.
 package main
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"slices"
 	"sort"
@@ -30,6 +32,7 @@ import (
 const (
 	proxyLabel = "service.kubernetes.io/service-proxy-name"
 	proxyName  = "byok8s"
+	table      = "byok8s"
 )
 
 func main() {
@@ -116,6 +119,7 @@ func (p *proxier) sync() error {
 		return err
 	}
 	sort.Slice(svcs, func(i, j int) bool { return key(svcs[i]) < key(svcs[j]) })
+	var ports []servicePort
 	for _, s := range svcs {
 		if !proxied(s) {
 			continue
@@ -136,6 +140,78 @@ func (p *proxier) sync() error {
 			p.reportedE[key(s)] = joined
 			fmt.Printf("endpoints %s %s\n", key(s), joined)
 		}
+		for _, sp := range s.Spec.Ports {
+			ports = append(ports, servicePort{svc: s, port: sp, endpoints: eps})
+		}
+	}
+	return p.apply(render(ports))
+}
+
+// servicePort is one port of one Service: the unit a rule is written for.
+type servicePort struct {
+	svc       *corev1.Service
+	port      corev1.ServicePort
+	endpoints []endpoint
+}
+
+// chain names the chain holding one service port's rules. Namespace and name
+// are DNS labels, and nft accepts '/' and '.' in a chain name.
+func (sp servicePort) chain() string {
+	return fmt.Sprintf("svc-%s/%s/%d", key(sp.svc), proto(sp.port.Protocol), sp.port.Port)
+}
+
+func proto(p corev1.Protocol) string { return strings.ToLower(string(p)) }
+
+// render writes the whole table. Adding the table first makes the delete
+// valid whether or not one exists, and nft applies the file as one
+// transaction, so the node never sees a moment with no rules.
+//
+// Traffic is dispatched by one lookup: a verdict map keyed on destination
+// address, protocol and port sends each packet to its service port's chain.
+func render(ports []servicePort) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "add table ip %s\ndelete table ip %s\n", table, table)
+	fmt.Fprintf(&b, "table ip %s {\n", table)
+	b.WriteString(`	chain nat-prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		jump services
+	}
+	chain nat-output {
+		type nat hook output priority -100; policy accept;
+		jump services
+	}
+	map service-ips {
+		type ipv4_addr . inet_proto . inet_service : verdict
+	}
+	chain services {
+		ip daddr . meta l4proto . th dport vmap @service-ips
+	}
+`)
+	for _, sp := range ports {
+		if len(sp.endpoints) == 0 {
+			continue
+		}
+		ep := sp.endpoints[0]
+		fmt.Fprintf(&b, "\tchain %s {\n", sp.chain())
+		fmt.Fprintf(&b, "\t\tmeta l4proto %s dnat to %s:%d\n", proto(sp.port.Protocol), ep.ip, sp.port.TargetPort.IntValue())
+		b.WriteString("\t}\n")
+	}
+	b.WriteString("}\n")
+	for _, sp := range ports {
+		if len(sp.endpoints) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "add element ip %s service-ips { %s . %s . %d : goto %s }\n",
+			table, sp.svc.Spec.ClusterIP, proto(sp.port.Protocol), sp.port.Port, sp.chain())
+	}
+	return b.String()
+}
+
+func (p *proxier) apply(ruleset string) error {
+	cmd := exec.Command("nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(ruleset)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("nft: %v\n%s", err, out)
 	}
 	return nil
 }

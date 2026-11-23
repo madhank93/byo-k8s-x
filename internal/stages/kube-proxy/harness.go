@@ -62,7 +62,8 @@ var (
 // launch starts the program inside proxyNode with a kubeconfig that reaches
 // the API server over the kind network. The cleanup stops it and deletes its
 // table, so a stage never leaves rules on a node that other courses share.
-func launch(ctx context.Context, env *kube.Env, bin string) (*runner.Process, func(), error) {
+// before runs once the node is clean and before the program starts.
+func launch(ctx context.Context, env *kube.Env, bin string, before ...func(context.Context) error) (*runner.Process, func(), error) {
 	installMu.Lock()
 	if installed != bin {
 		if err := node.Install(ctx, bin); err != nil {
@@ -79,6 +80,12 @@ func launch(ctx context.Context, env *kube.Env, bin string) (*runner.Process, fu
 		return nil, nil, err
 	}
 	dropTable(ctx)
+	for _, b := range before {
+		if err := b(ctx); err != nil {
+			dropTable(ctx)
+			return nil, nil, err
+		}
+	}
 	p, err := node.Start(ctx, []string{"KUBECONFIG=" + nodeKubeconfig})
 	if err != nil {
 		return nil, nil, err
@@ -119,6 +126,18 @@ func writeKubeconfig(ctx context.Context) error {
 // name for the length of a stage, and touches no other table.
 func dropTable(ctx context.Context) {
 	_, _ = node.Exec(ctx, 10*time.Second, "nft", "delete", "table", "ip", table)
+}
+
+// nftApply feeds a ruleset to nft in the proxy node.
+func nftApply(ctx context.Context, ruleset string) error {
+	res, err := node.Exec(ctx, 15*time.Second, "sh", "-c", "printf '%s' \"$0\" | nft -f -", ruleset)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("nft -f: %s", strings.TrimSpace(res.Stderr))
+	}
+	return nil
 }
 
 // nft runs nft in the proxy node and returns its stdout.
@@ -429,8 +448,8 @@ func (f fixture) udp(ctx context.Context, from, host string, port int32, n, spor
 func (f fixture) tally(ctx context.Context, from, script string, n int) (answers, error) {
 	out, err := f.exec(ctx, from, "sh", "-c", script)
 	a := answers{by: map[string]int{}, from: map[string]string{}, port: map[string]string{}, n: n}
-	if err != nil && out == "" {
-		return a, fmt.Errorf("run requests in pod %s: %w", from, err)
+	if err != nil {
+		return a, fmt.Errorf("run requests in pod %s: %w\n%s", from, err, out)
 	}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		line = strings.TrimSpace(line)
