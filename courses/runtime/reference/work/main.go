@@ -7,11 +7,14 @@
 //	app unpack [--root DIR] REF DEST
 //	app mount [--root DIR] REF ID
 //	app umount [--root DIR] ID
+//	app config [--root DIR] REF [ARG…]
+//	app run [--root DIR] REF [ARG…]
 package main
 
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -24,9 +27,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 )
@@ -50,6 +55,10 @@ func main() {
 		err = cmdMount(args)
 	case "umount":
 		err = cmdUmount(args)
+	case "config":
+		err = cmdConfig(args)
+	case "run":
+		err = cmdRun(args)
 	default:
 		err = fmt.Errorf("unknown command %q", cmd)
 	}
@@ -172,7 +181,11 @@ func cmdMount(args []string) error {
 	if fs.NArg() != 2 {
 		return errors.New("usage: mount [--root DIR] REF ID")
 	}
-	rootfs, err := mountRootfs(*root, fs.Arg(0), fs.Arg(1))
+	m, err := pull(*root, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	rootfs, err := mountRootfs(*root, m, fs.Arg(1))
 	if err != nil {
 		return err
 	}
@@ -192,20 +205,142 @@ func cmdUmount(args []string) error {
 	return removeContainer(*root, fs.Arg(0))
 }
 
+func cmdConfig(args []string) error {
+	fs := flag.NewFlagSet("config", flag.ContinueOnError)
+	root := fs.String("root", defaultRoot, "where images and containers live")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: config [--root DIR] REF [ARG…]")
+	}
+	_, p, err := imageProcess(*root, fs.Arg(0), fs.Args()[1:])
+	if err != nil {
+		return err
+	}
+	a, _ := json.Marshal(p.args)
+	fmt.Println("args", string(a))
+	fmt.Println("cwd", p.cwd)
+	for _, e := range p.env {
+		fmt.Println("env", e)
+	}
+	return nil
+}
+
+func cmdRun(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	root := fs.String("root", defaultRoot, "where images and containers live")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: run [--root DIR] REF [ARG…]")
+	}
+	m, p, err := imageProcess(*root, fs.Arg(0), fs.Args()[1:])
+	if err != nil {
+		return err
+	}
+	id := make([]byte, 6)
+	if _, err := rand.Read(id); err != nil {
+		return err
+	}
+	code, err := runContainer(*root, m, hex.EncodeToString(id), p)
+	if err != nil {
+		return err
+	}
+	os.Exit(code)
+	return nil
+}
+
+// runContainer runs the process in a fresh rootfs for the image, waits for it,
+// removes the container, and returns the process's exit code.
+func runContainer(root string, m manifest, id string, p process) (int, error) {
+	defer removeContainer(root, id)
+	rootfs, err := mountRootfs(root, m, id)
+	if err != nil {
+		return 0, err
+	}
+	// Path, Dir and every lookup the process makes resolve inside the chroot.
+	cmd := &exec.Cmd{
+		Path:        p.args[0],
+		Args:        p.args,
+		Env:         p.env,
+		Dir:         p.cwd,
+		Stdin:       os.Stdin,
+		Stdout:      os.Stdout,
+		Stderr:      os.Stderr,
+		SysProcAttr: &syscall.SysProcAttr{Chroot: rootfs},
+	}
+	err = cmd.Run()
+	if exit, ok := err.(*exec.ExitError); ok {
+		return exit.ExitCode(), nil
+	}
+	return 0, err
+}
+
+// process is what a container runs: its argv, working directory and
+// environment.
+type process struct {
+	args []string
+	cwd  string
+	env  []string
+}
+
+// defaultPath is the PATH a container gets when its image sets none, the
+// same default Docker and containerd use.
+const defaultPath = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// imageProcess pulls the image and reads from its config the process it
+// means. Arguments given on the command line replace the image's Cmd and
+// keep its Entrypoint, as `docker run IMAGE ARG…` does.
+func imageProcess(root, ref string, args []string) (manifest, process, error) {
+	m, err := pull(root, ref)
+	if err != nil {
+		return m, process{}, err
+	}
+	data, err := os.ReadFile(blobPath(root, m.Config.Digest))
+	if err != nil {
+		return m, process{}, err
+	}
+	var img struct {
+		Config struct {
+			Entrypoint []string `json:"Entrypoint"`
+			Cmd        []string `json:"Cmd"`
+			Env        []string `json:"Env"`
+			WorkingDir string   `json:"WorkingDir"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(data, &img); err != nil {
+		return m, process{}, fmt.Errorf("image config: %w", err)
+	}
+	c := img.Config
+	cmd := c.Cmd
+	if len(args) > 0 {
+		cmd = args
+	}
+	p := process{args: append(slices.Clone(c.Entrypoint), cmd...), cwd: c.WorkingDir, env: c.Env}
+	if len(p.args) == 0 {
+		return m, p, errors.New("the image names no command and none was given")
+	}
+	if p.cwd == "" {
+		p.cwd = "/"
+	}
+	if !slices.ContainsFunc(p.env, func(e string) bool { return strings.HasPrefix(e, "PATH=") }) {
+		p.env = append(p.env, defaultPath)
+	}
+	return m, p, nil
+}
+
 // containerDir holds one container's writable layer, overlay workdir and the
 // mount point of its root filesystem.
 func containerDir(root, id string) string {
 	return filepath.Join(root, "containers", filepath.Base(id))
 }
 
-// mountRootfs pulls the image, makes sure each layer is extracted in its own
+// mountRootfs makes sure each of the image's layers is extracted in its own
 // directory, and mounts an overlay of them under the container's directory
 // with a writable layer of its own on top. It returns the mount point.
-func mountRootfs(root, ref, id string) (string, error) {
-	m, err := pull(root, ref)
-	if err != nil {
-		return "", err
-	}
+func mountRootfs(root string, m manifest, id string) (string, error) {
 	// overlayfs lists lowerdirs top first; the manifest lists layers bottom first.
 	lower := make([]string, len(m.Layers))
 	for i, l := range m.Layers {
