@@ -57,6 +57,8 @@ func init() {
 	register(Stage{Slug: "json6902-patch", Run: stageJSON6902Patch})
 	register(Stage{Slug: "patch-targets", Run: stagePatchTargets})
 	register(Stage{Slug: "overlays", Run: stageOverlays})
+	register(Stage{Slug: "components", Run: stageComponents})
+	register(Stage{Slug: "replacements", Run: stageReplacements})
 }
 
 // tree is a kustomization directory as slash paths to contents.
@@ -1760,6 +1762,207 @@ configMapGenerator:
 		{"merge needs something to merge into, and the base generated no ConfigMap called flags", "dev", shopBase.with(tree{
 			"dev/kustomization.yaml": "resources: [../base]\nconfigMapGenerator:\n- name: flags\n  behavior: merge\n  literals: [level=2]\n",
 		})},
+	})
+}
+
+// features are two optional pieces of the shop as components: one brings its
+// own resource and generator and patches whatever is there, the other merges
+// into the first one's generator.
+var features = tree{
+	"components/cache/kustomization.yaml": `apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources: [redis.yaml]
+configMapGenerator:
+- name: cache
+  literals: [host=redis]
+patches:
+- target:
+    kind: Deployment
+  patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/envFrom/-
+      value:
+        configMapRef:
+          name: cache
+`,
+	"components/cache/redis.yaml": `apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+spec:
+  ports:
+  - port: 6379
+`,
+	"components/tuned/kustomization.yaml": `apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+nameSuffix: -tuned
+commonAnnotations:
+  tuned: "true"
+configMapGenerator:
+- name: cache
+  behavior: merge
+  literals: [ttl=60]
+`,
+}
+
+// stageComponents — a Component is a kustomization that runs inside its
+// parent: it adds to the parent's resources and generated objects, and its
+// own transformers apply to all of them, after the parent's generators and
+// before the parent's transformers.
+func stageComponents(ctx context.Context, _ *kube.Env, bin string) error {
+	app := shopBase.with(features)
+	return runChecks(ctx, bin, []check{
+		{"the cache component adds a Service and a ConfigMap, and its patch reaches the base's Deployment; the parent's prefix then renames everything, the component's resources included", "prod", app.with(tree{
+			"prod/kustomization.yaml": "namePrefix: prod-\nresources: [../base]\ncomponents: [../components/cache]\n",
+		})},
+		{"components run in order on what the parent has so far: tuned merges into the cache ConfigMap that cache generated, and its suffix and annotation land on everything, the parent's own generated ConfigMap included", "prod", app.with(tree{
+			"prod/kustomization.yaml": "namespace: prod\nresources: [../base]\ncomponents: [../components/cache, ../components/tuned]\nconfigMapGenerator:\n- name: flags\n  literals: [beta=on]\n",
+		})},
+		{"the same order reversed: tuned has no cache ConfigMap to merge into yet", "prod", app.with(tree{
+			"prod/kustomization.yaml": "resources: [../base]\ncomponents: [../components/tuned, ../components/cache]\n",
+		})},
+		{"a component is not a base: it may not be listed under resources", "prod", app.with(tree{
+			"prod/kustomization.yaml": "resources: [../base, ../components/cache]\n",
+		})},
+		{"and a base is not a component", "prod", app.with(tree{
+			"prod/kustomization.yaml": "components: [../base]\n",
+		})},
+		{"a Component's apiVersion is kustomize.config.k8s.io/v1alpha1", "prod", app.with(tree{
+			"components/odd/kustomization.yaml": "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Component\nnamePrefix: odd-\n",
+			"prod/kustomization.yaml":           "resources: [../base]\ncomponents: [../components/odd]\n",
+		})},
+		{"a component can be built on its own, as if it were the root", "components/cache", app},
+	})
+}
+
+// wiring is a ConfigMap whose values other resources need copies of.
+const wiring = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: endpoints
+  annotations:
+    example.com/owner: shop
+data:
+  host: redis.shop.svc
+  port: "6379"
+  replicas: "3"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: web
+        image: shop/web:1.0
+        env:
+        - name: HOST
+          value: unset
+        - name: PORT
+          value: "0"
+      - name: proxy
+        image: envoy:1.0
+        env:
+        - name: PORT
+          value: "0"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: api
+        image: shop/api:1.0
+`
+
+// stageReplacements — a replacement copies one field of one resource into
+// fields of others. Paths are dotted, with [field=value] and * to pick list
+// items; delimiter and index copy part of a value into part of a field; the
+// target field keeps its type; create makes a field that is not there.
+func stageReplacements(ctx context.Context, _ *kube.Env, bin string) error {
+	rep := func(source, targets string) string {
+		return "resources: [wiring.yaml]\nreplacements:\n- source:\n    " + strings.ReplaceAll(source, "\n", "\n    ") + "\n  targets:\n  " + strings.ReplaceAll(strings.TrimRight(targets, "\n"), "\n", "\n  ") + "\n"
+	}
+	return runChecks(ctx, bin, []check{
+		{"data.host goes into the HOST variable of the container named web, and data.port into every container's PORT; api is selected by kind but rejected by name", ".", tree{
+			"kustomization.yaml": rep("kind: ConfigMap\nname: endpoints\nfieldPath: data.host", `- select:
+    kind: Deployment
+  reject:
+  - name: api
+  fieldPaths:
+  - spec.template.spec.containers.[name=web].env.[name=HOST].value
+`) + "- source:\n    kind: ConfigMap\n    name: endpoints\n    fieldPath: data.port\n  targets:\n  - select:\n      name: web\n    fieldPaths:\n    - spec.template.spec.containers.*.env.[name=PORT].value\n",
+			"wiring.yaml": wiring,
+		}},
+		{"a field keeps its own type: the string \"3\" lands in replicas as the number 3, and the number in replicas lands in a string field as a string; a created field takes the source's type", ".", tree{
+			"kustomization.yaml": rep("kind: ConfigMap\nfieldPath: data.replicas", "- select:\n    kind: Deployment\n  fieldPaths: [spec.replicas]\n") +
+				"- source:\n    kind: Deployment\n    name: api\n    fieldPath: spec.replicas\n  targets:\n  - select:\n      kind: ConfigMap\n    fieldPaths: [data.port, data.count]\n    options:\n      create: true\n",
+			"wiring.yaml": wiring,
+		}},
+		{"delimiter and index: the second dot-separated part of the host replaces the tag after the colon in the first container's image, and an index past the end appends a part", ".", tree{
+			"kustomization.yaml": rep("kind: ConfigMap\nfieldPath: data.host\noptions:\n  delimiter: .\n  index: 1", `- select:
+    kind: Deployment
+  fieldPaths:
+  - spec.template.spec.containers.0.image
+  options:
+    delimiter: ':'
+    index: 1
+- select:
+    name: web
+  fieldPaths:
+  - spec.template.spec.containers.1.image
+  options:
+    delimiter: ':'
+    index: 4
+`),
+			"wiring.yaml": wiring,
+		}},
+		{"the default fieldPath is metadata.name, the name the resource has now, though the source names it as written; a bracketed segment holds a key with dots in it; create makes the missing annotations and labels", ".", tree{
+			"kustomization.yaml": "namePrefix: p-\n" + rep("kind: ConfigMap\nname: endpoints", `- select:
+    kind: Deployment
+  fieldPaths:
+  - metadata.annotations.[example.com/config]
+  options:
+    create: true
+`) + "- source:\n    kind: ConfigMap\n    fieldPath: metadata.annotations.[example.com/owner]\n  targets:\n  - select:\n      name: we.*\n    fieldPaths: [metadata.labels.owner]\n    options:\n      create: true\n",
+			"wiring.yaml": wiring,
+		}},
+		{"replacements run last in a kustomization, after its images: the tag copied in is the one that stays", ".", tree{
+			"kustomization.yaml": "images:\n- name: shop/web\n  newTag: \"9.9\"\n" + rep("kind: ConfigMap\nfieldPath: data.port", "- select:\n    name: web\n  fieldPaths: [spec.template.spec.containers.0.image]\n  options:\n    delimiter: ':'\n    index: 1\n"),
+			"wiring.yaml":        wiring,
+		}},
+		{"a replacement can live in its own file", ".", tree{
+			"kustomization.yaml": "resources: [wiring.yaml]\nreplacements:\n- path: host.yaml\n",
+			"host.yaml":          "source:\n  kind: ConfigMap\n  fieldPath: data.host\ntargets:\n- select:\n    kind: Deployment\n  fieldPaths: [metadata.annotations.host]\n  options:\n    create: true\n",
+			"wiring.yaml":        wiring,
+		}},
+		{"a target field that is not there, without create", ".", tree{
+			"kustomization.yaml": rep("kind: ConfigMap\nfieldPath: data.host", "- select:\n    kind: Deployment\n  fieldPaths: [spec.paused]\n"),
+			"wiring.yaml":        wiring,
+		}},
+		{"a source field that is not there", ".", tree{
+			"kustomization.yaml": rep("kind: ConfigMap\nfieldPath: data.nothing", "- select:\n    kind: Deployment\n  fieldPaths: [spec.replicas]\n"),
+			"wiring.yaml":        wiring,
+		}},
+		{"a source must select exactly one resource, and there are two Deployments", ".", tree{
+			"kustomization.yaml": rep("kind: Deployment", "- select:\n    kind: ConfigMap\n  fieldPaths: [data.host]\n"),
+			"wiring.yaml":        wiring,
+		}},
+		{"and there is no Secret at all", ".", tree{
+			"kustomization.yaml": rep("kind: Secret", "- select:\n    kind: ConfigMap\n  fieldPaths: [data.host]\n"),
+			"wiring.yaml":        wiring,
+		}},
+		{"a source index past the end of the value", ".", tree{
+			"kustomization.yaml": rep("kind: ConfigMap\nfieldPath: data.host\noptions:\n  delimiter: .\n  index: 7", "- select:\n    kind: Deployment\n  fieldPaths: [spec.replicas]\n"),
+			"wiring.yaml":        wiring,
+		}},
 	})
 }
 

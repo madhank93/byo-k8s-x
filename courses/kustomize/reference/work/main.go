@@ -28,6 +28,7 @@ type Kustomization struct {
 	Kind       string   `json:"kind,omitempty"`
 	Resources  []string `json:"resources,omitempty"`
 	Bases      []string `json:"bases,omitempty"`
+	Components []string `json:"components,omitempty"`
 	Namespace  string   `json:"namespace,omitempty"`
 	NamePrefix string   `json:"namePrefix,omitempty"`
 	NameSuffix string   `json:"nameSuffix,omitempty"`
@@ -43,6 +44,8 @@ type Kustomization struct {
 	PatchesStrategicMerge []string `json:"patchesStrategicMerge,omitempty"`
 	Patches               []Patch  `json:"patches,omitempty"`
 	PatchesJson6902       []Patch  `json:"patchesJson6902,omitempty"`
+
+	Replacements []Replacement `json:"replacements,omitempty"`
 
 	ConfigMapGenerator []Generator       `json:"configMapGenerator,omitempty"`
 	SecretGenerator    []SecretGenerator `json:"secretGenerator,omitempty"`
@@ -67,6 +70,41 @@ type Target struct {
 
 	LabelSelector      string `json:"labelSelector,omitempty"`
 	AnnotationSelector string `json:"annotationSelector,omitempty"`
+}
+
+// Replacement copies one field of one resource into fields of others, or
+// names a file holding such a replacement.
+type Replacement struct {
+	Path    string              `json:"path,omitempty"`
+	Source  *ReplacementSource  `json:"source,omitempty"`
+	Targets []ReplacementTarget `json:"targets,omitempty"`
+}
+
+// ReplacementSource is the resource a value comes from, and where in it.
+type ReplacementSource struct {
+	Group     string        `json:"group,omitempty"`
+	Version   string        `json:"version,omitempty"`
+	Kind      string        `json:"kind,omitempty"`
+	Name      string        `json:"name,omitempty"`
+	Namespace string        `json:"namespace,omitempty"`
+	FieldPath string        `json:"fieldPath,omitempty"`
+	Options   *FieldOptions `json:"options,omitempty"`
+}
+
+// ReplacementTarget is which resources receive a value, and where.
+type ReplacementTarget struct {
+	Select     *Target       `json:"select,omitempty"`
+	Reject     []Target      `json:"reject,omitempty"`
+	FieldPaths []string      `json:"fieldPaths,omitempty"`
+	Options    *FieldOptions `json:"options,omitempty"`
+}
+
+// FieldOptions narrow a value to one part of a delimited string, and let a
+// target field be created.
+type FieldOptions struct {
+	Delimiter string `json:"delimiter,omitempty"`
+	Index     int    `json:"index,omitempty"`
+	Create    bool   `json:"create,omitempty"`
 }
 
 // Generator is one entry of configMapGenerator.
@@ -174,7 +212,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: app build DIR")
 		os.Exit(2)
 	}
-	rs, err := build(os.Args[2], map[string]bool{})
+	rs, err := build(os.Args[2], map[string]bool{}, nil, "")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
@@ -248,18 +286,30 @@ func load(dir string) (*Kustomization, error) {
 	if err := dec.Decode(&k); err != nil {
 		return nil, fmt.Errorf("invalid Kustomization: %w", err)
 	}
-	if k.Kind != "" && k.Kind != "Kustomization" {
-		return nil, errors.New("kind should be Kustomization")
-	}
-	if k.APIVersion != "" && k.APIVersion != "kustomize.config.k8s.io/v1beta1" {
+	switch {
+	case k.Kind == "Component":
+		if k.APIVersion != "" && k.APIVersion != "kustomize.config.k8s.io/v1alpha1" {
+			return nil, errors.New("apiVersion for Component should be kustomize.config.k8s.io/v1alpha1")
+		}
+	case k.Kind != "" && k.Kind != "Kustomization":
+		return nil, errors.New("kind should be Kustomization or Component")
+	case k.APIVersion != "" && k.APIVersion != "kustomize.config.k8s.io/v1beta1":
 		return nil, errors.New("apiVersion for Kustomization should be kustomize.config.k8s.io/v1beta1")
+	}
+	if k.Kind == "" {
+		k.Kind = "Kustomization"
 	}
 	return &k, nil
 }
 
-// build produces a kustomization directory's resources. visiting holds the
-// directories being built further up, so a cycle is caught, not recursed.
-func build(dir string, visiting map[string]bool) ([]*resource, error) {
+// build produces a kustomization directory's resources, added to rs. as is
+// the kind the directory must hold, Kustomization or Component, or "" for
+// either. visiting holds the directories being built further up, so a cycle
+// is caught, not recursed.
+//
+// A Kustomization starts from nothing. A Component starts from its parent's
+// resources and generated objects, and its transformers apply to them all.
+func build(dir string, visiting map[string]bool, rs []*resource, as string) ([]*resource, error) {
 	abs, err := filepath.Abs(dir)
 	if err == nil {
 		abs, err = filepath.EvalSymlinks(abs)
@@ -277,7 +327,9 @@ func build(dir string, visiting map[string]bool) ([]*resource, error) {
 	if err != nil {
 		return nil, err
 	}
-	var rs []*resource
+	if kind := k.Kind; as != "" && kind != as && (kind == "Component" || as == "Component") {
+		return nil, fmt.Errorf("expected kind %s for path %s, but got %s", as, abs, kind)
+	}
 	for _, r := range append(k.Resources, k.Bases...) {
 		more, err := accumulate(abs, r, visiting)
 		if err != nil {
@@ -325,6 +377,11 @@ func build(dir string, visiting map[string]bool) ([]*resource, error) {
 	}
 	if err := unique(objects(rs)); err != nil {
 		return nil, fmt.Errorf("may not add resource with an already registered id: %w", err)
+	}
+	for _, c := range k.Components {
+		if rs, err = build(filepath.Join(abs, c), visiting, rs, "Component"); err != nil {
+			return nil, fmt.Errorf("accumulating components: %w", err)
+		}
 	}
 	if rs, err = patchAll(abs, k, rs); err != nil {
 		return nil, err
@@ -387,7 +444,267 @@ func build(dir string, visiting map[string]bool) ([]*resource, error) {
 			return nil, fmt.Errorf("resource with name %s does not match a config with a scalable kind", rep.Name)
 		}
 	}
+	if err := replaceAll(abs, k.Replacements, rs); err != nil {
+		return nil, err
+	}
 	return rs, nil
+}
+
+// replaceAll runs replacements, the last thing a kustomization does.
+func replaceAll(root string, reps []Replacement, rs []*resource) error {
+	for _, rp := range reps {
+		if rp.Path != "" {
+			b, err := readInRoot(root, rp.Path)
+			if err != nil {
+				return err
+			}
+			js, err := yaml.YAMLToJSON(b)
+			if err != nil {
+				return err
+			}
+			dec := json.NewDecoder(bytes.NewReader(js))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&rp); err != nil {
+				return fmt.Errorf("replacement %s: %w", rp.Path, err)
+			}
+		}
+		if rp.Source == nil {
+			return errors.New("a replacement needs a source")
+		}
+		v, err := replacementValue(*rp.Source, rs)
+		if err != nil {
+			return err
+		}
+		for _, t := range rp.Targets {
+			if err := replaceIn(t, v, rs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// replacementValue is the value at the source's field path in the one
+// resource the source selects.
+func replacementValue(s ReplacementSource, rs []*resource) (any, error) {
+	sel := Target{Group: s.Group, Version: s.Version, Kind: s.Kind, Name: s.Name, Namespace: s.Namespace}
+	var hits []*resource
+	for _, r := range rs {
+		ok, err := selects(sel, r)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			hits = append(hits, r)
+		}
+	}
+	switch len(hits) {
+	case 0:
+		return nil, fmt.Errorf("nothing selected by %s %s", s.Kind, s.Name)
+	case 1:
+	default:
+		return nil, fmt.Errorf("multiple matches for selector %s %s", s.Kind, s.Name)
+	}
+	fp := s.FieldPath
+	if fp == "" {
+		fp = "metadata.name"
+	}
+	var v any
+	found := false
+	err := fieldPath(hits[0].o, splitFieldPath(fp), false, func(parent any, key string) error {
+		v, found = lookup(parent, key)
+		return nil
+	})
+	if err != nil || !found {
+		return nil, fmt.Errorf("fieldPath `%s` is missing for replacement source %s %s", fp, s.Kind, s.Name)
+	}
+	if o := s.Options; o != nil && o.Delimiter != "" {
+		parts := strings.Split(scalar(v), o.Delimiter)
+		if o.Index < 0 || o.Index >= len(parts) {
+			return nil, fmt.Errorf("options.index %d is out of bounds for value %s", o.Index, scalar(v))
+		}
+		v = parts[o.Index]
+	}
+	return v, nil
+}
+
+// replaceIn writes v at every field path of every resource t selects and
+// none of its rejects do.
+func replaceIn(t ReplacementTarget, v any, rs []*resource) error {
+	opts := FieldOptions{}
+	if t.Options != nil {
+		opts = *t.Options
+	}
+	for _, r := range rs {
+		ok := t.Select != nil
+		var err error
+		if ok {
+			if ok, err = selects(*t.Select, r); err != nil {
+				return err
+			}
+		}
+		for _, rej := range t.Reject {
+			hit, err := selects(rej, r)
+			if err != nil {
+				return err
+			}
+			ok = ok && !hit
+		}
+		if !ok {
+			continue
+		}
+		for _, fp := range t.FieldPaths {
+			err := fieldPath(r.o, splitFieldPath(fp), opts.Create, func(parent any, key string) error {
+				old, found := lookup(parent, key)
+				if !found && !opts.Create {
+					return fmt.Errorf("unable to find field %q in replacement target", fp)
+				}
+				nv := v
+				if opts.Delimiter != "" {
+					parts := strings.Split(scalar(old), opts.Delimiter)
+					if opts.Index >= 0 && opts.Index < len(parts) {
+						parts[opts.Index] = scalar(v)
+					} else {
+						parts = append(parts, scalar(v))
+					}
+					nv = strings.Join(parts, opts.Delimiter)
+				} else if found {
+					nv = retype(v, old)
+				}
+				store(parent, key, nv)
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// splitFieldPath splits a dotted field path, keeping a bracketed segment
+// such as [example.com/owner] or [name=web] whole.
+func splitFieldPath(fp string) []string {
+	var out []string
+	depth, start := 0, 0
+	for i, c := range fp + "." {
+		switch {
+		case c == '[':
+			depth++
+		case c == ']':
+			depth--
+		case c == '.' && depth == 0:
+			out = append(out, fp[start:i])
+			start = i + 1
+		}
+	}
+	return out
+}
+
+// fieldPath walks segments to every place they name and calls set with the
+// container and the last segment there. A segment is a map key (bracketed
+// when it holds dots), a list index, [field=value] for the list items with
+// that field, or * for every item. With create, missing map keys on the way
+// are made.
+func fieldPath(v any, segs []string, create bool, set func(parent any, key string) error) error {
+	if len(segs) == 1 {
+		return set(v, segs[0])
+	}
+	seg := segs[0]
+	if l, ok := v.([]any); ok {
+		k, val, isMatch := strings.Cut(strings.Trim(seg, "[]"), "=")
+		matched := false
+		for i, item := range l {
+			m, _ := item.(obj)
+			if seg == "*" || seg == strconv.Itoa(i) || (isMatch && m != nil && scalar(m[k]) == val) {
+				matched = true
+				if err := fieldPath(item, segs[1:], create, set); err != nil {
+					return err
+				}
+			}
+		}
+		if !matched && seg != "*" {
+			return fmt.Errorf("unable to find field %q", seg)
+		}
+		return nil
+	}
+	m, ok := v.(obj)
+	if !ok {
+		return fmt.Errorf("unable to find field %q", seg)
+	}
+	key := strings.Trim(seg, "[]")
+	next, ok := m[key]
+	if !ok || next == nil {
+		if !create {
+			return fmt.Errorf("unable to find field %q in replacement target", strings.Join(segs, "."))
+		}
+		next = obj{}
+		m[key] = next
+	}
+	return fieldPath(next, segs[1:], create, set)
+}
+
+// lookup reads key from a map, or an index from a list.
+func lookup(parent any, key string) (any, bool) {
+	switch p := parent.(type) {
+	case obj:
+		v, ok := p[strings.Trim(key, "[]")]
+		return v, ok
+	case []any:
+		if i, err := strconv.Atoi(key); err == nil && i >= 0 && i < len(p) {
+			return p[i], true
+		}
+	}
+	return nil, false
+}
+
+// store writes a looked-up place.
+func store(parent any, key string, v any) {
+	switch p := parent.(type) {
+	case obj:
+		p[strings.Trim(key, "[]")] = v
+	case []any:
+		if i, err := strconv.Atoi(key); err == nil && i >= 0 && i < len(p) {
+			p[i] = v
+		}
+	}
+}
+
+// scalar is a value as YAML would write it, unquoted.
+func scalar(v any) string {
+	switch v := v.(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case nil:
+		return ""
+	}
+	return fmt.Sprint(v)
+}
+
+// retype gives a scalar the type of the value it replaces, as kustomize
+// keeps the target field's YAML tag: "3" into replicas is the number 3, and
+// 1 into a string field is "1".
+func retype(v, old any) any {
+	s := scalar(v)
+	switch old.(type) {
+	case string:
+		if _, isMap := v.(obj); !isMap {
+			if _, isList := v.([]any); !isList {
+				return s
+			}
+		}
+	case float64:
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+	case bool:
+		if b, err := strconv.ParseBool(s); err == nil {
+			return b
+		}
+	}
+	return v
 }
 
 // scalable are the kinds replicas may set, in any API group.
@@ -906,7 +1223,7 @@ func accumulate(root, entry string, visiting map[string]bool) ([]*resource, erro
 		return nil, err
 	}
 	if fi.IsDir() {
-		return build(path, visiting)
+		return build(path, visiting, nil, "Kustomization")
 	}
 	if rel, err := filepath.Rel(root, path); err != nil || strings.HasPrefix(rel, "..") {
 		return nil, fmt.Errorf("security; file %q is not in or below %q", path, root)
