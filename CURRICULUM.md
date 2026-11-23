@@ -170,17 +170,20 @@ Linux, copied into a kind node container and run there; assertions use
 `crictl`, `nsenter` and the node's own filesystem. One harness change
 (`runner.NodeExec`) unlocks all four.
 
-### `runtime` — Build your own container runtime · 26 stages
+### [x] `runtime` — Build your own container runtime · 10 stages
 
-An image on a registry, turned into a running process, then wrapped in the CRI
-so a real kubelet can drive it.
+An image on a registry, turned into a running process in namespaces of its
+own.
 
 `registry-auth` · `manifest-fetch` · `layer-pull` · `unpack` ·
 `overlay-rootfs` · `image-config` · `spawn` · `mount-ns` · `pivot-root` ·
-`pid-ns` · `uts-ipc-ns` · `net-ns` · `cgroup-limit` · `cgroup-stats` ·
-`user-ns` · `capabilities` · `seccomp` · `oci-bundle` · `cri-identity` ·
-`cri-image` · `cri-sandbox` · `cri-container` · `cri-status` · `cri-logs` ·
-`cri-exec` · `kubelet-drives-it`
+`pid-ns`
+
+Not yet built, and the target for a follow-on: `uts-ipc-ns` · `net-ns` ·
+`cgroup-limit` · `cgroup-stats` · `capabilities` · `oci-bundle` ·
+`cri-identity` · `cri-image` · `cri-sandbox` · `cri-container` ·
+`cri-status` · `cri-logs` · `cri-exec` · `kubelet-drives-it` — cgroups, the
+remaining namespaces, and the CRI a real kubelet can drive.
 
 ### `kubelet` — Build your own kubelet · 28 stages
 

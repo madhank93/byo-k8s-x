@@ -30,16 +30,19 @@ import (
 	helmstages "github.com/madhank93/byo-k8s-x/internal/stages/helm"
 	kubectlstages "github.com/madhank93/byo-k8s-x/internal/stages/kubectl"
 	kustomizestages "github.com/madhank93/byo-k8s-x/internal/stages/kustomize"
+	runtimestages "github.com/madhank93/byo-k8s-x/internal/stages/runtime"
 	safeapplystages "github.com/madhank93/byo-k8s-x/internal/stages/safe-apply"
 	schedulerstages "github.com/madhank93/byo-k8s-x/internal/stages/scheduler"
 	webhookstages "github.com/madhank93/byo-k8s-x/internal/stages/webhook"
 )
 
-// course is how one course is graded: its assertions, and whether its stages
-// want a namespace on the kind cluster prepared for them.
+// course is how one course is graded: its assertions, whether its stages
+// want a namespace on the kind cluster prepared for them, and whether the
+// program runs inside a kind node, which means building it for Linux.
 type course struct {
 	lookup  stages.Lookup
 	cluster bool
+	node    bool
 }
 
 // courses maps a course slug to that — the one line a new course adds to this
@@ -47,14 +50,15 @@ type course struct {
 // its stages talk to the learner's own server over HTTP and there is no
 // cluster for the harness to prepare; kustomize renders offline.
 var courses = map[string]course{
-	"kubectl":    {kubectlstages.Lookup, true},
-	"controller": {controllerstages.Lookup, true},
-	"webhook":    {webhookstages.Lookup, true},
-	"scheduler":  {schedulerstages.Lookup, true},
-	"apiserver":  {apiserverstages.Lookup, false},
-	"safe-apply": {safeapplystages.Lookup, true},
-	"helm":       {helmstages.Lookup, true},
-	"kustomize":  {kustomizestages.Lookup, false},
+	"kubectl":    {lookup: kubectlstages.Lookup, cluster: true},
+	"controller": {lookup: controllerstages.Lookup, cluster: true},
+	"webhook":    {lookup: webhookstages.Lookup, cluster: true},
+	"scheduler":  {lookup: schedulerstages.Lookup, cluster: true},
+	"apiserver":  {lookup: apiserverstages.Lookup},
+	"safe-apply": {lookup: safeapplystages.Lookup, cluster: true},
+	"helm":       {lookup: helmstages.Lookup, cluster: true},
+	"kustomize":  {lookup: kustomizestages.Lookup},
+	"runtime":    {lookup: runtimestages.Lookup, node: true},
 }
 
 type testCase struct {
@@ -96,7 +100,15 @@ func run() error {
 	// Build once. Compiling is the slowest step in the loop and the program
 	// does not change between cases.
 	fmt.Println("building your program…")
-	bin, err := runner.Build(ctx, filepath.Join(dir, "app"))
+	goos, goarch := "", ""
+	if c.node {
+		arch, err := runner.NodeArch(ctx)
+		if err != nil {
+			return err
+		}
+		goos, goarch = "linux", arch
+	}
+	bin, err := runner.BuildFor(ctx, filepath.Join(dir, "app"), goos, goarch)
 	if err != nil {
 		return err
 	}
