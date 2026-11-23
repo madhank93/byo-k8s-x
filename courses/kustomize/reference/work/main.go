@@ -141,6 +141,7 @@ func main() {
 			r.rename(str(r.o, "metadata", "name") + "-" + h)
 		}
 	}
+	fixReferences(rs)
 	objs := objects(rs)
 	sortLegacy(objs)
 	out, err := render(objs)
@@ -371,6 +372,81 @@ func generate(root string, g SecretGenerator, global *GeneratorOptions) (obj, er
 		o["immutable"] = true
 	}
 	return o, nil
+}
+
+// ref is a field naming another object of kind target, in referrers of a
+// group and kind ("" matches any). An empty target means the kind field
+// beside the name says what it names.
+type ref struct {
+	group, kind, path, target string
+}
+
+// podSpecAt is where each workload kind keeps its pod spec.
+var podSpecAt = map[string]string{
+	"Pod": "spec", "Deployment": "spec/template/spec", "ReplicaSet": "spec/template/spec",
+	"DaemonSet": "spec/template/spec", "StatefulSet": "spec/template/spec", "Job": "spec/template/spec",
+	"ReplicationController": "spec/template/spec", "CronJob": "spec/jobTemplate/spec/template/spec",
+}
+
+// refs is every reference kustomize keeps up to date here.
+var refs = func() []ref {
+	inPod := map[string]string{
+		"volumes/configMap/name":                   "ConfigMap",
+		"volumes/secret/secretName":                "Secret",
+		"volumes/persistentVolumeClaim/claimName":  "PersistentVolumeClaim",
+		"volumes/projected/sources/configMap/name": "ConfigMap",
+		"volumes/projected/sources/secret/name":    "Secret",
+		"imagePullSecrets/name":                    "Secret",
+		"serviceAccountName":                       "ServiceAccount",
+	}
+	for _, c := range []string{"containers", "initContainers"} {
+		inPod[c+"/env/valueFrom/configMapKeyRef/name"] = "ConfigMap"
+		inPod[c+"/env/valueFrom/secretKeyRef/name"] = "Secret"
+		inPod[c+"/envFrom/configMapRef/name"] = "ConfigMap"
+		inPod[c+"/envFrom/secretRef/name"] = "Secret"
+	}
+	out := []ref{
+		{"networking.k8s.io", "Ingress", "spec/rules/http/paths/backend/service/name", "Service"},
+		{"networking.k8s.io", "Ingress", "spec/defaultBackend/service/name", "Service"},
+		{"networking.k8s.io", "Ingress", "spec/tls/secretName", "Secret"},
+		{"apps", "StatefulSet", "spec/serviceName", "Service"},
+		{"rbac.authorization.k8s.io", "RoleBinding", "roleRef/name", ""},
+		{"rbac.authorization.k8s.io", "ClusterRoleBinding", "roleRef/name", ""},
+		{"autoscaling", "HorizontalPodAutoscaler", "spec/scaleTargetRef/name", ""},
+	}
+	for kind, at := range podSpecAt {
+		for path, target := range inPod {
+			out = append(out, ref{"", kind, at + "/" + path, target})
+		}
+	}
+	return out
+}()
+
+// fixReferences points every reference to a name a resource used to have at
+// the name it has now. Only a resource in the referrer's own namespace, or a
+// cluster-scoped one, can answer.
+func fixReferences(rs []*resource) {
+	for _, r := range rs {
+		for _, rf := range refs {
+			if (rf.group != "" && rf.group != group(r.o)) || rf.kind != str(r.o, "kind") {
+				continue
+			}
+			walk(r.o, strings.Split(rf.path, "/"), false, func(parent obj, key string) {
+				name, _ := parent[key].(string)
+				target := rf.target
+				if target == "" {
+					target, _ = parent["kind"].(string)
+				}
+				for _, c := range rs {
+					if str(c.o, "kind") == target && c.hasName(name) &&
+						(clusterScoped(c.o) || str(c.o, "metadata", "namespace") == str(r.o, "metadata", "namespace")) {
+						parent[key] = str(c.o, "metadata", "name")
+						return
+					}
+				}
+			})
+		}
+	}
 }
 
 // contentHash is kustomize's name suffix: the SHA-256 of the object's kind,

@@ -52,6 +52,7 @@ func init() {
 	register(Stage{Slug: "configmap-generator", Run: stageConfigMapGenerator})
 	register(Stage{Slug: "secret-generator", Run: stageSecretGenerator})
 	register(Stage{Slug: "name-hash", Run: stageNameHash})
+	register(Stage{Slug: "name-references", Run: stageNameReferences})
 }
 
 // tree is a kustomization directory as slash paths to contents.
@@ -1035,6 +1036,238 @@ configMapGenerator:
 	})
 }
 
+// consumers refer to config, credentials, a claim and a service account from
+// every place a pod spec can, in three kinds of workload.
+const consumers = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      serviceAccountName: runner
+      imagePullSecrets:
+      - name: registry
+      initContainers:
+      - name: init
+        image: busybox
+        envFrom:
+        - configMapRef:
+            name: settings
+      containers:
+      - name: web
+        image: nginx
+        env:
+        - name: MODE
+          valueFrom:
+            configMapKeyRef:
+              name: settings
+              key: mode
+        - name: PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: credentials
+              key: password
+        - name: EXTERNAL
+          valueFrom:
+            configMapKeyRef:
+              name: not-ours
+              key: x
+        envFrom:
+        - secretRef:
+            name: credentials
+        - configMapRef:
+            name: settings
+      volumes:
+      - name: config
+        configMap:
+          name: settings
+      - name: secret
+        secret:
+          secretName: credentials
+      - name: data
+        persistentVolumeClaim:
+          claimName: data
+      - name: both
+        projected:
+          sources:
+          - configMap:
+              name: settings
+          - secret:
+              name: credentials
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly
+spec:
+  schedule: "0 0 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: runner
+          containers:
+          - name: job
+            image: busybox
+            envFrom:
+            - configMapRef:
+                name: settings
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: solo
+spec:
+  containers:
+  - name: c
+    image: busybox
+    envFrom:
+    - secretRef:
+        name: credentials
+  volumes:
+  - name: config
+    configMap:
+      name: settings
+`
+
+// providers are what consumers and the routing objects refer to.
+const providers = `apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: runner
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-ns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-all
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: reader
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+spec:
+  defaultBackend:
+    service:
+      name: web
+      port:
+        number: 80
+  tls:
+  - secretName: tls
+    hosts: [shop.example.com]
+  rules:
+  - host: shop.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web
+            port:
+              number: 80
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: api
+            port:
+              number: 80
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: web
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  minReplicas: 1
+  maxReplicas: 3
+`
+
+// stageNameReferences — when a name changes, every field kustomize knows to
+// refer to that kind of object changes with it: generated hashes, prefixes
+// and suffixes, through any number of kustomizations, but only within one
+// namespace, and never a name that is not one of the build's own.
+func stageNameReferences(ctx context.Context, _ *kube.Env, bin string) error {
+	generators := `configMapGenerator:
+- name: settings
+  literals: [mode=fast]
+secretGenerator:
+- name: credentials
+  literals: [password=s3cr3t]
+- name: registry
+  type: kubernetes.io/dockerconfigjson
+  literals: ['.dockerconfigjson={}']
+- name: tls
+  type: kubernetes.io/tls
+  literals: [tls.crt=c, tls.key=k]
+`
+	return runChecks(ctx, bin, []check{
+		{"a generated ConfigMap or Secret is referred to by its hashed name from every volume, env, envFrom, projection and image pull secret of a pod spec, in any workload; not-ours is nobody's here and stays as it is", ".", tree{
+			"kustomization.yaml": generators + "resources: [consumers.yaml]\n", "consumers.yaml": consumers,
+		}},
+		{"a prefix renames the Service an Ingress and a StatefulSet route to, the ServiceAccount a pod runs as, the claim it mounts, the Role or ClusterRole a binding grants — told apart by roleRef.kind — and the Deployment an autoscaler scales", ".", tree{
+			"kustomization.yaml": "namePrefix: shop-\nnameSuffix: -v1\n" + generators + "resources: [consumers.yaml, providers.yaml]\n",
+			"consumers.yaml":     consumers, "providers.yaml": providers,
+		}},
+		{"names change at every level and references follow all the way: the overlay's own Pod refers to the base's ConfigMap by its original name", "app", tree{
+			"app/kustomization.yaml":  "namePrefix: prod-\nresources: [../base, pod.yaml]\n",
+			"app/pod.yaml":            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: debug\nspec:\n  containers:\n  - name: c\n    image: busybox\n    envFrom:\n    - configMapRef:\n        name: settings\n",
+			"base/kustomization.yaml": "namePrefix: base-\n" + generators + "resources: [consumers.yaml, providers.yaml]\n",
+			"base/consumers.yaml":     consumers, "base/providers.yaml": providers,
+		}},
+		{"a reference only follows a rename in its own namespace: the Pod in b keeps settings, because the ConfigMap that was settings lives in a", "app", tree{
+			"app/kustomization.yaml": "resources: [../a, ../b]\n",
+			"a/kustomization.yaml":   "namespace: a\nnamePrefix: a-\nconfigMapGenerator:\n- name: settings\n  literals: [x=1]\n",
+			"b/kustomization.yaml":   "namespace: b\nresources: [pod.yaml]\n",
+			"b/pod.yaml":             "apiVersion: v1\nkind: Pod\nmetadata:\n  name: p\nspec:\n  containers:\n  - name: c\n    image: busybox\n    envFrom:\n    - configMapRef:\n        name: settings\n",
+		}},
+	})
+}
+
 // runChecks builds every check with both programs and compares them as data.
 func runChecks(ctx context.Context, bin string, checks []check) error {
 	w, err := newWork(ctx, bin)
@@ -1047,14 +1280,20 @@ func runChecks(ctx context.Context, bin string, checks []check) error {
 			return err
 		}
 	}
+	// A stage whose every tree kustomize refuses grades nothing but exit codes,
+	// which is how a typo in a test's own YAML would pass silently.
+	if w.built == 0 {
+		panic("kustomize refused every tree of this stage")
+	}
 	return nil
 }
 
 // work is one stage's scratch space.
 type work struct {
-	ctx context.Context
-	bin string
-	dir string
+	ctx   context.Context
+	bin   string
+	dir   string
+	built int // trees kustomize built rather than refused
 }
 
 func newWork(ctx context.Context, bin string) (*work, error) {
@@ -1124,6 +1363,7 @@ func (w *work) same(c check, name string, exact bool) error {
 		}
 		return nil
 	}
+	w.built++
 	if got.ExitCode != 0 {
 		return fmt.Errorf("%s\nkustomize builds this, but the program exited %d:\n%s", shown, got.ExitCode, tail(got.Stderr))
 	}
