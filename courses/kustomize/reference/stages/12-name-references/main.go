@@ -841,8 +841,9 @@ func kindRank(kind string) int {
 	return 0
 }
 
-// sortKey orders by group, version and kind, then by name and namespace,
-// with kustomize's placeholders for the empty ones ('~' sorts after letters).
+// sortKey orders by group, version and kind, then by namespace and name,
+// with kustomize's placeholders for the empty ones ('~' sorts after letters,
+// and '|' after every character a name can hold).
 func sortKey(o obj) string {
 	group, version, ok := strings.Cut(str(o, "apiVersion"), "/")
 	if !ok {
@@ -858,7 +859,7 @@ func sortKey(o obj) string {
 	if ns == "" {
 		ns = "~X"
 	}
-	return group + "_" + version + "_" + str(o, "kind") + "|" + str(o, "metadata", "name") + "_" + ns
+	return group + "_" + version + "_" + str(o, "kind") + "|" + ns + "|" + str(o, "metadata", "name")
 }
 
 func sortLegacy(objs []obj) {

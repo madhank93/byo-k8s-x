@@ -18,6 +18,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	yaml3 "go.yaml.in/yaml/v3"
 	"sigs.k8s.io/yaml"
 )
 
@@ -1293,19 +1294,52 @@ func sortLegacy(objs []obj) {
 
 var docSep = regexp.MustCompile(`(?m)^---[ \t]*$`)
 
-// readDocs decodes every non-empty document of a YAML stream.
+// readDocs decodes every non-empty document of a YAML stream the way
+// kustomize does: as YAML 1.2, where yes and on are strings, then through
+// JSON, where a date becomes an RFC 3339 timestamp.
 func readDocs(data string) ([]obj, error) {
 	var out []obj
 	for _, doc := range docSep.Split(data, -1) {
-		var o obj
-		if err := yaml.Unmarshal([]byte(doc), &o); err != nil {
+		var v any
+		if err := yaml3.Unmarshal([]byte(doc), &v); err != nil {
 			return nil, err
 		}
-		if o != nil {
-			out = append(out, o)
+		if v == nil {
+			continue
 		}
+		js, err := json.Marshal(stringKeys(v))
+		if err != nil {
+			return nil, err
+		}
+		var o obj
+		if err := json.Unmarshal(js, &o); err != nil {
+			return nil, fmt.Errorf("a document is not a map: %w", err)
+		}
+		out = append(out, o)
 	}
 	return out, nil
+}
+
+// stringKeys turns the map[any]any YAML gives a mapping with a non-string
+// key into a map JSON can encode.
+func stringKeys(v any) any {
+	switch v := v.(type) {
+	case map[string]any:
+		for k, x := range v {
+			v[k] = stringKeys(x)
+		}
+	case map[any]any:
+		m := map[string]any{}
+		for k, x := range v {
+			m[fmt.Sprint(k)] = stringKeys(x)
+		}
+		return m
+	case []any:
+		for i, x := range v {
+			v[i] = stringKeys(x)
+		}
+	}
+	return v
 }
 
 // readResources decodes every document of a YAML file.

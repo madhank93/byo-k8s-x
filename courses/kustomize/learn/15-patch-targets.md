@@ -1,6 +1,6 @@
 ---
 title: Aim a patch at many resources
-concepts: [patch targets, regular expressions, label selectors, output order]
+concepts: [patch targets, regular expressions, label selectors]
 ---
 
 ## Core concept
@@ -47,10 +47,6 @@ A strategic merge patch merges *into* what is there. A JSON patch needs its
 path to exist — with one exception you will meet here: kustomize keeps
 bookkeeping annotations on every resource while it builds, so
 `/metadata/annotations` is always there to `add` under.
-
-More same-kind resources means kustomize's output order matters more. Within
-one group, version and kind it sorts by **namespace, then name**, and a
-resource with no namespace sorts after all the namespaced ones.
 
 ## Go APIs
 

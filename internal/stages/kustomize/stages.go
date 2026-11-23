@@ -59,6 +59,7 @@ func init() {
 	register(Stage{Slug: "overlays", Run: stageOverlays})
 	register(Stage{Slug: "components", Run: stageComponents})
 	register(Stage{Slug: "replacements", Run: stageReplacements})
+	register(Stage{Slug: "kustomize-parity", Run: stageKustomizeParity})
 }
 
 // tree is a kustomization directory as slash paths to contents.
@@ -230,8 +231,12 @@ func stageResources(ctx context.Context, _ *kube.Env, bin string) error {
 		return "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " + name + "\n"
 	}
 	return runChecks(ctx, bin, []check{
-		{"one file holding many documents comes out in kustomize's order: Namespace, then the kinds kustomize ranks first, then everything else by group, version and kind, webhooks last, and by name then namespace within a kind", ".", tree{
+		{"one file holding many documents comes out in kustomize's order: Namespace, then the kinds kustomize ranks first, then everything else by group, version and kind, webhooks last, and by namespace then name within a kind", ".", tree{
 			"kustomization.yaml": "resources: [all.yaml]\n", "all.yaml": mixed,
+		}},
+		{"within a kind, namespace sorts before name, compared as namespace|name so aa comes before a, and a resource with no namespace comes after every namespaced one", ".", tree{
+			"kustomization.yaml": "resources: [cms.yaml]\n",
+			"cms.yaml":           "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: m\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: z\n  namespace: a\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n  namespace: b\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: b\n  namespace: aa\n",
 		}},
 		{"empty documents and comment-only documents are not resources", ".", tree{
 			"kustomization.yaml": "resources: [a.yaml]\n",
@@ -1966,15 +1971,157 @@ func stageReplacements(ctx context.Context, _ *kube.Env, bin string) error {
 	})
 }
 
+// scalars is a ConfigMap and a custom resource holding values that YAML
+// spells, quotes or converts in more than one way.
+const scalars = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scalars
+data:
+  "yes": "yes"
+  "on": "on"
+  "y": "y"
+  "1": one
+  tilde: "~"
+  octal: "0123"
+  exp: "1e3"
+  empty: ""
+  colon: "a: b"
+  hash: "#x"
+  lead: "  lead"
+  uni: "héllo wörld"
+  date: "2024-01-01"
+  multi: |
+    line one
+    line two
+  multinonl: |-
+    line one
+    line two
+  long: "the quick brown fox jumps over the lazy dog and keeps on running far beyond eighty characters of text"
+  quote: 'it''s "quoted"'
+  star: "*star"
+  tab: "a\tb"
+---
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: w
+spec:
+  on: yes
+  y: n
+  Yes: On
+  big: 1000000
+  bigger: 12345678901234
+  huge: 100000000000000000000
+  float: 1.50
+  exp: 6.02e23
+  octal: 0123
+  hex: 0x1F
+  bin: 0b101
+  sexagesimal: 1:20
+  nothing: ~
+  emptymap: {}
+  emptylist: []
+  list: [1, "2", three]
+  nested:
+  - a: 1
+    b: [x]
+  - []
+  - {}
+  date: 2024-01-01
+  ts: 2024-01-01T10:00:00Z
+`
+
+// stageKustomizeParity — the output is now compared byte for byte: the same
+// documents, in the same order, with the same keys, quoting and number
+// formatting kustomize prints, for a whole application and for every awkward
+// scalar YAML has.
+func stageKustomizeParity(ctx context.Context, _ *kube.Env, bin string) error {
+	var many strings.Builder
+	for _, k := range []string{"apps/v1 Deployment", "v1 Service", "v1 Pod", "batch/v1 Job", "example.com/v1 Zebra",
+		"example.com/v1 Apple", "example.com/v2 Apple", "admissionregistration.k8s.io/v1 ValidatingWebhookConfiguration",
+		"admissionregistration.k8s.io/v1 MutatingWebhookConfiguration", "v1 Namespace", "apiextensions.k8s.io/v1 CustomResourceDefinition",
+		"rbac.authorization.k8s.io/v1 RoleBinding", "rbac.authorization.k8s.io/v1 Role", "v1 ConfigMap", "policy/v1 PodDisruptionBudget",
+		"networking.k8s.io/v1 Ingress", "storage.k8s.io/v1 StorageClass", "v1 LimitRange", "a.io/v1 Thing", "b.io/v1 Thing", "v1 Thing"} {
+		gv, kind, _ := strings.Cut(k, " ")
+		for _, at := range []string{"name: b\n  namespace: x", "name: a\n  namespace: xy", "name: c"} {
+			fmt.Fprintf(&many, "---\napiVersion: %s\nkind: %s\nmetadata:\n  %s\n", gv, kind, at)
+		}
+	}
+	shop := shopBase.with(features).with(tree{
+		"prod/kustomization.yaml": `namespace: prod
+namePrefix: prod-
+labels:
+- pairs:
+    env: prod
+  includeSelectors: true
+resources: [../base, ingress.yaml]
+components: [../components/cache]
+replicas:
+- name: web
+  count: 3
+images:
+- name: shop/web
+  newTag: "2.0"
+configMapGenerator:
+- name: settings
+  behavior: merge
+  literals: [level=3]
+patches:
+- path: limits.yaml
+- target:
+    kind: Service
+  patch: |-
+    - op: replace
+      path: /spec/ports/0/port
+      value: 8080
+replacements:
+- source:
+    kind: Service
+    name: redis
+    fieldPath: spec.ports.0.port
+  targets:
+  - select:
+      kind: ConfigMap
+      name: cache
+    fieldPaths: [data.port]
+    options:
+      create: true
+`,
+		"prod/limits.yaml":  "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      containers:\n      - name: web\n        resources:\n          limits:\n            memory: 512Mi\n            cpu: \"1\"\n",
+		"prod/ingress.yaml": "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: shop\nspec:\n  rules:\n  - host: shop.example.com\n    http:\n      paths:\n      - path: /\n        pathType: Prefix\n        backend:\n          service:\n            name: web\n            port:\n              number: 80\n",
+	})
+	return compare(ctx, bin, []check{
+		{"the whole shop in prod — a base, a component, an overlay's generator merge, patches of both kinds, a replacement and the hashes and references that follow — printed exactly as kustomize prints it", "prod", shop},
+		{"scalars YAML can spell several ways: YAML 1.2 keeps yes, on and y as strings, an unquoted date becomes a timestamp, numbers print as kustomize prints them, and every string is quoted only where it must be", ".", tree{
+			"kustomization.yaml": "resources: [scalars.yaml]\nconfigMapGenerator:\n- name: script\n  files: [run.sh]\n",
+			"scalars.yaml":       scalars,
+			"run.sh":             "#!/bin/sh\necho \"hi there\"\n\tindented\n",
+		}},
+		{"output order: kustomize's kinds first in its order, webhooks last, everything else by group, version and kind, then namespace and name", ".", tree{
+			"kustomization.yaml": "resources: [many.yaml]\n", "many.yaml": many.String(),
+		}},
+		{"a kustomization with nothing in it prints nothing at all", ".", tree{
+			"kustomization.yaml": "resources: []\n",
+		}},
+	}, true)
+}
+
 // runChecks builds every check with both programs and compares them as data.
 func runChecks(ctx context.Context, bin string, checks []check) error {
+	return compare(ctx, bin, checks, false)
+}
+
+// compare builds every check with both programs and compares them as data,
+// or byte for byte when exact is set.
+func compare(ctx context.Context, bin string, checks []check, exact bool) error {
 	w, err := newWork(ctx, bin)
 	if err != nil {
 		return err
 	}
 	defer w.close()
 	for i, c := range checks {
-		if err := w.same(c, fmt.Sprintf("case%02d", i+1), false); err != nil {
+		if err := w.same(c, fmt.Sprintf("case%02d", i+1), exact); err != nil {
 			return err
 		}
 	}
