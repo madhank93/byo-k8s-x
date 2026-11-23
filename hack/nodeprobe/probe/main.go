@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const work = "/var/lib/byok8s-probe"
@@ -394,11 +396,11 @@ func childSeccomp() (string, error) {
 		{0x06, 0, 0, 0x7fff0000},                         // ret allow
 	}
 	fp := sockFprog{len: uint16(len(prog)), filter: &prog[0]}
-	if err := prctl(syscall.PR_SET_NO_NEW_PRIVS, 1); err != nil {
+	if err := prctl(unix.PR_SET_NO_NEW_PRIVS, 1); err != nil {
 		return "", err
 	}
 	const seccompSetModeFilter, tsync = 1, 1
-	if _, _, e := syscall.RawSyscall(syscall.SYS_SECCOMP, seccompSetModeFilter, tsync, uintptr(unsafe.Pointer(&fp))); e != 0 {
+	if _, _, e := syscall.RawSyscall(unix.SYS_SECCOMP, seccompSetModeFilter, tsync, uintptr(unsafe.Pointer(&fp))); e != 0 {
 		return "", fmt.Errorf("seccomp: %w", e)
 	}
 	_, _, e := syscall.RawSyscall(syscall.SYS_GETPPID, 0, 0, 0)
@@ -427,7 +429,7 @@ func childLandlock() (string, error) {
 	if e != 0 {
 		return "", fmt.Errorf("create ruleset: %w", e)
 	}
-	if err := prctl(syscall.PR_SET_NO_NEW_PRIVS, 1); err != nil {
+	if err := prctl(unix.PR_SET_NO_NEW_PRIVS, 1); err != nil {
 		return "", err
 	}
 	if _, _, e := syscall.RawSyscall(restrict, fd, 0, 0); e != 0 {
