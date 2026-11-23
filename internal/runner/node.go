@@ -22,12 +22,14 @@ import (
 // process the program forked, however it detached.
 type Node string
 
-// NodeBin is where Install puts the learner's program inside a node.
-const NodeBin = "/usr/local/bin/byok8s-app"
-
-// scopePrefix names every scope this package creates, so Sweep can find runs
-// a killed harness left behind.
+// scopePrefix names every scope and binary this package creates in a node.
+// Each name carries the host pid of the harness that made it, so harnesses
+// grading on one node at once leave each other alone, and Sweep can tell runs
+// a killed harness left behind from live ones.
 const scopePrefix = "byok8s-app-"
+
+// NodeBin is where Install puts the learner's program inside a node.
+var NodeBin = fmt.Sprintf("/usr/local/bin/%s%d", scopePrefix, os.Getpid())
 
 var scopeSeq atomic.Int64
 
@@ -54,18 +56,55 @@ func (n Node) Install(ctx context.Context, bin string) error {
 	return nil
 }
 
-// Sweep kills every scope a previous run left in the node.
+// Sweep kills every scope of this harness, and the scopes and binaries of
+// harnesses no longer running on this host.
 func (n Node) Sweep(ctx context.Context) error {
-	res, err := n.Exec(ctx, 30*time.Second, "systemctl", "kill", "--signal=SIGKILL", scopePrefix+"*.scope")
+	res, err := n.Exec(ctx, 30*time.Second, "sh", "-c",
+		"systemctl list-units --all --plain --no-legend '"+scopePrefix+"*.scope' | cut -d' ' -f1; ls /usr/local/bin | grep '^"+scopePrefix+"' || true")
 	if err != nil {
 		return err
 	}
-	// systemctl kill with a pattern that matches nothing exits non-zero and
-	// says nothing; anything it does say is a real failure.
-	if res.ExitCode != 0 && strings.TrimSpace(res.Stderr) != "" {
-		return fmt.Errorf("sweep node %s: %s", n, res.Stderr)
+	if res.ExitCode != 0 {
+		return fmt.Errorf("list runs in node %s: %s", n, res.Stderr)
+	}
+	var scopes, bins []string
+	for _, name := range strings.Fields(res.Stdout) {
+		switch {
+		case !stale(name):
+		case strings.HasSuffix(name, ".scope"):
+			scopes = append(scopes, name)
+		default:
+			bins = append(bins, "/usr/local/bin/"+name)
+		}
+	}
+	// A scope that ends between listing and killing is not an error, so only
+	// the docker exec itself failing counts.
+	if len(scopes) > 0 {
+		if _, err := n.Exec(ctx, 30*time.Second, append([]string{"systemctl", "kill", "--signal=SIGKILL"}, scopes...)...); err != nil {
+			return err
+		}
+	}
+	if len(bins) > 0 {
+		if _, err := n.Exec(ctx, 30*time.Second, append([]string{"rm", "-f"}, bins...)...); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// stale reports whether a scope or binary named byok8s-app-<pid>[-<seq>.scope]
+// is one Sweep should remove: any scope of this harness, or anything of a
+// harness no longer running on this host. A name without a pid is stale.
+func stale(name string) bool {
+	rest := strings.TrimSuffix(strings.TrimPrefix(name, scopePrefix), ".scope")
+	pid, err := strconv.Atoi(strings.SplitN(rest, "-", 2)[0])
+	if err != nil || pid <= 0 {
+		return true
+	}
+	if pid == os.Getpid() {
+		return strings.HasSuffix(name, ".scope")
+	}
+	return syscall.Kill(pid, 0) == syscall.ESRCH
 }
 
 // Invoke runs the installed program in the node with args and extra
