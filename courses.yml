@@ -71,7 +71,7 @@ entries:
 
   - slug: kustomize
     name: Build your own kustomize
-    status: planned
+    status: shipped
     tier: the ecosystem
     blurb: Bases, overlays, patches, and generated names that stay wired up.
 
