@@ -5,6 +5,8 @@
 //	app manifest REF
 //	app pull [--root DIR] REF
 //	app unpack [--root DIR] REF DEST
+//	app mount [--root DIR] REF ID
+//	app umount [--root DIR] ID
 package main
 
 import (
@@ -44,6 +46,10 @@ func main() {
 		err = cmdPull(args)
 	case "unpack":
 		err = cmdUnpack(args)
+	case "mount":
+		err = cmdMount(args)
+	case "umount":
+		err = cmdUmount(args)
 	default:
 		err = fmt.Errorf("unknown command %q", cmd)
 	}
@@ -150,11 +156,114 @@ func cmdUnpack(args []string) error {
 		return err
 	}
 	for _, l := range m.Layers {
-		if err := applyLayer(blobPath(*root, l.Digest), dest); err != nil {
+		if err := applyLayer(blobPath(*root, l.Digest), dest, false); err != nil {
 			return fmt.Errorf("layer %s: %w", l.Digest, err)
 		}
 	}
 	return nil
+}
+
+func cmdMount(args []string) error {
+	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
+	root := fs.String("root", defaultRoot, "where images and containers live")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return errors.New("usage: mount [--root DIR] REF ID")
+	}
+	rootfs, err := mountRootfs(*root, fs.Arg(0), fs.Arg(1))
+	if err != nil {
+		return err
+	}
+	fmt.Println(rootfs)
+	return nil
+}
+
+func cmdUmount(args []string) error {
+	fs := flag.NewFlagSet("umount", flag.ContinueOnError)
+	root := fs.String("root", defaultRoot, "where images and containers live")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: umount [--root DIR] ID")
+	}
+	return removeContainer(*root, fs.Arg(0))
+}
+
+// containerDir holds one container's writable layer, overlay workdir and the
+// mount point of its root filesystem.
+func containerDir(root, id string) string {
+	return filepath.Join(root, "containers", filepath.Base(id))
+}
+
+// mountRootfs pulls the image, makes sure each layer is extracted in its own
+// directory, and mounts an overlay of them under the container's directory
+// with a writable layer of its own on top. It returns the mount point.
+func mountRootfs(root, ref, id string) (string, error) {
+	m, err := pull(root, ref)
+	if err != nil {
+		return "", err
+	}
+	// overlayfs lists lowerdirs top first; the manifest lists layers bottom first.
+	lower := make([]string, len(m.Layers))
+	for i, l := range m.Layers {
+		dir, err := layerDir(root, l.Digest)
+		if err != nil {
+			return "", fmt.Errorf("layer %s: %w", l.Digest, err)
+		}
+		lower[len(m.Layers)-1-i] = dir
+	}
+	c := containerDir(root, id)
+	upper, work, rootfs := filepath.Join(c, "upper"), filepath.Join(c, "work"), filepath.Join(c, "rootfs")
+	for _, d := range []string{upper, work, rootfs} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return "", err
+		}
+	}
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(lower, ":"), upper, work)
+	if err := syscall.Mount("overlay", rootfs, "overlay", 0, opts); err != nil {
+		return "", fmt.Errorf("mount overlay at %s: %w", rootfs, err)
+	}
+	return rootfs, nil
+}
+
+// removeContainer unmounts a container's rootfs and deletes its directory,
+// writable layer included. A container that is not mounted is still removed.
+func removeContainer(root, id string) error {
+	c := containerDir(root, id)
+	if err := syscall.Unmount(filepath.Join(c, "rootfs"), syscall.MNT_DETACH); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOENT) {
+		return err
+	}
+	return os.RemoveAll(c)
+}
+
+// layerDir extracts a layer into a directory of its own, once: overlay
+// mounts of every container from the image share it read-only. It is built
+// beside its final name and renamed into place, so a half-extracted layer is
+// never mistaken for a finished one.
+func layerDir(root, digest string) (string, error) {
+	algo, hex, _ := strings.Cut(digest, ":")
+	dir := filepath.Join(root, "layers", algo, hex)
+	if _, err := os.Stat(dir); err == nil {
+		return dir, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return "", err
+	}
+	tmp, err := os.MkdirTemp(filepath.Dir(dir), ".partial-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+	if err := applyLayer(blobPath(root, digest), tmp, true); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		return "", err
+	}
+	return dir, os.Rename(tmp, dir)
 }
 
 // blobPath is where the store keeps a blob: named by its digest, so a blob
@@ -447,7 +556,10 @@ const (
 // applyLayer extracts a gzipped layer tarball onto dest. Names are confined to
 // dest: each is cleaned against "/" before it is joined, and no entry is
 // written through a symlink an earlier entry planted.
-func applyLayer(blob, dest string) error {
+//
+// Applied onto the layers below it, a whiteout deletes; extracted alone for
+// overlayfs, it is recorded the way overlayfs reads one instead.
+func applyLayer(blob, dest string, forOverlay bool) error {
 	f, err := os.Open(blob)
 	if err != nil {
 		return err
@@ -479,13 +591,21 @@ func applyLayer(blob, dest string) error {
 		}
 		base := filepath.Base(name)
 		if base == whiteoutOpaque {
-			if err := opaque(filepath.Dir(target)); err != nil {
+			hide := opaque
+			if forOverlay {
+				hide = overlayOpaque
+			}
+			if err := hide(filepath.Dir(target)); err != nil {
 				return err
 			}
 			continue
 		}
 		if hidden, ok := strings.CutPrefix(base, whiteoutPrefix); ok {
-			if err := whiteout(filepath.Join(filepath.Dir(target), hidden)); err != nil {
+			hide := whiteout
+			if forOverlay {
+				hide = overlayWhiteout
+			}
+			if err := hide(filepath.Join(filepath.Dir(target), hidden)); err != nil {
 				return err
 			}
 			continue
@@ -533,6 +653,17 @@ func opaque(dir string) error {
 
 func whiteout(path string) error {
 	return os.RemoveAll(path)
+}
+
+// overlayWhiteout is overlayfs's form of a deleted file: a character device
+// numbered 0/0 in its place.
+func overlayWhiteout(path string) error {
+	return syscall.Mknod(path, syscall.S_IFCHR, 0)
+}
+
+// overlayOpaque marks a directory whose lower-layer contents overlayfs hides.
+func overlayOpaque(dir string) error {
+	return syscall.Setxattr(dir, "trusted.overlay.opaque", []byte("y"), 0)
 }
 
 // extract writes one tar entry at target, replacing whatever a lower layer
