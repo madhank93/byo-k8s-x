@@ -272,7 +272,9 @@ func runContainer(root string, m manifest, id string, p process) (int, error) {
 	}
 	cmd := exec.Command("/proc/self/exe", "init", string(spec))
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
+	// init is the first process of the new pid namespace, and exec keeps its
+	// pid, so the image's program runs as pid 1.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID}
 	err = cmd.Run()
 	if exit, ok := err.(*exec.ExitError); ok {
 		return exit.ExitCode(), nil
@@ -305,13 +307,74 @@ func cmdInit(args []string) error {
 	if err := syscall.Mount("overlay", s.Rootfs, "overlay", 0, s.Overlay); err != nil {
 		return fmt.Errorf("mount overlay at %s: %w", s.Rootfs, err)
 	}
-	if err := syscall.Chroot(s.Rootfs); err != nil {
+	if err := pivotRoot(s.Rootfs); err != nil {
 		return err
+	}
+	if err := os.MkdirAll("/proc", 0o555); err != nil {
+		return err
+	}
+	if err := syscall.Mount("proc", "/proc", "proc", syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV, ""); err != nil {
+		return fmt.Errorf("mount /proc: %w", err)
+	}
+	if err := mountDev(); err != nil {
+		return fmt.Errorf("populate /dev: %w", err)
 	}
 	if err := syscall.Chdir(s.Cwd); err != nil {
 		return err
 	}
 	return syscall.Exec(s.Args[0], s.Args, s.Env)
+}
+
+// pivotRoot makes rootfs the root of the mount namespace and detaches the
+// node's root, which chroot alone would leave mounted and reachable. rootfs
+// must be a mount point, which the overlay is.
+func pivotRoot(rootfs string) error {
+	old := filepath.Join(rootfs, ".oldroot")
+	if err := os.MkdirAll(old, 0o700); err != nil {
+		return err
+	}
+	if err := syscall.PivotRoot(rootfs, old); err != nil {
+		return fmt.Errorf("pivot_root to %s: %w", rootfs, err)
+	}
+	if err := syscall.Chdir("/"); err != nil {
+		return err
+	}
+	if err := syscall.Unmount("/.oldroot", syscall.MNT_DETACH); err != nil {
+		return fmt.Errorf("detach the old root: %w", err)
+	}
+	return os.Remove("/.oldroot")
+}
+
+// devices are the character devices every container gets in /dev, as the
+// OCI runtime spec lists them, with their major and minor numbers.
+var devices = []struct {
+	name         string
+	major, minor uint32
+}{
+	{"null", 1, 3}, {"zero", 1, 5}, {"full", 1, 7},
+	{"random", 1, 8}, {"urandom", 1, 9}, {"tty", 5, 0},
+}
+
+// mountDev gives the container a /dev of its own holding only the standard
+// device nodes, not the node's devices.
+func mountDev() error {
+	if err := os.MkdirAll("/dev", 0o755); err != nil {
+		return err
+	}
+	if err := syscall.Mount("tmpfs", "/dev", "tmpfs", syscall.MS_NOSUID, "mode=755"); err != nil {
+		return err
+	}
+	for _, d := range devices {
+		dev := int(d.major<<8 | d.minor)
+		if err := syscall.Mknod("/dev/"+d.name, syscall.S_IFCHR|0o666, dev); err != nil {
+			return err
+		}
+		// mknod's mode is filtered by the umask; the nodes are meant world-writable.
+		if err := os.Chmod("/dev/"+d.name, 0o666); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // process is what a container runs: its argv, working directory and
