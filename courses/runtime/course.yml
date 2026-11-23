@@ -1,0 +1,37 @@
+slug: runtime
+name: Build your own container runtime
+language: go
+entrypoint: main.go
+# The program runs inside the first worker node; see internal/stages/runtime.
+workers: 1
+stages:
+  - slug: registry-auth
+    name: Get a pull token
+    difficulty: medium
+  - slug: manifest-fetch
+    name: Resolve a tag to a manifest
+    difficulty: medium
+  - slug: layer-pull
+    name: Pull blobs into a store
+    difficulty: medium
+  - slug: unpack
+    name: Apply the layers
+    difficulty: hard
+  - slug: overlay-rootfs
+    name: Stack the layers with overlayfs
+    difficulty: hard
+  - slug: image-config
+    name: Read what the image runs
+    difficulty: easy
+  - slug: spawn
+    name: Run the image's process
+    difficulty: medium
+  - slug: mount-ns
+    name: Give it its own mount table
+    difficulty: hard
+  - slug: pivot-root
+    name: Make the rootfs its root
+    difficulty: hard
+  - slug: pid-ns
+    name: Make it pid 1
+    difficulty: medium
