@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -116,7 +117,12 @@ type sample struct {
 	mem        float64
 }
 
-type usage struct{ cpuMilli, mem int64 }
+// usage is a rate over a window: at is when the later sample was taken.
+type usage struct {
+	cpuMilli, mem int64
+	at            time.Time
+	window        time.Duration
+}
 
 // scrape reads one node's /metrics/resource, keyed namespace/pod/container.
 func scrape(ctx context.Context, cs *kubernetes.Clientset, node string) (map[string]sample, error) {
@@ -197,7 +203,8 @@ func later(ctx context.Context, cs *kubernetes.Clientset, node string, first map
 // the kubelet measured it, not as this program waited.
 func rate(a, b sample) usage {
 	cores := (b.cpuSeconds - a.cpuSeconds) / (float64(b.cpuAt-a.cpuAt) / 1000)
-	return usage{cpuMilli: int64(cores * 1000), mem: int64(b.mem)}
+	return usage{cpuMilli: int64(cores * 1000), mem: int64(b.mem),
+		at: time.UnixMilli(b.cpuAt), window: time.Duration(b.cpuAt-a.cpuAt) * time.Millisecond}
 }
 
 // collect samples every node twice, concurrently, and returns each
@@ -272,7 +279,9 @@ func serve(cs *kubernetes.Clientset, cfg *rest.Config, ns string, port int, host
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{Handler: routes(), TLSConfig: &tls.Config{Certificates: []tls.Certificate{pair}}}
+	st := &store{}
+	go st.run(ctx, cs)
+	srv := &http.Server{Handler: routes(st), TLSConfig: &tls.Config{Certificates: []tls.Certificate{pair}}}
 	go srv.ServeTLS(l, "", "")
 
 	dyn, err := dynamic.NewForConfig(cfg)
@@ -338,10 +347,86 @@ func unregister(cs *kubernetes.Clientset, dyn dynamic.Interface, ns string) {
 	cs.CoreV1().Services(ns).Delete(ctx, serviceName, metav1.DeleteOptions{})
 }
 
-// routes serves discovery: the aggregator asks for the group version's
-// resource list to decide the API is Available, and clients ask the same
-// question through the API server.
-func routes() http.Handler {
+// store holds the latest rate for every container in the cluster, keyed
+// namespace/pod/container. Nothing is kept beyond the last round: metrics are
+// a view of now, not a history.
+type store struct {
+	mu         sync.Mutex
+	containers map[string]usage
+}
+
+// run scrapes every node, round after round, until ctx ends. A node that
+// fails a round keeps nothing for that round rather than stopping the rest.
+func (st *store) run(ctx context.Context, cs *kubernetes.Clientset) {
+	for ctx.Err() == nil {
+		nodes, err := nodeNames(ctx, cs)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "list nodes:", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		got, err := collect(ctx, cs, nodes)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "scrape:", err)
+		}
+		st.mu.Lock()
+		st.containers = got
+		st.mu.Unlock()
+	}
+}
+
+// pods groups the stored containers into PodMetrics for one namespace.
+func (st *store) pods(ns string) map[string]map[string]any {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := map[string]map[string]any{}
+	for _, k := range sortedKeys(st.containers) {
+		parts := strings.SplitN(k, "/", 3)
+		if parts[0] != ns {
+			continue
+		}
+		u := st.containers[k]
+		pm, ok := out[parts[1]]
+		if !ok {
+			pm = map[string]any{
+				"kind": "PodMetrics", "apiVersion": group + "/" + version,
+				"metadata":   map[string]any{"name": parts[1], "namespace": ns, "creationTimestamp": metav1.Now()},
+				"timestamp":  metav1.NewTime(u.at),
+				"window":     metav1.Duration{Duration: u.window},
+				"containers": []any{},
+			}
+			out[parts[1]] = pm
+		}
+		pm["containers"] = append(pm["containers"].([]any), map[string]any{"name": parts[2], "usage": quantities(u)})
+	}
+	return out
+}
+
+func quantities(u usage) map[string]any {
+	return map[string]any{
+		"cpu":    resource.NewMilliQuantity(u.cpuMilli, resource.DecimalSI),
+		"memory": resource.NewQuantity(u.mem, resource.BinarySI),
+	}
+}
+
+func list(kind string, items []any) map[string]any {
+	return map[string]any{"kind": kind, "apiVersion": group + "/" + version, "metadata": map[string]any{}, "items": items}
+}
+
+// notFound is the Status body the API server would send for a missing object,
+// which is what lets a client tell "no such pod" from "the server broke".
+func notFound(w http.ResponseWriter, resource, name string) {
+	writeJSON(w, http.StatusNotFound, metav1.Status{
+		TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"},
+		Status:   metav1.StatusFailure, Reason: metav1.StatusReasonNotFound, Code: http.StatusNotFound,
+		Message: fmt.Sprintf("%s %q not found", resource, name),
+		Details: &metav1.StatusDetails{Name: name, Group: group, Kind: resource},
+	})
+}
+
+// routes serves discovery, which the aggregator checks before it calls the
+// API Available, and the metrics themselves.
+func routes(st *store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /apis/"+group+"/"+version, func(w http.ResponseWriter, r *http.Request) {
 		verbs := []string{"get", "list"}
@@ -353,6 +438,22 @@ func routes() http.Handler {
 				{Name: "nodes", Kind: "NodeMetrics", Namespaced: false, Verbs: verbs},
 			},
 		})
+	})
+	mux.HandleFunc("GET /apis/"+group+"/"+version+"/namespaces/{ns}/pods", func(w http.ResponseWriter, r *http.Request) {
+		pods := st.pods(r.PathValue("ns"))
+		items := []any{}
+		for _, name := range sortedKeys(pods) {
+			items = append(items, pods[name])
+		}
+		writeJSON(w, http.StatusOK, list("PodMetricsList", items))
+	})
+	mux.HandleFunc("GET /apis/"+group+"/"+version+"/namespaces/{ns}/pods/{name}", func(w http.ResponseWriter, r *http.Request) {
+		pm, ok := st.pods(r.PathValue("ns"))[r.PathValue("name")]
+		if !ok {
+			notFound(w, "pods", r.PathValue("name"))
+			return
+		}
+		writeJSON(w, http.StatusOK, pm)
 	})
 	return mux
 }

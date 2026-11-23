@@ -282,8 +282,8 @@ func stagePodMetrics(ctx context.Context, env *kube.Env, bin string) error {
 		return fmt.Errorf("the list answer has kind %q, want PodMetricsList", list.Kind)
 	}
 	for _, it := range list.Items {
-		if it.Metadata.Namespace != env.Namespace {
-			return fmt.Errorf("listing namespace %s returned pod %s/%s", env.Namespace, it.Metadata.Namespace, it.Metadata.Name)
+		if it.Metadata.Namespace != env.Namespace || (it.Metadata.Name != "fill" && it.Metadata.Name != "burner") {
+			return fmt.Errorf("listing namespace %s, which holds only fill and burner, returned pod %s/%s", env.Namespace, it.Metadata.Namespace, it.Metadata.Name)
 		}
 		if it.Timestamp.IsZero() || it.Window.Duration <= 0 {
 			return fmt.Errorf("pod %s has no timestamp or window — a client cannot tell how old a sample is without them", it.Metadata.Name)
