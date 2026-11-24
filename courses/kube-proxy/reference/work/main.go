@@ -194,8 +194,12 @@ func render(ports []servicePort) string {
 	map service-ips {
 		type ipv4_addr . inet_proto . inet_service : verdict
 	}
+	map service-nodeports {
+		type inet_proto . inet_service : verdict
+	}
 	chain services {
 		ip daddr . meta l4proto . th dport vmap @service-ips
+		fib daddr type local meta l4proto . th dport vmap @service-nodeports
 	}
 	map no-endpoint-services {
 		type ipv4_addr . inet_proto . inet_service : verdict
@@ -246,6 +250,12 @@ func render(ports []servicePort) string {
 		}
 		fmt.Fprintf(&b, "add element ip %s service-ips { %s . %s . %d : goto %s }\n",
 			table, sp.svc.Spec.ClusterIP, proto(sp.port.Protocol), sp.port.Port, sp.chain())
+		// A node port is open on every address the node owns, which is
+		// what fib daddr type local matches.
+		if sp.port.NodePort != 0 {
+			fmt.Fprintf(&b, "add element ip %s service-nodeports { %s . %d : goto %s }\n",
+				table, proto(sp.port.Protocol), sp.port.NodePort, sp.chain())
+		}
 	}
 	return b.String()
 }

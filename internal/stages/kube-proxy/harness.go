@@ -15,6 +15,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -415,7 +416,19 @@ func (f fixture) exec(ctx context.Context, pod string, cmd ...string) (string, e
 	req := f.env.Client.CoreV1().RESTClient().Post().Resource("pods").
 		Namespace(f.env.Namespace).Name(pod).SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{Command: cmd, Stdout: true, Stderr: true}, scheme.ParameterCodec)
-	ex, err := remotecommand.NewSPDYExecutor(f.env.Config, "POST", req.URL())
+	// The same choice kubectl makes: WebSocket first, SPDY for a server
+	// that cannot upgrade.
+	spdy, err := remotecommand.NewSPDYExecutor(f.env.Config, "POST", req.URL())
+	if err != nil {
+		return "", err
+	}
+	ws, err := remotecommand.NewWebSocketExecutor(f.env.Config, "GET", req.URL().String())
+	if err != nil {
+		return "", err
+	}
+	ex, err := remotecommand.NewFallbackExecutor(ws, spdy, func(err error) bool {
+		return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
+	})
 	if err != nil {
 		return "", err
 	}
