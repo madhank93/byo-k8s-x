@@ -124,7 +124,12 @@ type usage struct {
 	window        time.Duration
 }
 
-// scrape reads one node's /metrics/resource, keyed namespace/pod/container.
+// nodeKey is where a scrape keeps the node's own sample. A colon cannot
+// appear in a namespace, so it never collides with a container's key.
+const nodeKey = ":node"
+
+// scrape reads one node's /metrics/resource, keyed namespace/pod/container,
+// and the node itself under nodeKey.
 func scrape(ctx context.Context, cs *kubernetes.Clientset, node string) (map[string]sample, error) {
 	raw, err := cs.CoreV1().RESTClient().Get().AbsPath("/api/v1/nodes", node, "proxy/metrics/resource").DoRaw(ctx)
 	if err != nil {
@@ -133,12 +138,19 @@ func scrape(ctx context.Context, cs *kubernetes.Clientset, node string) (map[str
 	out := map[string]sample{}
 	for _, line := range strings.Split(string(raw), "\n") {
 		name, labels, val, at, ok := parseLine(line)
-		if !ok || (name != "container_cpu_usage_seconds_total" && name != "container_memory_working_set_bytes") {
+		if !ok {
 			continue
 		}
 		key := labels["namespace"] + "/" + labels["pod"] + "/" + labels["container"]
+		switch name {
+		case "container_cpu_usage_seconds_total", "container_memory_working_set_bytes":
+		case "node_cpu_usage_seconds_total", "node_memory_working_set_bytes":
+			key = nodeKey
+		default:
+			continue
+		}
 		s := out[key]
-		if name == "container_cpu_usage_seconds_total" {
+		if strings.HasSuffix(name, "_cpu_usage_seconds_total") {
 			s.cpuSeconds, s.cpuAt = val, at
 		} else {
 			s.mem = val
@@ -151,8 +163,16 @@ func scrape(ctx context.Context, cs *kubernetes.Clientset, node string) (map[str
 // parseLine reads one Prometheus text sample: name{labels} value timestamp.
 // Values may be written in exponent form, so they are floats.
 func parseLine(line string) (name string, labels map[string]string, val float64, at int64, ok bool) {
+	if strings.HasPrefix(line, "#") {
+		return "", nil, 0, 0, false
+	}
 	open, close := strings.IndexByte(line, '{'), strings.LastIndexByte(line, '}')
-	if strings.HasPrefix(line, "#") || open < 0 || close < open {
+	if open < 0 {
+		// A sample with no labels has no braces either.
+		line = strings.Replace(line, " ", "{} ", 1)
+		open, close = strings.IndexByte(line, '{'), strings.IndexByte(line, '}')
+	}
+	if open <= 0 || close < open {
 		return "", nil, 0, 0, false
 	}
 	labels = map[string]string{}
@@ -230,7 +250,11 @@ func collect(ctx context.Context, cs *kubernetes.Clientset, nodes []string) (map
 				return
 			}
 			for k := range b {
-				out[k] = rate(a[k], b[k])
+				key := k
+				if k == nodeKey {
+					key = nodeKey + "/" + node
+				}
+				out[key] = rate(a[k], b[k])
 			}
 		}()
 	}
@@ -402,6 +426,28 @@ func (st *store) pods(ns string) map[string]map[string]any {
 	return out
 }
 
+// nodes is NodeMetrics for every node: the kubelet's own figure for the
+// node, which counts the system daemons no pod accounts for.
+func (st *store) nodes() map[string]map[string]any {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := map[string]map[string]any{}
+	for k, u := range st.containers {
+		name, ok := strings.CutPrefix(k, nodeKey+"/")
+		if !ok {
+			continue
+		}
+		out[name] = map[string]any{
+			"kind": "NodeMetrics", "apiVersion": group + "/" + version,
+			"metadata":  map[string]any{"name": name, "creationTimestamp": metav1.Now()},
+			"timestamp": metav1.NewTime(u.at),
+			"window":    metav1.Duration{Duration: u.window},
+			"usage":     quantities(u),
+		}
+	}
+	return out
+}
+
 func quantities(u usage) map[string]any {
 	return map[string]any{
 		"cpu":    resource.NewMilliQuantity(u.cpuMilli, resource.DecimalSI),
@@ -454,6 +500,22 @@ func routes(st *store) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, pm)
+	})
+	mux.HandleFunc("GET /apis/"+group+"/"+version+"/nodes", func(w http.ResponseWriter, r *http.Request) {
+		nodes := st.nodes()
+		items := []any{}
+		for _, name := range sortedKeys(nodes) {
+			items = append(items, nodes[name])
+		}
+		writeJSON(w, http.StatusOK, list("NodeMetricsList", items))
+	})
+	mux.HandleFunc("GET /apis/"+group+"/"+version+"/nodes/{name}", func(w http.ResponseWriter, r *http.Request) {
+		nm, ok := st.nodes()[r.PathValue("name")]
+		if !ok {
+			notFound(w, "nodes", r.PathValue("name"))
+			return
+		}
+		writeJSON(w, http.StatusOK, nm)
 	})
 	return mux
 }

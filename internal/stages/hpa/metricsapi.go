@@ -251,7 +251,9 @@ func stagePodMetrics(ctx context.Context, env *kube.Env, bin string) error {
 	err = kube.WaitFor(waitCtx, "PodMetrics for fill and burner", func(ctx context.Context) (bool, error) {
 		list = metricsList{}
 		if err := getMetrics(ctx, env, "/namespaces/"+env.Namespace+"/pods", "", &list); err != nil {
-			last = err.Error()
+			if ctx.Err() == nil {
+				last = err.Error()
+			}
 			return false, nil
 		}
 		seen := map[string]metricsItem{}
@@ -326,7 +328,9 @@ func stageNodeMetrics(ctx context.Context, env *kube.Env, bin string) error {
 	err = kube.WaitFor(waitCtx, "NodeMetrics for every node", func(ctx context.Context) (bool, error) {
 		list = metricsList{}
 		if err := getMetrics(ctx, env, "/nodes", "", &list); err != nil {
-			last = err.Error()
+			if ctx.Err() == nil {
+				last = err.Error()
+			}
 			return false, nil
 		}
 		last = fmt.Sprintf("%d of %d nodes listed", len(list.Items), len(nodes.Items))
