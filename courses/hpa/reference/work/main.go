@@ -19,22 +19,28 @@ import (
 	"syscall"
 	"time"
 
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	certutil "k8s.io/client-go/util/cert"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: app summary|scrape <node> | app pods | app serve --port P --external-host H")
+		fmt.Fprintln(os.Stderr, "usage: app summary|scrape <node> | app pods | app serve --port P --external-host H | app autoscale")
 		os.Exit(2)
 	}
 	loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
@@ -79,6 +85,10 @@ func main() {
 		ns, _, err := loader.Namespace()
 		check(err)
 		check(serve(cs, cfg, ns, *port, *host))
+	case "autoscale":
+		ns, _, err := loader.Namespace()
+		check(err)
+		check(autoscale(cs, cfg, ns))
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		os.Exit(2)
@@ -305,7 +315,7 @@ func serve(cs *kubernetes.Clientset, cfg *rest.Config, ns string, port int, host
 	}
 	st := &store{}
 	go st.run(ctx, cs)
-	srv := &http.Server{Handler: routes(st), TLSConfig: &tls.Config{Certificates: []tls.Certificate{pair}}}
+	srv := &http.Server{Handler: routes(st, cs), TLSConfig: &tls.Config{Certificates: []tls.Certificate{pair}}}
 	go srv.ServeTLS(l, "", "")
 
 	dyn, err := dynamic.NewForConfig(cfg)
@@ -399,27 +409,29 @@ func (st *store) run(ctx context.Context, cs *kubernetes.Clientset) {
 	}
 }
 
-// pods groups the stored containers into PodMetrics for one namespace.
+// pods groups the stored containers into PodMetrics keyed namespace/pod, for
+// one namespace or, when ns is empty, every namespace.
 func (st *store) pods(ns string) map[string]map[string]any {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	out := map[string]map[string]any{}
 	for _, k := range sortedKeys(st.containers) {
 		parts := strings.SplitN(k, "/", 3)
-		if parts[0] != ns {
+		if len(parts) != 3 || (ns != "" && parts[0] != ns) {
 			continue
 		}
 		u := st.containers[k]
-		pm, ok := out[parts[1]]
+		key := parts[0] + "/" + parts[1]
+		pm, ok := out[key]
 		if !ok {
 			pm = map[string]any{
 				"kind": "PodMetrics", "apiVersion": group + "/" + version,
-				"metadata":   map[string]any{"name": parts[1], "namespace": ns, "creationTimestamp": metav1.Now()},
+				"metadata":   map[string]any{"name": parts[1], "namespace": parts[0], "creationTimestamp": metav1.Now()},
 				"timestamp":  metav1.NewTime(u.at),
 				"window":     metav1.Duration{Duration: u.window},
 				"containers": []any{},
 			}
-			out[parts[1]] = pm
+			out[key] = pm
 		}
 		pm["containers"] = append(pm["containers"].([]any), map[string]any{"name": parts[2], "usage": quantities(u)})
 	}
@@ -472,7 +484,7 @@ func notFound(w http.ResponseWriter, resource, name string) {
 
 // routes serves discovery, which the aggregator checks before it calls the
 // API Available, and the metrics themselves.
-func routes(st *store) http.Handler {
+func routes(st *store, cs *kubernetes.Clientset) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /apis/"+group+"/"+version, func(w http.ResponseWriter, r *http.Request) {
 		verbs := []string{"get", "list"}
@@ -485,16 +497,36 @@ func routes(st *store) http.Handler {
 			},
 		})
 	})
-	mux.HandleFunc("GET /apis/"+group+"/"+version+"/namespaces/{ns}/pods", func(w http.ResponseWriter, r *http.Request) {
-		pods := st.pods(r.PathValue("ns"))
+	// The metrics carry no labels, so a selector is answered by asking the
+	// API server which pods match and keeping only theirs.
+	podList := func(w http.ResponseWriter, r *http.Request) {
+		ns := r.PathValue("ns")
+		pods := st.pods(ns)
+		if sel := r.URL.Query().Get("labelSelector"); sel != "" {
+			match, err := cs.CoreV1().Pods(ns).List(r.Context(), metav1.ListOptions{LabelSelector: sel})
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, metav1.Status{TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"},
+					Status: metav1.StatusFailure, Reason: metav1.StatusReasonBadRequest, Code: http.StatusBadRequest, Message: err.Error()})
+				return
+			}
+			keep := map[string]map[string]any{}
+			for _, p := range match.Items {
+				if pm, ok := pods[p.Namespace+"/"+p.Name]; ok {
+					keep[p.Namespace+"/"+p.Name] = pm
+				}
+			}
+			pods = keep
+		}
 		items := []any{}
-		for _, name := range sortedKeys(pods) {
-			items = append(items, pods[name])
+		for _, k := range sortedKeys(pods) {
+			items = append(items, pods[k])
 		}
 		writeJSON(w, http.StatusOK, list("PodMetricsList", items))
-	})
+	}
+	mux.HandleFunc("GET /apis/"+group+"/"+version+"/pods", podList)
+	mux.HandleFunc("GET /apis/"+group+"/"+version+"/namespaces/{ns}/pods", podList)
 	mux.HandleFunc("GET /apis/"+group+"/"+version+"/namespaces/{ns}/pods/{name}", func(w http.ResponseWriter, r *http.Request) {
-		pm, ok := st.pods(r.PathValue("ns"))[r.PathValue("name")]
+		pm, ok := st.pods(r.PathValue("ns"))[r.PathValue("ns")+"/"+r.PathValue("name")]
 		if !ok {
 			notFound(w, "pods", r.PathValue("name"))
 			return
@@ -518,6 +550,95 @@ func routes(st *store) http.Handler {
 		writeJSON(w, http.StatusOK, nm)
 	})
 	return mux
+}
+
+var autoscalersGVR = schema.GroupVersionResource{Group: "byok8s.dev", Version: "v1alpha1", Resource: "autoscalers"}
+
+// autoscaler reconciles Autoscalers: the spec and status of an autoscaling/v2
+// HorizontalPodAutoscaler, in a group the cluster's own controller ignores.
+type autoscaler struct {
+	cs     *kubernetes.Clientset
+	dyn    dynamic.Interface
+	mapper *restmapper.DeferredDiscoveryRESTMapper
+	ns     string
+}
+
+// autoscale syncs every Autoscaler in ns on a timer. A target's replicas change
+// without its Autoscaler changing, so a watch on Autoscalers alone would miss it.
+func autoscale(cs *kubernetes.Clientset, cfg *rest.Config, ns string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return err
+	}
+	a := &autoscaler{cs: cs, dyn: dyn, ns: ns,
+		mapper: restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(cs.Discovery()))}
+	for ctx.Err() == nil {
+		list, err := dyn.Resource(autoscalersGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "list autoscalers:", err)
+		} else {
+			for i := range list.Items {
+				if err := a.sync(ctx, &list.Items[i]); err != nil {
+					fmt.Fprintf(os.Stderr, "autoscaler %s: %v\n", list.Items[i].GetName(), err)
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return nil
+}
+
+func (a *autoscaler) sync(ctx context.Context, obj *unstructured.Unstructured) error {
+	var hpa autoscalingv2.HorizontalPodAutoscaler
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &hpa); err != nil {
+		return err
+	}
+	scale, _, err := a.scale(ctx, hpa.Spec.ScaleTargetRef)
+	if err != nil {
+		return err
+	}
+	hpa.Status.CurrentReplicas = scale.Status.Replicas
+	return a.writeStatus(ctx, obj, hpa.Status)
+}
+
+// scale reads a target's scale subresource, which every scalable kind serves
+// in one shape, so the autoscaler never needs to know what a Deployment is.
+func (a *autoscaler) scale(ctx context.Context, ref autoscalingv2.CrossVersionObjectReference) (*autoscalingv1.Scale, schema.GroupVersionResource, error) {
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		return nil, schema.GroupVersionResource{}, err
+	}
+	gk := schema.GroupKind{Group: gv.Group, Kind: ref.Kind}
+	m, err := a.mapper.RESTMapping(gk, gv.Version)
+	if meta.IsNoMatchError(err) {
+		// The kind may be newer than the cached discovery.
+		a.mapper.Reset()
+		m, err = a.mapper.RESTMapping(gk, gv.Version)
+	}
+	if err != nil {
+		return nil, schema.GroupVersionResource{}, err
+	}
+	u, err := a.dyn.Resource(m.Resource).Namespace(a.ns).Get(ctx, ref.Name, metav1.GetOptions{}, "scale")
+	if err != nil {
+		return nil, m.Resource, err
+	}
+	var s autoscalingv1.Scale
+	return &s, m.Resource, runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &s)
+}
+
+func (a *autoscaler) writeStatus(ctx context.Context, obj *unstructured.Unstructured, st autoscalingv2.HorizontalPodAutoscalerStatus) error {
+	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&st)
+	if err != nil {
+		return err
+	}
+	obj.Object["status"] = u
+	_, err = a.dyn.Resource(autoscalersGVR).Namespace(a.ns).UpdateStatus(ctx, obj, metav1.UpdateOptions{})
+	return err
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
