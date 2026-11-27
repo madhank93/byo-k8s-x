@@ -26,6 +26,7 @@ import (
 	"github.com/madhank93/byo-k8s-x/internal/runner"
 	"github.com/madhank93/byo-k8s-x/internal/stages"
 	apiserverstages "github.com/madhank93/byo-k8s-x/internal/stages/apiserver"
+	cnistages "github.com/madhank93/byo-k8s-x/internal/stages/cni"
 	controllerstages "github.com/madhank93/byo-k8s-x/internal/stages/controller"
 	helmstages "github.com/madhank93/byo-k8s-x/internal/stages/helm"
 	kubectlstages "github.com/madhank93/byo-k8s-x/internal/stages/kubectl"
@@ -59,6 +60,7 @@ var courses = map[string]course{
 	"helm":       {lookup: helmstages.Lookup, cluster: true},
 	"kustomize":  {lookup: kustomizestages.Lookup},
 	"runtime":    {lookup: runtimestages.Lookup, node: true},
+	"cni":        {lookup: cnistages.Lookup, cluster: true, node: true},
 }
 
 type testCase struct {

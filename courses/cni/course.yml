@@ -1,0 +1,68 @@
+slug: cni
+name: Build your own CNI plugin
+language: go
+entrypoint: main.go
+# The plugin runs inside the first two workers, which the harness drives as a
+# container runtime would; see internal/stages/cni.
+workers: 2
+stages:
+  - slug: plugin-contract
+    name: Speak the plugin protocol
+    difficulty: easy
+  - slug: version
+    name: Negotiate the spec version
+    difficulty: easy
+  - slug: netns
+    name: Enter the container's network namespace
+    difficulty: medium
+  - slug: veth
+    name: Plumb a veth pair
+    difficulty: medium
+  - slug: ipam-static
+    name: Assign a static address
+    difficulty: medium
+  - slug: ipam-persist
+    name: Allocate from a pool
+    difficulty: hard
+  - slug: routes
+    name: Install the container's routes
+    difficulty: easy
+  - slug: bridge
+    name: Join containers on a bridge
+    difficulty: medium
+  - slug: result
+    name: Report what you built
+    difficulty: easy
+  - slug: sysctls
+    name: Tune the container's network stack
+    difficulty: medium
+  - slug: del
+    name: Tear it down
+    difficulty: medium
+  - slug: check
+    name: Verify a container's network
+    difficulty: medium
+  - slug: conflist
+    name: Run a plugin chain
+    difficulty: hard
+  - slug: portmap
+    name: Forward a host port
+    difficulty: hard
+  - slug: bandwidth
+    name: Shape a container's traffic
+    difficulty: medium
+  - slug: hostport-cleanup
+    name: Remove only your own rules
+    difficulty: medium
+  - slug: node-routes
+    name: Route between nodes
+    difficulty: medium
+  - slug: vxlan
+    name: Build an overlay
+    difficulty: hard
+  - slug: netpol-lite
+    name: Isolate namespaces
+    difficulty: hard
+  - slug: kubelet-drives-it
+    name: Let the kubelet drive it
+    difficulty: medium

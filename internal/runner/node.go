@@ -110,9 +110,16 @@ func stale(name string) bool {
 // Invoke runs the installed program in the node with args and extra
 // environment entries, and captures its output, like InvokeEnv on the host.
 func (n Node) Invoke(ctx context.Context, env []string, timeout time.Duration, args ...string) (*Result, error) {
+	return n.InvokeStdin(ctx, env, "", timeout, args...)
+}
+
+// InvokeStdin is Invoke with stdin fed to the program, the way a CNI runtime
+// hands a plugin its network config.
+func (n Node) InvokeStdin(ctx context.Context, env []string, stdin string, timeout time.Duration, args ...string) (*Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd, signal := n.scoped(ctx, env, args)
+	cmd.Stdin = strings.NewReader(stdin)
 	return capture(cmd, func() error { return signal(syscall.SIGKILL) })
 }
 
