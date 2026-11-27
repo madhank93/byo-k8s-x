@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/madhank93/byo-k8s-x/internal/runner"
 )
@@ -277,7 +278,38 @@ func stageIPAMPersist(w *work) error {
 	if err != nil {
 		return err
 	}
-	return wantCNIError(res, 0, "every address in "+cidr+" is taken")
+	if err := wantCNIError(res, 0, "every address in "+cidr+" is taken"); err != nil {
+		return err
+	}
+	return w.waitsForLock()
+}
+
+// waitsForLock holds the pool's lock, an flock on dataDir/lock, and checks an
+// ADD waits for it. Racing processes collide too rarely to catch a missing
+// lock any other way.
+func (w *work) waitsForLock() error {
+	const hold = 3 * time.Second
+	lock := w.ipamDir() + "/lock"
+	conf := w.conf(map[string]any{"ipam": w.pool(fmt.Sprintf("10.217.%d.0/24", w.n))})
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.sh(node1, fmt.Sprintf("mkdir -p %s && flock %s sleep %d", w.ipamDir(), lock, int(hold.Seconds())))
+		done <- err
+	}()
+	time.Sleep(time.Second)
+	start := time.Now()
+	_, _, err := w.add(node1, "waiter", conf)
+	took := time.Since(start)
+	if lerr := <-done; lerr != nil {
+		return lerr
+	}
+	if err != nil {
+		return err
+	}
+	if took < hold-1500*time.Millisecond {
+		return fmt.Errorf("with %s held by another process, ADD returned after %s instead of waiting for it; without the lock, two plugins running at once can lease the same address", lock, took.Round(time.Millisecond))
+	}
+	return nil
 }
 
 // stageRoutes — ipam routes become routes in the container, through the
