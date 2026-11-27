@@ -144,6 +144,7 @@ func (d *driver) GetPluginInfo(context.Context, *csi.GetPluginInfoRequest) (*csi
 func (d *driver) GetPluginCapabilities(context.Context, *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
 	return &csi.GetPluginCapabilitiesResponse{Capabilities: []*csi.PluginCapability{
 		{Type: &csi.PluginCapability_Service_{Service: &csi.PluginCapability_Service{Type: csi.PluginCapability_Service_CONTROLLER_SERVICE}}},
+		{Type: &csi.PluginCapability_Service_{Service: &csi.PluginCapability_Service{Type: csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS}}},
 	}}, nil
 }
 
@@ -193,13 +194,16 @@ func (d *driver) CreateVolume(_ context.Context, req *csi.CreateVolumeRequest) (
 	if err != nil {
 		return nil, err
 	}
+	if !d.reachable(req.AccessibilityRequirements) {
+		return nil, status.Errorf(codes.ResourceExhausted, "volumes live on node %s, which no requisite topology includes", d.nodeID)
+	}
 
 	id := volumeID(req.Name)
 	if v, err := d.load(id); err == nil {
 		if v.Capacity < size || (req.CapacityRange.GetLimitBytes() > 0 && v.Capacity > req.CapacityRange.GetLimitBytes()) {
 			return nil, status.Errorf(codes.AlreadyExists, "volume %s exists with capacity %d", req.Name, v.Capacity)
 		}
-		return &csi.CreateVolumeResponse{Volume: v.csi()}, nil
+		return &csi.CreateVolumeResponse{Volume: d.csiVolume(v)}, nil
 	} else if !os.IsNotExist(err) {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -211,7 +215,21 @@ func (d *driver) CreateVolume(_ context.Context, req *csi.CreateVolumeRequest) (
 	if err := d.save(v); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	return &csi.CreateVolumeResponse{Volume: v.csi()}, nil
+	return &csi.CreateVolumeResponse{Volume: d.csiVolume(v)}, nil
+}
+
+// reachable is whether a volume made on this node satisfies the CO's
+// requisite topologies; with none, any node will do.
+func (d *driver) reachable(req *csi.TopologyRequirement) bool {
+	if len(req.GetRequisite()) == 0 {
+		return true
+	}
+	for _, t := range req.Requisite {
+		if t.Segments[topologyKey] == d.nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 // capacity picks a volume's size from the range a CO asked for.
@@ -236,8 +254,14 @@ func volumeID(name string) string {
 	return "vol-" + hex.EncodeToString(sum[:8])
 }
 
-func (v *volume) csi() *csi.Volume {
-	return &csi.Volume{VolumeId: v.ID, CapacityBytes: v.Capacity}
+// csiVolume is a volume as the CO sees it: it is reachable only from the node
+// whose disk holds it.
+func (d *driver) csiVolume(v *volume) *csi.Volume {
+	return &csi.Volume{
+		VolumeId:           v.ID,
+		CapacityBytes:      v.Capacity,
+		AccessibleTopology: []*csi.Topology{{Segments: map[string]string{topologyKey: d.nodeID}}},
+	}
 }
 
 func (d *driver) metaPath(id string) string { return filepath.Join(d.root, "volumes", id+".json") }
@@ -291,7 +315,7 @@ func (d *driver) ListVolumes(context.Context, *csi.ListVolumesRequest) (*csi.Lis
 	}
 	resp := &csi.ListVolumesResponse{}
 	for _, v := range vols {
-		resp.Entries = append(resp.Entries, &csi.ListVolumesResponse_Entry{Volume: v.csi()})
+		resp.Entries = append(resp.Entries, &csi.ListVolumesResponse_Entry{Volume: d.csiVolume(v)})
 	}
 	return resp, nil
 }
@@ -313,7 +337,9 @@ func (d *driver) all() ([]*volume, error) {
 }
 
 // nodeCaps is what this driver's node service implements.
-var nodeCaps = []csi.NodeServiceCapability_RPC_Type{}
+var nodeCaps = []csi.NodeServiceCapability_RPC_Type{
+	csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+}
 
 func (d *driver) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	var caps []*csi.NodeServiceCapability
@@ -328,4 +354,55 @@ func (d *driver) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.Nod
 		NodeId:             d.nodeID,
 		AccessibleTopology: &csi.Topology{Segments: map[string]string{topologyKey: d.nodeID}},
 	}, nil
+}
+
+// NodeStageVolume mounts the volume's storage at the staging path, once per
+// node; every pod that uses the volume is then a bind mount of that.
+func (d *driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+	if req.VolumeId == "" || req.StagingTargetPath == "" || req.VolumeCapability == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume_id, staging_target_path and volume_capability are required")
+	}
+	if _, err := d.load(req.VolumeId); os.IsNotExist(err) {
+		return nil, status.Errorf(codes.NotFound, "no volume %s", req.VolumeId)
+	} else if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if err := bindOnce(d.dataPath(req.VolumeId), req.StagingTargetPath, false); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+// bindOnce bind-mounts src at dst unless something is mounted there already,
+// so a retried call does not stack a second mount.
+func bindOnce(src, dst string, readonly bool) error {
+	if ok, err := mounted(dst); err != nil || ok {
+		return err
+	}
+	if err := syscall.Mount(src, dst, "", syscall.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind %s at %s: %w", src, dst, err)
+	}
+	if readonly {
+		// A bind mount takes its source's flags; read-only needs a remount.
+		if err := syscall.Mount("", dst, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY, ""); err != nil {
+			syscall.Unmount(dst, 0)
+			return fmt.Errorf("remount %s read-only: %w", dst, err)
+		}
+	}
+	return nil
+}
+
+// mounted is whether anything is mounted exactly on path.
+func mounted(path string) (bool, error) {
+	b, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false, err
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		// Field 5 is the mount point, with spaces and the like octal-escaped.
+		if f := strings.Fields(l); len(f) > 4 && f[4] == filepath.Clean(path) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
