@@ -518,7 +518,7 @@ func (f fixture) tally(ctx context.Context, from, script string, n int) (answers
 			fields := strings.Fields(line)
 			a.by[fields[0]]++
 			if len(fields) > 1 {
-				a.from[fields[0]] = strings.TrimPrefix(fields[1], "::ffff:")
+				a.from[fields[0]] = strings.TrimPrefix(strings.Trim(fields[1], "[]"), "::ffff:")
 			}
 			if len(fields) > 2 {
 				a.port[fields[0]] = fields[2]

@@ -33,6 +33,11 @@ const (
 	proxyLabel = "service.kubernetes.io/service-proxy-name"
 	proxyName  = "byok8s"
 	table      = "byok8s"
+
+	// masqMark is the packet mark bit meaning "rewrite this source on the
+	// way out". kube-proxy uses 0x4000; a bit of our own keeps the two
+	// proxies' decisions apart.
+	masqMark = 0x10000
 )
 
 func main() {
@@ -165,6 +170,12 @@ func (sp servicePort) chain() string {
 	return fmt.Sprintf("svc-%s/%s/%d", key(sp.svc), proto(sp.port.Protocol), sp.port.Port)
 }
 
+// externalChain names the chain for traffic that reached a service port from
+// outside the cluster's own addressing: through a node port.
+func (sp servicePort) externalChain() string {
+	return fmt.Sprintf("ext-%s/%s/%d", key(sp.svc), proto(sp.port.Protocol), sp.port.Port)
+}
+
 // endpointChain names the chain that sends a service port's traffic to one
 // endpoint.
 func (sp servicePort) endpointChain(ep endpoint) string {
@@ -183,7 +194,7 @@ func render(ports []servicePort) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "add table ip %s\ndelete table ip %s\n", table, table)
 	fmt.Fprintf(&b, "table ip %s {\n", table)
-	b.WriteString(`	chain nat-prerouting {
+	fmt.Fprintf(&b, `	chain nat-prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
 		jump services
 	}
@@ -193,6 +204,13 @@ func render(ports []servicePort) string {
 	}
 	map service-ips {
 		type ipv4_addr . inet_proto . inet_service : verdict
+	}
+	chain nat-postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		meta mark & %#x != 0 masquerade
+	}
+	chain mark-for-masquerade {
+		meta mark set meta mark | %#x
 	}
 	map service-nodeports {
 		type inet_proto . inet_service : verdict
@@ -218,7 +236,7 @@ func render(ports []servicePort) string {
 	chain reject-chain {
 		reject
 	}
-`)
+`, masqMark, masqMark)
 	for _, sp := range ports {
 		if len(sp.endpoints) == 0 {
 			continue
@@ -232,8 +250,15 @@ func render(ports []servicePort) string {
 		fmt.Fprintf(&b, "\tchain %s {\n", sp.chain())
 		fmt.Fprintf(&b, "\t\tnumgen random mod %d vmap { %s }\n", len(sp.endpoints), strings.Join(picks, ", "))
 		b.WriteString("\t}\n")
+		// Traffic from outside may come from anywhere, and its reply would
+		// go straight back from the pod's node, around this one. Marking it
+		// for masquerade makes the reply return here to be un-rewritten.
+		fmt.Fprintf(&b, "\tchain %s {\n\t\tjump mark-for-masquerade\n\t\tgoto %s\n\t}\n", sp.externalChain(), sp.chain())
 		for _, ep := range sp.endpoints {
 			fmt.Fprintf(&b, "\tchain %s {\n", sp.endpointChain(ep))
+			// A pod sent to itself would answer itself directly, around the
+			// rewrite; masquerading makes the reply come back through the node.
+			fmt.Fprintf(&b, "\t\tip saddr %s jump mark-for-masquerade\n", ep.ip)
 			fmt.Fprintf(&b, "\t\tmeta l4proto %s dnat to %s:%d\n", proto(sp.port.Protocol), ep.ip, ep.port)
 			b.WriteString("\t}\n")
 		}
@@ -254,7 +279,7 @@ func render(ports []servicePort) string {
 		// what fib daddr type local matches.
 		if sp.port.NodePort != 0 {
 			fmt.Fprintf(&b, "add element ip %s service-nodeports { %s . %d : goto %s }\n",
-				table, proto(sp.port.Protocol), sp.port.NodePort, sp.chain())
+				table, proto(sp.port.Protocol), sp.port.NodePort, sp.externalChain())
 		}
 	}
 	return b.String()
