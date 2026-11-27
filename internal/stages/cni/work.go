@@ -74,7 +74,7 @@ const podRange = "10.217.0.0/16"
 // connection tracking. kind masquerades anything leaving a node for outside
 // its own pod range, and bridged traffic passes iptables here, so without it
 // a container would see every peer as the gateway.
-var harnessTables = `table ip byok8s-harness {
+var harnessTables = `table ip byok8s-cni-harness {
   chain pre {
     type filter hook prerouting priority raw;
     ip saddr ` + podRange + ` ip daddr ` + podRange + ` notrack
@@ -146,7 +146,7 @@ func (w *work) close() { w.clean() }
 
 // clean removes everything a run leaves in both nodes: processes in the
 // course's namespaces, the namespaces, links, routes into the course's
-// range, nftables tables named byok8s*, the stage's directory, and a plugin
+// range, nftables tables named byok8s-cni*, the stage's directory, and a plugin
 // left installed for the kubelet.
 func (w *work) clean() error {
 	script := fmt.Sprintf(`
@@ -158,7 +158,7 @@ done
 sleep 0.2
 for l in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^%[1]s'); do ip link del "$l" 2>/dev/null; done
 ip route show | grep '^10\.217\.' | while read -r r; do ip route del $r 2>/dev/null; done
-for t in $(nft list tables | awk '$3 ~ /^byok8s/ {print $2 "/" $3}'); do nft delete table "${t%%/*}" "${t#*/}"; done
+for t in $(nft list tables | awk '$3 ~ /^byok8s-cni/ {print $2 "/" $3}'); do nft delete table "${t%%/*}" "${t#*/}"; done
 rm -rf %[2]s
 true`, prefix, w.dir)
 	for _, n := range []runner.Node{node1, node2} {
