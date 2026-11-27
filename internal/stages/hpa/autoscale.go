@@ -406,8 +406,8 @@ func stageScalingFormula(ctx context.Context, env *kube.Env, bin string) error {
 	if err := r.expect(ctx, "web", 150, 10, "4 pods at 150% of a 50% target want 12, and maxReplicas is 10"); err != nil {
 		return err
 	}
-	r.metrics.setCPU(each(65))
-	if err := r.expect(ctx, "web", 130, 6, "ceil(4 × 130/50) = ceil(10.4/2) = 6 — round up, never to nearest"); err != nil {
+	r.metrics.setCPU(each(33))
+	if err := r.expect(ctx, "web", 66, 6, "ceil(4 × 66/50) = ceil(5.28) = 6 — round up, never to nearest"); err != nil {
 		return err
 	}
 	r.metrics.setCPU(each(10))

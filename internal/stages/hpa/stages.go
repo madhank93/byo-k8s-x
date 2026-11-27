@@ -141,17 +141,29 @@ func clearPods(ctx context.Context, env *kube.Env) {
 		metav1.DeleteOptions{GracePeriodSeconds: ptr(int64(0))}, metav1.ListOptions{})
 }
 
-// workers are the nodes fixture pods are pinned to, in a stable order.
-func workers(ctx context.Context, env *kube.Env) ([]string, error) {
-	list, err := env.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: "!node-role.kubernetes.io/control-plane"})
+// kindNodes lists the nodes a kind container backs. Other courses register
+// nodes no kubelet answers for, and a pod pinned to one never runs.
+func kindNodes(ctx context.Context, env *kube.Env, selector string) ([]string, error) {
+	list, err := env.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		return nil, err
 	}
 	var names []string
 	for _, n := range list.Items {
-		names = append(names, n.Name)
+		if strings.HasPrefix(n.Spec.ProviderID, "kind://") {
+			names = append(names, n.Name)
+		}
 	}
 	sort.Strings(names)
+	return names, nil
+}
+
+// workers are the nodes fixture pods are pinned to, in a stable order.
+func workers(ctx context.Context, env *kube.Env) ([]string, error) {
+	names, err := kindNodes(ctx, env, "!node-role.kubernetes.io/control-plane")
+	if err != nil {
+		return nil, err
+	}
 	if len(names) < 2 {
 		return nil, fmt.Errorf("this course needs two worker nodes and the cluster has %d (byok8s down && byok8s up)", len(names))
 	}

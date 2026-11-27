@@ -311,7 +311,7 @@ func stagePodMetrics(ctx context.Context, env *kube.Env, bin string) error {
 
 // stageNodeMetrics — the program serves NodeMetrics for every node.
 func stageNodeMetrics(ctx context.Context, env *kube.Env, bin string) error {
-	nodes, err := env.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	nodes, err := kindNodes(ctx, env, "")
 	if err != nil {
 		return err
 	}
@@ -333,8 +333,14 @@ func stageNodeMetrics(ctx context.Context, env *kube.Env, bin string) error {
 			}
 			return false, nil
 		}
-		last = fmt.Sprintf("%d of %d nodes listed", len(list.Items), len(nodes.Items))
-		return len(list.Items) >= len(nodes.Items), nil
+		found := 0
+		for _, n := range nodes {
+			if slices.ContainsFunc(list.Items, func(it metricsItem) bool { return it.Metadata.Name == n }) {
+				found++
+			}
+		}
+		last = fmt.Sprintf("%d of %d nodes listed", found, len(nodes))
+		return found == len(nodes), nil
 	})
 	if err != nil {
 		return fmt.Errorf("%w\nlast answer: %s", err, last)
@@ -342,23 +348,23 @@ func stageNodeMetrics(ctx context.Context, env *kube.Env, bin string) error {
 	if list.Kind != "NodeMetricsList" {
 		return fmt.Errorf("the list answer has kind %q, want NodeMetricsList", list.Kind)
 	}
-	for _, n := range nodes.Items {
-		i := slices.IndexFunc(list.Items, func(it metricsItem) bool { return it.Metadata.Name == n.Name })
+	for _, n := range nodes {
+		i := slices.IndexFunc(list.Items, func(it metricsItem) bool { return it.Metadata.Name == n })
 		if i < 0 {
-			return fmt.Errorf("node %s is missing from the list", n.Name)
+			return fmt.Errorf("node %s is missing from the list", n)
 		}
 		it := list.Items[i]
 		cq, err1 := resource.ParseQuantity(it.Usage["cpu"])
 		mq, err2 := resource.ParseQuantity(it.Usage["memory"])
 		if err1 != nil || err2 != nil || cq.IsZero() || mq.IsZero() {
-			return fmt.Errorf("node %s has usage %v — both cpu and memory are quantities, and a running node uses some of each", n.Name, it.Usage)
+			return fmt.Errorf("node %s has usage %v — both cpu and memory are quantities, and a running node uses some of each", n, it.Usage)
 		}
 		if it.Timestamp.IsZero() || it.Window.Duration <= 0 {
-			return fmt.Errorf("node %s has no timestamp or window", n.Name)
+			return fmt.Errorf("node %s has no timestamp or window", n)
 		}
 	}
 
-	name := nodes.Items[0].Name
+	name := nodes[0]
 	var one metricsItem
 	if err := getMetrics(ctx, env, "/nodes/"+name, "", &one); err != nil {
 		return fmt.Errorf("GET nodes/%s: %w", name, err)
@@ -405,13 +411,17 @@ func stageKubectlTop(ctx context.Context, env *kube.Env, bin string) error {
 	defer cleanup()
 
 	var out string
+	var last error
 	waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	if err := kube.WaitFor(waitCtx, "kubectl top pod to show hot and cold", func(ctx context.Context) (bool, error) {
-		out, err = kubectlTop(ctx, kc, "pod", "--no-headers")
-		return err == nil && hasRow(out, "hot") && hasRow(out, "cold"), nil
+		out, last = kubectlTop(ctx, kc, "pod", "--no-headers")
+		return last == nil && hasRow(out, "hot") && hasRow(out, "cold"), nil
 	}); err != nil {
-		return fmt.Errorf("%w\nlast output: %v\n%s", err, err, tail(out))
+		if last != nil {
+			return fmt.Errorf("%w\nlast attempt: %v", err, last)
+		}
+		return fmt.Errorf("%w\nlast output:\n%s", err, tail(out))
 	}
 
 	out, err = kubectlTop(ctx, kc, "pod", "-l", "tier=hot", "--no-headers")
@@ -434,13 +444,13 @@ func stageKubectlTop(ctx context.Context, env *kube.Env, bin string) error {
 	if err != nil {
 		return err
 	}
-	all, err := env.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	all, err := kindNodes(ctx, env, "")
 	if err != nil {
 		return err
 	}
-	for _, n := range all.Items {
-		if !hasRow(out, n.Name) {
-			return fmt.Errorf("kubectl top node printed:\n%s\nand node %s is not in it", tail(out), n.Name)
+	for _, n := range all {
+		if !hasRow(out, n) {
+			return fmt.Errorf("kubectl top node printed:\n%s\nand node %s is not in it", tail(out), n)
 		}
 	}
 	return nil
