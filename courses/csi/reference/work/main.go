@@ -406,3 +406,66 @@ func mounted(path string) (bool, error) {
 	}
 	return false, nil
 }
+
+// NodePublishVolume makes the staged volume appear at a pod's target path,
+// read-only if the pod asked.
+func (d *driver) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	if req.VolumeId == "" || req.TargetPath == "" || req.VolumeCapability == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume_id, target_path and volume_capability are required")
+	}
+	if _, err := d.load(req.VolumeId); os.IsNotExist(err) {
+		return nil, status.Errorf(codes.NotFound, "no volume %s", req.VolumeId)
+	} else if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if req.StagingTargetPath == "" {
+		return nil, status.Error(codes.FailedPrecondition, "staging_target_path is required; the volume must be staged first")
+	}
+	// The CO makes the target's parent; the target itself is the driver's.
+	if err := os.MkdirAll(req.TargetPath, 0o755); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if err := bindOnce(req.StagingTargetPath, req.TargetPath, req.Readonly); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// NodeUnpublishVolume unmounts the target and removes it; a target that is
+// already gone is success.
+func (d *driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+	if req.VolumeId == "" || req.TargetPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id and target_path are required")
+	}
+	if err := unmount(req.TargetPath); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if err := os.Remove(req.TargetPath); err != nil && !os.IsNotExist(err) {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+// NodeUnstageVolume unmounts the staging path. The directory is the CO's, so
+// it stays.
+func (d *driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	if req.VolumeId == "" || req.StagingTargetPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id and staging_target_path are required")
+	}
+	if err := unmount(req.StagingTargetPath); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &csi.NodeUnstageVolumeResponse{}, nil
+}
+
+// unmount unmounts path if anything is mounted there.
+func unmount(path string) error {
+	ok, err := mounted(path)
+	if err != nil || !ok {
+		return err
+	}
+	if err := syscall.Unmount(path, 0); err != nil {
+		return fmt.Errorf("unmount %s: %w", path, err)
+	}
+	return nil
+}
