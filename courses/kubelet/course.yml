@@ -1,0 +1,20 @@
+slug: kubelet
+name: Build your own kubelet
+language: go
+entrypoint: main.go
+# The program runs inside the first worker node, beside that node's own
+# kubelet, as the kubelet for a Node of its own; see internal/stages/kubelet.
+workers: 1
+stages:
+  - slug: node-register
+    name: Register a node
+    difficulty: easy
+  - slug: node-status
+    name: Report what the machine is
+    difficulty: medium
+  - slug: node-lease
+    name: Hold the node's lease
+    difficulty: medium
+  - slug: run-container
+    name: Run a pod's containers
+    difficulty: hard
