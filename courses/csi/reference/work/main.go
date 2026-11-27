@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	registration "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 )
 
 const version = "0.1.0"
@@ -36,9 +37,10 @@ type driver struct {
 	csi.UnimplementedControllerServer
 	csi.UnimplementedNodeServer
 
-	name   string
-	nodeID string
-	root   string
+	name     string
+	nodeID   string
+	root     string
+	endpoint string // the CSI socket's path
 }
 
 func main() {
@@ -47,42 +49,92 @@ func main() {
 	flag.StringVar(&d.name, "name", "", "the driver name")
 	flag.StringVar(&d.nodeID, "node-id", "", "the node this driver runs on")
 	flag.StringVar(&d.root, "root", "", "where the driver keeps its volumes")
+	regSocket := flag.String("registration-socket", "", "where to serve the kubelet's plugin registration API, if anywhere")
 	flag.Parse()
-	if err := d.serve(*endpoint); err != nil {
+	if err := d.serve(*endpoint, *regSocket); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// serve listens on the endpoint until SIGTERM, then stops and removes the
-// socket.
-func (d *driver) serve(endpoint string) error {
+// serve listens on the endpoint, and on the registration socket if there is
+// one, until SIGTERM; then it stops and removes both sockets.
+func (d *driver) serve(endpoint, regSocket string) error {
 	path, ok := strings.CutPrefix(endpoint, "unix://")
 	if !ok {
 		return fmt.Errorf("--endpoint %q is not unix://", endpoint)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	lis, err := net.Listen("unix", path)
+	d.endpoint = path
+	lis, err := listen(path)
 	if err != nil {
 		return err
 	}
+	defer os.Remove(path)
 	srv := grpc.NewServer()
 	csi.RegisterIdentityServer(srv, d)
 	csi.RegisterControllerServer(srv, d)
 	csi.RegisterNodeServer(srv, d)
+	servers := []*grpc.Server{srv}
+
+	// The kubelet watches its plugins_registry directory: a socket appearing
+	// there is a plugin asking to be registered, and its going is the plugin
+	// leaving.
+	if regSocket != "" {
+		rl, err := listen(regSocket)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(regSocket)
+		reg := grpc.NewServer()
+		registration.RegisterRegistrationServer(reg, &registrar{d: d})
+		servers = append(servers, reg)
+		go reg.Serve(rl)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	go func() {
 		<-ctx.Done()
-		srv.GracefulStop()
+		for _, s := range servers {
+			s.GracefulStop()
+		}
 	}()
 	log.Printf("%s serving on %s", d.name, path)
 	return srv.Serve(lis)
+}
+
+// listen opens a unix socket at path, replacing whatever a crashed run left
+// there.
+func listen(path string) (net.Listener, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	return net.Listen("unix", path)
+}
+
+// registrar answers the kubelet's plugin watcher: which kind of plugin this
+// is, its name, and where its CSI endpoint is.
+type registrar struct {
+	registration.UnimplementedRegistrationServer
+	d *driver
+}
+
+func (r *registrar) GetInfo(context.Context, *registration.InfoRequest) (*registration.PluginInfo, error) {
+	return &registration.PluginInfo{
+		Type:              registration.CSIPlugin,
+		Name:              r.d.name,
+		Endpoint:          r.d.endpoint,
+		SupportedVersions: []string{"1.0.0"},
+	}, nil
+}
+
+func (r *registrar) NotifyRegistrationStatus(_ context.Context, s *registration.RegistrationStatus) (*registration.RegistrationStatusResponse, error) {
+	if !s.PluginRegistered {
+		log.Printf("the kubelet refused the registration: %s", s.Error)
+	}
+	return &registration.RegistrationStatusResponse{}, nil
 }
 
 func (d *driver) GetPluginInfo(context.Context, *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {

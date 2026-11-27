@@ -5,6 +5,7 @@ go 1.25.1
 require (
 	github.com/container-storage-interface/spec v1.14.0
 	google.golang.org/grpc v1.79.3
+	k8s.io/kubelet v0.34.1
 )
 
 require (
