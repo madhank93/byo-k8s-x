@@ -1,0 +1,67 @@
+slug: csi
+name: Build your own CSI driver
+language: go
+entrypoint: main.go
+# The driver runs inside the first worker node; see internal/stages/csi.
+workers: 1
+stages:
+  - slug: identity
+    name: Serve the Identity service
+    difficulty: medium
+  - slug: controller-capabilities
+    name: Advertise what you implement
+    difficulty: easy
+  - slug: create-volume
+    name: Provision a volume
+    difficulty: medium
+  - slug: delete-volume
+    name: Delete it, and remember the rest
+    difficulty: medium
+  - slug: node-info
+    name: Say which node you are
+    difficulty: easy
+  - slug: registration
+    name: Register with the kubelet
+    difficulty: hard
+  - slug: topology
+    name: Pin volumes to a node
+    difficulty: medium
+  - slug: node-stage
+    name: Stage a volume on the node
+    difficulty: medium
+  - slug: node-publish
+    name: Publish it into a pod's path
+    difficulty: medium
+  - slug: node-unpublish
+    name: Take it back down
+    difficulty: medium
+  - slug: filesystem
+    name: Format and mount a block device
+    difficulty: hard
+  - slug: expansion
+    name: Grow a volume in place
+    difficulty: hard
+  - slug: controller-publish
+    name: Attach before mount
+    difficulty: medium
+  - slug: ephemeral-inline
+    name: A volume that lives with its pod
+    difficulty: hard
+  - slug: snapshot-create
+    name: Take a snapshot
+    difficulty: medium
+  - slug: snapshot-restore
+    name: Restore one
+    difficulty: medium
+  - slug: clone
+    name: Clone a volume
+    difficulty: medium
+  - slug: capacity
+    name: Report and enforce capacity
+    difficulty: medium
+  - slug: idempotency
+    name: Survive a CO that retries
+    difficulty: hard
+  - slug: sidecars-drive-it
+    name: Let Kubernetes drive it
+    difficulty: hard

@@ -77,7 +77,7 @@ entries:
 
   - slug: csi
     name: Build your own CSI driver
-    status: planned
+    status: shipped
     tier: the ecosystem
     blurb: Provision a volume, stage it, publish it into a pod.
 

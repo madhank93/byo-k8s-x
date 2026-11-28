@@ -234,13 +234,17 @@ Host processes again. Independent of tiers 2 and 3 — take them whenever.
 `patch-targets` · `overlays` · `components` · `replacements` ·
 `kustomize-parity`
 
-### `csi` — Build your own CSI driver · 20 stages
+### [x] `csi` — Build your own CSI driver · 20 stages
 
-`identity` · `registration` · `controller-capabilities` · `create-volume` ·
-`delete-volume` · `topology` · `node-stage` · `node-publish` ·
+A gRPC driver the real kubelet and external-provisioner drive: volumes
+provisioned, staged and published into pods, then grown, snapshotted and
+cloned.
+
+`identity` · `controller-capabilities` · `create-volume` · `delete-volume` ·
+`node-info` · `registration` · `topology` · `node-stage` · `node-publish` ·
 `node-unpublish` · `filesystem` · `expansion` · `controller-publish` ·
-`node-info` · `ephemeral-inline` · `snapshot-create` · `snapshot-restore` ·
-`clone` · `capacity` · `idempotency` · `sidecars-drive-it`
+`ephemeral-inline` · `snapshot-create` · `snapshot-restore` · `clone` ·
+`capacity` · `idempotency` · `sidecars-drive-it`
 
 ### `hpa` — Build your own metrics server and HPA · 18 stages
 
