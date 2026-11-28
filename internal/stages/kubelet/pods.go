@@ -557,3 +557,219 @@ func stageGracefulDelete(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	return w.stopped(forced, 10*time.Second, "pod forced was deleted with --grace-period=0 and is gone from the API, so the kubelet kills its container at once")
 }
+
+// stageRestartPolicy — the kubelet runs an exited container again when the
+// pod's restartPolicy says to, a fresh containerd container per run, and
+// backs off between runs of one that keeps exiting: 10s, then 20s, doubling.
+func stageRestartPolicy(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	exit := func(code int) []string { return []string{"sh", "-c", fmt.Sprintf("echo run; exit %d", code)} }
+	var crash *corev1.Pod
+	for _, p := range []*corev1.Pod{
+		w.pod("crash", corev1.RestartPolicyAlways, corev1.Container{Name: "main", Command: exit(1)}),
+		w.pod("always-ok", corev1.RestartPolicyAlways, corev1.Container{Name: "main", Command: exit(0)}),
+		w.pod("onfailure-ok", corev1.RestartPolicyOnFailure, corev1.Container{Name: "main", Command: exit(0)}),
+		w.pod("onfailure-bad", corev1.RestartPolicyOnFailure, corev1.Container{Name: "main", Command: exit(2)}),
+	} {
+		p, err := w.create(p)
+		if err != nil {
+			return err
+		}
+		if p.Name == "crash" {
+			crash = p
+		}
+	}
+
+	// Watch crash through two restarts, noting when each happened and that
+	// it waited in CrashLoopBackOff between them.
+	var at [3]time.Time
+	at[0] = time.Now()
+	backedOff := false
+	var last *corev1.Pod
+	ctx2, cancel := context.WithTimeout(ctx, 50*time.Second)
+	defer cancel()
+	err = kube.WaitFor(ctx2, "pod crash to restart twice", func(ctx context.Context) (bool, error) {
+		if err := w.alive(); err != nil {
+			return false, err
+		}
+		p, err := w.env.Client.CoreV1().Pods(w.env.Namespace).Get(ctx, "crash", metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		last = p
+		cs := containerStatus(p, "main")
+		if cs == nil {
+			return false, nil
+		}
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" {
+			backedOff = true
+		}
+		if n := cs.RestartCount; n > 0 && n < 3 && at[n].IsZero() {
+			at[n] = time.Now()
+		}
+		return cs.RestartCount >= 2, nil
+	})
+	if err != nil {
+		return fmt.Errorf("%w: restartPolicy Always runs an exited container again; status is %s", err, statusJSON(last))
+	}
+	cs := containerStatus(last, "main")
+	switch {
+	case last.Status.Phase != corev1.PodRunning:
+		return fmt.Errorf("pod crash is %s; a pod whose containers will run again is Running", last.Status.Phase)
+	case cs.LastTerminationState.Terminated == nil || cs.LastTerminationState.Terminated.ExitCode != 1:
+		return fmt.Errorf("container main's lastState is %+v; it is the run that exited 1", cs.LastTerminationState)
+	case !backedOff:
+		return fmt.Errorf("container main never showed state waiting with reason CrashLoopBackOff between restarts")
+	case at[2].Sub(at[1]) < 14*time.Second:
+		return fmt.Errorf("container main restarted %s after its first restart; the back-off doubles to 20s", at[2].Sub(at[1]).Round(time.Second))
+	}
+	for n := range 3 {
+		if !strings.Contains(w.log(crash, "main", n), "run") {
+			return fmt.Errorf("%s does not hold run %d's output; each run logs to a file of its own", w.logPath(crash, "main", n), n)
+		}
+	}
+	cs2, err := w.containers()
+	if err != nil {
+		return err
+	}
+	if n := len(of(cs2, crash, "main")); n < 2 {
+		return fmt.Errorf("containerd holds %d containers for crash's main; each run is a new container, and the last one stays for lastState", n)
+	}
+
+	if _, err := w.waitPod("always-ok", "pod always-ok to restart", 5*time.Second, func(p *corev1.Pod) error {
+		if cs := containerStatus(p, "main"); cs == nil || cs.RestartCount == 0 {
+			return fmt.Errorf("restartPolicy Always runs a container again even after it exits 0")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	p, err := w.phase("onfailure-ok", corev1.PodSucceeded, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if cs := containerStatus(p, "main"); cs.RestartCount != 0 {
+		return fmt.Errorf("pod onfailure-ok restarted a container that exited 0")
+	}
+	_, err = w.waitPod("onfailure-bad", "pod onfailure-bad to restart", 5*time.Second, func(p *corev1.Pod) error {
+		if cs := containerStatus(p, "main"); cs == nil || cs.RestartCount == 0 || p.Status.Phase != corev1.PodRunning {
+			return fmt.Errorf("restartPolicy OnFailure runs a container that exited 2 again, and the pod stays Running; status is %s", statusJSON(p))
+		}
+		return nil
+	})
+	return err
+}
+
+func initStatus(p *corev1.Pod, name string) *corev1.ContainerStatus {
+	for i := range p.Status.InitContainerStatuses {
+		if p.Status.InitContainerStatuses[i].Name == name {
+			return &p.Status.InitContainerStatuses[i]
+		}
+	}
+	return nil
+}
+
+// stageInitContainers — init containers run one at a time, in order, each to
+// a clean exit, before any app container starts; the pod is Pending and not
+// Initialized until they have, and a failed one is retried or fails the pod
+// as its restartPolicy says.
+func stageInitContainers(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	ordered := w.pod("ordered", corev1.RestartPolicyAlways, corev1.Container{Name: "app", Command: []string{"sleep", "3600"}})
+	ordered.Spec.InitContainers = []corev1.Container{
+		{Name: "first", Image: image, Command: []string{"sh", "-c", "sleep 4"}},
+		{Name: "second", Image: image, Command: []string{"sh", "-c", "sleep 2"}},
+	}
+	fail := w.pod("fail", corev1.RestartPolicyNever, corev1.Container{Name: "app", Command: []string{"sleep", "3600"}})
+	fail.Spec.InitContainers = []corev1.Container{{Name: "first", Image: image, Command: []string{"sh", "-c", "exit 1"}}}
+	retry := w.pod("retry", corev1.RestartPolicyOnFailure, corev1.Container{Name: "app", Command: []string{"sleep", "3600"}})
+	retry.Spec.InitContainers = []corev1.Container{{Name: "first", Image: image, Command: []string{"sh", "-c", "exit 1"}}}
+	pods := map[string]*corev1.Pod{}
+	for _, p := range []*corev1.Pod{ordered, fail, retry} {
+		got, err := w.create(p)
+		if err != nil {
+			return err
+		}
+		pods[p.Name] = got
+	}
+
+	// While the first init container runs, nothing else does.
+	if _, err := w.running(pods["ordered"], "first", 30*time.Second); err != nil {
+		return err
+	}
+	p, err := w.waitPod("ordered", "pod ordered to report it is initializing", 5*time.Second, func(p *corev1.Pod) error {
+		cs := containerStatus(p, "app")
+		switch {
+		case p.Status.Phase != corev1.PodPending || podCondition(p, corev1.PodInitialized) != corev1.ConditionFalse:
+			return fmt.Errorf("while init container first runs the pod is Pending and Initialized is False; phase is %q, Initialized %s", p.Status.Phase, podCondition(p, corev1.PodInitialized))
+		case initStatus(p, "first") == nil || initStatus(p, "first").State.Running == nil:
+			return fmt.Errorf("status.initContainerStatuses should show first running: %s", statusJSON(p))
+		case cs == nil || cs.State.Waiting == nil || cs.State.Waiting.Reason != "PodInitializing":
+			return fmt.Errorf("app container app waits for reason PodInitializing while init containers run: %s", statusJSON(p))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	cs, err := w.containers()
+	if err != nil {
+		return err
+	}
+	if n := len(of(cs, p, "second")) + len(of(cs, p, "app")); n != 0 {
+		return fmt.Errorf("while init container first runs, containerd already holds %d containers for second or app; they wait their turn", n)
+	}
+
+	p, err = w.waitPod("ordered", "pod ordered to be Running", 30*time.Second, func(p *corev1.Pod) error {
+		if p.Status.Phase != corev1.PodRunning || podCondition(p, corev1.PodInitialized) != corev1.ConditionTrue {
+			return fmt.Errorf("once its init containers are done the pod is Initialized and Running; status is %s", statusJSON(p))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	first, second, app := initStatus(p, "first"), initStatus(p, "second"), containerStatus(p, "app")
+	switch {
+	case first == nil || second == nil || first.State.Terminated == nil || second.State.Terminated == nil:
+		return fmt.Errorf("both init containers should show terminated: %s", statusJSON(p))
+	case first.State.Terminated.ExitCode != 0 || second.State.Terminated.ExitCode != 0:
+		return fmt.Errorf("both init containers exited 0: %s", statusJSON(p))
+	case second.State.Terminated.StartedAt.Before(&first.State.Terminated.FinishedAt):
+		return fmt.Errorf("init container second started at %s, before first finished at %s; they run one at a time", second.State.Terminated.StartedAt, first.State.Terminated.FinishedAt)
+	case app.State.Running == nil || app.State.Running.StartedAt.Before(&second.State.Terminated.FinishedAt):
+		return fmt.Errorf("container app should start after the last init container finishes: %s", statusJSON(p))
+	}
+
+	p, err = w.phase("fail", corev1.PodFailed, 20*time.Second)
+	if err != nil {
+		return fmt.Errorf("an init container that fails in a restartPolicy Never pod fails the pod: %w", err)
+	}
+	if cs, err := w.containers(); err != nil {
+		return err
+	} else if len(of(cs, p, "app")) != 0 {
+		return fmt.Errorf("pod fail's init container failed, yet its app container was created")
+	}
+	_, err = w.waitPod("retry", "pod retry to retry its init container", 20*time.Second, func(p *corev1.Pod) error {
+		s := initStatus(p, "first")
+		if p.Status.Phase != corev1.PodPending || s == nil || s.RestartCount == 0 {
+			return fmt.Errorf("restartPolicy OnFailure runs a failed init container again, and the pod stays Pending; status is %s", statusJSON(p))
+		}
+		return nil
+	})
+	return err
+}

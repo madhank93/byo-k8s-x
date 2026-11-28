@@ -24,3 +24,9 @@ stages:
   - slug: graceful-delete
     name: Stop a pod gracefully
     difficulty: medium
+  - slug: restart-policy
+    name: Restart what exits
+    difficulty: medium
+  - slug: init-containers
+    name: Run init containers first
+    difficulty: medium

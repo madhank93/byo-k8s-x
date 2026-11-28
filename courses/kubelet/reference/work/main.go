@@ -76,12 +76,15 @@ func run() error {
 	name := flag.String("hostname-override", "", "the Node's name")
 	taints := flag.String("register-with-taints", "", "taints to register the Node with, K=V:EFFECT,…")
 	root := flag.String("root-dir", "/var/lib/kubelet", "where the kubelet keeps pod logs and volumes")
-	ns := flag.String("containerd-namespace", "k8s.io", "the containerd namespace pods run in")
+	ns := flag.String("containerd-namespace", "", "the containerd namespace pods run in, never k8s.io: the CRI owns that one")
 	flag.String("pod-manifest-path", "", "a directory of static pod manifests")
 	flag.Int("port", 10250, "the port the kubelet serves its API on")
 	flag.Parse()
 	if *name == "" {
 		return fmt.Errorf("--hostname-override is required")
+	}
+	if *ns == "" || *ns == "k8s.io" {
+		return fmt.Errorf("--containerd-namespace must name a namespace of the kubelet's own, not k8s.io")
 	}
 
 	cfg, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
@@ -396,22 +399,76 @@ func (k *kubelet) syncPod(ctx context.Context, w *worker, p *corev1.Pod) error {
 	if err != nil {
 		return err
 	}
-	for i := range p.Spec.Containers {
-		c := &p.Spec.Containers[i]
-		if states[c.Name] != nil {
-			continue
+	initialized, failed := initDone(p, states)
+	if !initialized && !failed {
+		// Init containers run one at a time: the first not yet done.
+		for i := range p.Spec.InitContainers {
+			c := &p.Spec.InitContainers[i]
+			if st := states[c.Name]; st != nil && !st.running && st.exitCode == 0 {
+				continue
+			}
+			k.ensure(ctx, w, p, c, states[c.Name], initPolicy(p.Spec.RestartPolicy))
+			break
 		}
-		if err := k.startContainer(ctx, p, c); err != nil {
-			w.waiting[c.Name] = waitingFor(err)
-			fmt.Fprintf(os.Stderr, "error: start container %s of %s: %v\n", c.Name, w.key, err)
-			continue
+	}
+	if initialized {
+		for i := range p.Spec.Containers {
+			k.ensure(ctx, w, p, &p.Spec.Containers[i], states[p.Spec.Containers[i].Name], p.Spec.RestartPolicy)
 		}
-		delete(w.waiting, c.Name)
 	}
 	if states, err = k.podContainers(ctx, p.UID); err != nil {
 		return err
 	}
 	return k.writeStatus(ctx, p, k.podStatus(p, states, w))
+}
+
+// ensure starts container c, whose latest run is st, if it has not run or
+// should run again and its back-off is over.
+func (k *kubelet) ensure(ctx context.Context, w *worker, p *corev1.Pod, c *corev1.Container, st *ctrState, policy corev1.RestartPolicy) {
+	restart := 0
+	if st != nil {
+		if st.running || !restarts(policy, st.exitCode) {
+			return
+		}
+		restart = st.restart + 1
+		if wait := time.Until(st.finished.Add(backoff(st.restart))); wait > 0 {
+			w.waiting[c.Name] = &corev1.ContainerStateWaiting{
+				Reason:  "CrashLoopBackOff",
+				Message: fmt.Sprintf("back-off %s restarting failed container=%s pod=%s", backoff(st.restart), c.Name, p.Name),
+			}
+			return
+		}
+	}
+	if err := k.startContainer(ctx, p, c, restart); err != nil {
+		w.waiting[c.Name] = waitingFor(err)
+		fmt.Fprintf(os.Stderr, "error: start container %s of %s: %v\n", c.Name, w.key, err)
+		return
+	}
+	delete(w.waiting, c.Name)
+}
+
+// initDone reports whether every init container has exited 0, and whether
+// one has failed for good.
+func initDone(p *corev1.Pod, states map[string]*ctrState) (done, failed bool) {
+	for _, c := range p.Spec.InitContainers {
+		st := states[c.Name]
+		if st == nil || st.running {
+			return false, false
+		}
+		if st.exitCode != 0 {
+			return false, !restarts(initPolicy(p.Spec.RestartPolicy), st.exitCode)
+		}
+	}
+	return true, false
+}
+
+// initPolicy is how init containers restart: a failed one runs again unless
+// the pod never restarts anything, and one that succeeded never does.
+func initPolicy(policy corev1.RestartPolicy) corev1.RestartPolicy {
+	if policy == corev1.RestartPolicyNever {
+		return policy
+	}
+	return corev1.RestartPolicyOnFailure
 }
 
 // terminate stops a deleted pod's containers within its grace period, then
@@ -508,6 +565,17 @@ func (k *kubelet) removePod(ctx context.Context, w *worker) {
 	k.mu.Unlock()
 }
 
+// restarts reports whether a container that exited with code runs again.
+func restarts(policy corev1.RestartPolicy, code int32) bool {
+	return policy == corev1.RestartPolicyAlways || policy == corev1.RestartPolicyOnFailure && code != 0
+}
+
+// backoff is how long a container waits after its restart-th run exits
+// before it runs again: 10s, doubling, at most five minutes.
+func backoff(restart int) time.Duration {
+	return min(10*time.Second<<min(restart, 5), 5*time.Minute)
+}
+
 func terminal(phase corev1.PodPhase) bool {
 	return phase == corev1.PodSucceeded || phase == corev1.PodFailed
 }
@@ -529,6 +597,7 @@ const (
 	labelPodName      = "io.kubernetes.pod.name"
 	labelPodNamespace = "io.kubernetes.pod.namespace"
 	labelContainer    = "io.kubernetes.container.name"
+	labelRestartCount = "io.kubernetes.container.restartCount"
 	labelImageID      = "byok8s.dev/image-id"
 	labelStartedAt    = "byok8s.dev/started-at"
 	labelFinishedAt   = "byok8s.dev/finished-at"
@@ -538,6 +607,9 @@ const (
 // ctrState is what one containerd container says about a run of a pod's
 // container.
 type ctrState struct {
+	restart int
+	// prev is the run before this one, which a status reports as lastState.
+	prev              *ctrState
 	id                string
 	imageID           string
 	running           bool
@@ -552,7 +624,8 @@ func (k *kubelet) podContainers(ctx context.Context, uid types.UID) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]*ctrState{}
+	runs := map[string][]*ctrState{}
+	ctrs := map[string]client.Container{}
 	for _, c := range cs {
 		labels, err := c.Labels(ctx)
 		if err != nil {
@@ -562,7 +635,24 @@ func (k *kubelet) podContainers(ctx context.Context, uid types.UID) (map[string]
 		if err != nil {
 			return nil, err
 		}
-		out[labels[labelContainer]] = st
+		st.restart, _ = strconv.Atoi(labels[labelRestartCount])
+		runs[labels[labelContainer]] = append(runs[labels[labelContainer]], st)
+		ctrs[st.id] = c
+	}
+	out := map[string]*ctrState{}
+	for name, rs := range runs {
+		slices.SortFunc(rs, func(a, b *ctrState) int { return a.restart - b.restart })
+		// Only the last two runs are ever reported; older ones go.
+		for _, old := range rs[:max(len(rs)-2, 0)] {
+			if err := ctrs[old.id].Delete(ctx, client.WithSnapshotCleanup); err != nil {
+				return nil, err
+			}
+		}
+		latest := rs[len(rs)-1]
+		if len(rs) > 1 {
+			latest.prev = rs[len(rs)-2]
+		}
+		out[name] = latest
 	}
 	return out, nil
 }
@@ -608,7 +698,7 @@ func (k *kubelet) inspect(ctx context.Context, c client.Container, labels map[st
 }
 
 // startContainer creates container c of pod p in containerd and starts it.
-func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.Container) error {
+func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.Container, restart int) error {
 	img, err := k.image(ctx, c.Image)
 	if err != nil {
 		return err
@@ -617,7 +707,7 @@ func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.C
 	if err != nil {
 		return err
 	}
-	logPath := filepath.Join(k.root, "logs", fmt.Sprintf("%s_%s_%s", p.Namespace, p.Name, p.UID), c.Name, "0.log")
+	logPath := filepath.Join(k.root, "logs", fmt.Sprintf("%s_%s_%s", p.Namespace, p.Name, p.UID), c.Name, strconv.Itoa(restart)+".log")
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		return err
 	}
@@ -641,6 +731,7 @@ func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.C
 			labelPodName:      p.Name,
 			labelPodNamespace: p.Namespace,
 			labelContainer:    c.Name,
+			labelRestartCount: strconv.Itoa(restart),
 			labelImageID:      named.Name() + "@" + img.Target().Digest.String(),
 		}),
 		client.WithNewSpec(opts...),
@@ -666,18 +757,34 @@ func (k *kubelet) podStatus(p *corev1.Pod, states map[string]*ctrState, w *worke
 	if s.StartTime == nil {
 		s.StartTime = ptr(stamp(time.Now()))
 	}
+	initialized, failed := initDone(p, states)
+	s.InitContainerStatuses = nil
+	for _, c := range p.Spec.InitContainers {
+		s.InitContainerStatuses = append(s.InitContainerStatuses, containerStatus(c, states[c.Name], w.waiting[c.Name]))
+	}
 	s.ContainerStatuses = nil
 	for _, c := range p.Spec.Containers {
-		s.ContainerStatuses = append(s.ContainerStatuses, containerStatus(c, states[c.Name], w.waiting[c.Name]))
+		waiting := w.waiting[c.Name]
+		if !initialized {
+			waiting = &corev1.ContainerStateWaiting{Reason: "PodInitializing"}
+		}
+		s.ContainerStatuses = append(s.ContainerStatuses, containerStatus(c, states[c.Name], waiting))
 	}
-	s.Phase = phase(p.Spec.RestartPolicy, s.ContainerStatuses)
+	switch {
+	case failed:
+		s.Phase = corev1.PodFailed
+	case !initialized:
+		s.Phase = corev1.PodPending
+	default:
+		s.Phase = phase(p.Spec.RestartPolicy, s.ContainerStatuses)
+	}
 	ready := s.Phase == corev1.PodRunning
 	for _, cs := range s.ContainerStatuses {
 		ready = ready && cs.Ready
 	}
 	s.Conditions = setConditions(s.Conditions, map[corev1.PodConditionType]bool{
 		corev1.PodScheduled:    true,
-		corev1.PodInitialized:  true,
+		corev1.PodInitialized:  initialized,
 		corev1.ContainersReady: ready,
 		corev1.PodReady:        ready,
 	})
@@ -696,9 +803,17 @@ func containerStatus(c corev1.Container, st *ctrState, waiting *corev1.Container
 	case st.running:
 		cs.State.Running = &corev1.ContainerStateRunning{StartedAt: stamp(st.started)}
 		cs.Ready, cs.Started = true, ptr(true)
+	case waiting != nil:
+		// Exited and waiting to run again: the run that ended is lastState.
+		cs.State.Waiting = waiting
+		cs.LastTerminationState.Terminated = terminated(st)
 	default:
 		cs.State.Terminated = terminated(st)
 	}
+	if st.prev != nil && cs.LastTerminationState.Terminated == nil {
+		cs.LastTerminationState.Terminated = terminated(st.prev)
+	}
+	cs.RestartCount = int32(st.restart)
 	cs.ContainerID, cs.ImageID = "containerd://"+st.id, st.imageID
 	return cs
 }
@@ -731,6 +846,8 @@ func phase(policy corev1.RestartPolicy, statuses []corev1.ContainerStatus) corev
 			if cs.State.Terminated.ExitCode == 0 {
 				succeeded++
 			}
+		case cs.LastTerminationState.Terminated != nil:
+			stopped++
 		default:
 			waiting++
 		}
