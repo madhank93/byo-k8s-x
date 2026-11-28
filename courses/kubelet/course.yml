@@ -33,3 +33,6 @@ stages:
   - slug: env
     name: Give containers their environment
     difficulty: medium
+  - slug: volumes
+    name: Mount emptyDir and hostPath volumes
+    difficulty: medium

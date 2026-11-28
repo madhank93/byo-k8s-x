@@ -569,6 +569,9 @@ func (k *kubelet) removePod(ctx context.Context, w *worker) {
 	}
 	ns, name, _ := strings.Cut(w.key, "/")
 	os.RemoveAll(filepath.Join(k.root, "logs", fmt.Sprintf("%s_%s_%s", ns, name, w.uid)))
+	if err := k.removeVolumes(w.uid); err != nil {
+		fmt.Fprintf(os.Stderr, "error: remove volumes of %s: %v\n", w.key, err)
+	}
 	k.mu.Lock()
 	delete(k.workers, w.uid)
 	k.mu.Unlock()
@@ -715,6 +718,14 @@ func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.C
 	if err != nil {
 		return err
 	}
+	paths, err := k.volumes(p)
+	if err != nil {
+		return err
+	}
+	ms, err := mounts(c, paths)
+	if err != nil {
+		return err
+	}
 	img, err := k.image(ctx, c.Image)
 	if err != nil {
 		return err
@@ -732,6 +743,7 @@ func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.C
 		oci.WithImageConfig(img),
 		oci.WithProcessArgs(argv(cfg.Config.Entrypoint, cfg.Config.Cmd, expandAll(c.Command, vars), expandAll(c.Args, vars))...),
 		oci.WithEnv(env),
+		oci.WithMounts(ms),
 		oci.WithHostNamespace(specs.NetworkNamespace),
 		oci.WithHostHostsFile,
 		oci.WithHostResolvconf,
@@ -1148,4 +1160,82 @@ func expandAll(args []string, vars map[string]string) []string {
 		out[i] = expand(a, vars)
 	}
 	return out
+}
+
+// podDir is where the kubelet keeps a pod's volumes on the node.
+func (k *kubelet) podDir(uid types.UID) string {
+	return filepath.Join(k.root, "pods", string(uid))
+}
+
+// volumes makes p's volumes on the node and returns where each one is.
+func (k *kubelet) volumes(p *corev1.Pod) (map[string]string, error) {
+	paths := map[string]string{}
+	for _, v := range p.Spec.Volumes {
+		switch {
+		case v.EmptyDir != nil:
+			dir := filepath.Join(k.podDir(p.UID), "volumes", "kubernetes.io~empty-dir", v.Name)
+			if err := os.MkdirAll(dir, 0o777); err != nil {
+				return nil, err
+			}
+			if v.EmptyDir.Medium == corev1.StorageMediumMemory && !mounted(dir) {
+				if err := syscall.Mount("tmpfs", dir, "tmpfs", 0, ""); err != nil {
+					return nil, fmt.Errorf("mount tmpfs for volume %s: %w", v.Name, err)
+				}
+			}
+			paths[v.Name] = dir
+		case v.HostPath != nil:
+			if t := v.HostPath.Type; t != nil && *t == corev1.HostPathDirectoryOrCreate {
+				if err := os.MkdirAll(v.HostPath.Path, 0o755); err != nil {
+					return nil, err
+				}
+			}
+			paths[v.Name] = v.HostPath.Path
+		default:
+			return nil, configError{fmt.Errorf("volume %s is of a kind this kubelet does not support", v.Name)}
+		}
+	}
+	return paths, nil
+}
+
+// mounted reports whether dir is a mount point: on another device than its
+// parent.
+func mounted(dir string) bool {
+	var a, b syscall.Stat_t
+	return syscall.Stat(dir, &a) == nil && syscall.Stat(filepath.Dir(dir), &b) == nil && a.Dev != b.Dev
+}
+
+// mounts are c's volume mounts as bind mounts of the volumes' paths.
+func mounts(c *corev1.Container, paths map[string]string) ([]specs.Mount, error) {
+	var out []specs.Mount
+	for _, m := range c.VolumeMounts {
+		src, ok := paths[m.Name]
+		if !ok {
+			return nil, configError{fmt.Errorf("volume mount %s names no volume", m.Name)}
+		}
+		mode := "rw"
+		if m.ReadOnly {
+			mode = "ro"
+		}
+		out = append(out, specs.Mount{
+			Destination: m.MountPath,
+			Type:        "bind",
+			Source:      filepath.Join(src, m.SubPath),
+			Options:     []string{"rbind", mode},
+		})
+	}
+	return out, nil
+}
+
+// removeVolumes unmounts a pod's in-memory emptyDirs and removes its
+// directory. A hostPath is the node's, so it is never under it.
+func (k *kubelet) removeVolumes(uid types.UID) error {
+	dirs, _ := filepath.Glob(filepath.Join(k.podDir(uid), "volumes", "*", "*"))
+	for _, d := range dirs {
+		if mounted(d) {
+			if err := syscall.Unmount(d, syscall.MNT_DETACH); err != nil {
+				return err
+			}
+		}
+	}
+	return os.RemoveAll(k.podDir(uid))
 }

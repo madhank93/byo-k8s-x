@@ -54,6 +54,15 @@ func init() {
 	register(Stage{Slug: "graceful-delete", Run: stageGracefulDelete})
 	register(Stage{Slug: "restart-policy", Run: stageRestartPolicy})
 	register(Stage{Slug: "init-containers", Run: stageInitContainers})
+	register(Stage{Slug: "env", Run: stageEnv})
+	register(Stage{Slug: "volumes", Run: stageVolumes})
+	register(Stage{Slug: "config-volumes", Run: stageConfigVolumes})
+	register(Stage{Slug: "service-account-token", Run: stageServiceAccountToken})
+	register(Stage{Slug: "resources", Run: stageResources})
+	register(Stage{Slug: "liveness-probe", Run: stageLivenessProbe})
+	register(Stage{Slug: "readiness-probe", Run: stageReadinessProbe})
+	register(Stage{Slug: "lifecycle-hooks", Run: stageLifecycleHooks})
+	register(Stage{Slug: "static-pod", Run: stageStaticPod})
 }
 
 // node is the worker the program runs in.

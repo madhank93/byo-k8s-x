@@ -4,13 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
 	"github.com/madhank93/byo-k8s-x/internal/runner"
@@ -772,4 +777,860 @@ func stageInitContainers(ctx context.Context, env *kube.Env, bin string) error {
 		return nil
 	})
 	return err
+}
+
+// envOf parses the output of env into a map.
+func envOf(out string) map[string]string {
+	m := map[string]string{}
+	for _, l := range strings.Split(out, "\n") {
+		if k, v, ok := strings.Cut(l, "="); ok {
+			m[k] = v
+		}
+	}
+	return m
+}
+
+// stageEnv — the kubelet builds each container's environment: literal
+// values with $(VAR) references expanded, values from the pod's own fields
+// and resources, from ConfigMaps and Secrets, and whole ConfigMaps by
+// envFrom, on top of the image's own environment.
+func stageEnv(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	cs := env.Client.CoreV1()
+	token := randHex(4)
+	if _, err := cs.ConfigMaps(env.Namespace).Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "settings"},
+		Data:       map[string]string{"color": "blue-" + token, "A": "1", "B": "2"},
+	}, metav1.CreateOptions{}); err != nil {
+		return err
+	}
+	if _, err := cs.Secrets(env.Namespace).Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "creds"},
+		Data:       map[string][]byte{"password": []byte("s3cret-" + token)},
+	}, metav1.CreateOptions{}); err != nil {
+		return err
+	}
+	field := func(path string) *corev1.EnvVarSource {
+		return &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: path}}
+	}
+	c := corev1.Container{
+		Name:    "main",
+		Command: []string{"sh", "-c", `env; echo "expanded=$(GREETING)"; sleep 3600`},
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		}},
+		EnvFrom: []corev1.EnvFromSource{{Prefix: "CM_", ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "settings"}}}},
+		Env: []corev1.EnvVar{
+			{Name: "GREETING", Value: "hello"},
+			{Name: "COMPOSED", Value: "$(GREETING)-there"},
+			{Name: "ESCAPED", Value: "$$(GREETING)"},
+			{Name: "UNDEFINED", Value: "$(NOPE)"},
+			{Name: "POD_NAME", ValueFrom: field("metadata.name")},
+			{Name: "POD_NAMESPACE", ValueFrom: field("metadata.namespace")},
+			{Name: "POD_UID", ValueFrom: field("metadata.uid")},
+			{Name: "NODE_NAME", ValueFrom: field("spec.nodeName")},
+			{Name: "HOST_IP", ValueFrom: field("status.hostIP")},
+			{Name: "POD_IP", ValueFrom: field("status.podIP")},
+			{Name: "APP_LABEL", ValueFrom: field("metadata.labels['app']")},
+			{Name: "MEM_LIMIT", ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{Resource: "limits.memory"}}},
+			{Name: "COLOR", ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "settings"}, Key: "color"}}},
+			{Name: "PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "creds"}, Key: "password"}}},
+			{Name: "CM_A", Value: "overridden"},
+		},
+	}
+	pod := w.pod("env", corev1.RestartPolicyNever, c)
+	pod.Labels = map[string]string{"app": "web-" + token}
+	missing := w.pod("missing", corev1.RestartPolicyNever, corev1.Container{
+		Name: "main", Command: []string{"sleep", "3600"},
+		Env: []corev1.EnvVar{{Name: "X", ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "absent"}, Key: "x"}}}},
+	})
+	p, err := w.create(pod)
+	if err != nil {
+		return err
+	}
+	if _, err := w.create(missing); err != nil {
+		return err
+	}
+	facts, err := w.machine()
+	if err != nil {
+		return err
+	}
+	if err := w.waitLog(p, "main", 0, "expanded=", 40*time.Second); err != nil {
+		return err
+	}
+	got := envOf(w.log(p, "main", 0))
+	for _, want := range [][2]string{
+		{"GREETING", "hello"},
+		{"COMPOSED", "hello-there"},
+		{"ESCAPED", "$(GREETING)"},
+		{"UNDEFINED", "$(NOPE)"},
+		{"expanded", "hello"},
+		{"POD_NAME", "env"},
+		{"POD_NAMESPACE", env.Namespace},
+		{"POD_UID", string(p.UID)},
+		{"NODE_NAME", w.name},
+		{"HOST_IP", facts["ip"]},
+		{"POD_IP", facts["ip"]},
+		{"APP_LABEL", "web-" + token},
+		{"MEM_LIMIT", "67108864"},
+		{"COLOR", "blue-" + token},
+		{"PASSWORD", "s3cret-" + token},
+		{"CM_A", "overridden"},
+		{"CM_B", "2"},
+		{"CM_color", "blue-" + token},
+	} {
+		if got[want[0]] != want[1] {
+			return fmt.Errorf("in container main, %s is %q; expected %q\nthe container's environment:\n%s", want[0], got[want[0]], want[1], tail(w.log(p, "main", 0)))
+		}
+	}
+	if !strings.Contains(got["PATH"], "/bin") {
+		return fmt.Errorf("in container main, PATH is %q; the image's own environment comes first, and busybox sets PATH", got["PATH"])
+	}
+
+	_, err = w.waitPod("missing", "pod missing to report its missing ConfigMap", 20*time.Second, func(p *corev1.Pod) error {
+		cs := containerStatus(p, "main")
+		if cs == nil || cs.State.Waiting == nil || cs.State.Waiting.Reason != "CreateContainerConfigError" {
+			return fmt.Errorf("an env var from a ConfigMap that does not exist leaves the container waiting with reason CreateContainerConfigError; status is %s", statusJSON(p))
+		}
+		return nil
+	})
+	return err
+}
+
+// nodeTest runs test(1) in the node, true when it exits 0.
+func nodeTest(ctx context.Context, args ...string) (bool, error) {
+	res, err := node.Exec(ctx, 30*time.Second, append([]string{"test"}, args...)...)
+	if err != nil {
+		return false, err
+	}
+	return res.ExitCode == 0, nil
+}
+
+// stageVolumes — the kubelet makes a pod's emptyDir and hostPath volumes
+// and mounts them where each container asks: an emptyDir shared by the
+// pod's containers and removed with the pod, in memory when asked, and a
+// hostPath of the node's own, read-only when the mount says so.
+func stageVolumes(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	token := randHex(4)
+	hostDir := w.root + "/host-" + token
+	created := w.root + "/created-" + token
+	if err := node.WriteFile(ctx, hostDir+"/in", []byte("from-host-"+token+"\n"), 0o644); err != nil {
+		return err
+	}
+
+	p := w.pod("volumes", corev1.RestartPolicyNever,
+		corev1.Container{
+			Name:         "writer",
+			Command:      []string{"sh", "-c", "echo shared-" + token + " > /data/msg; sleep 3600"},
+			VolumeMounts: []corev1.VolumeMount{{Name: "shared", MountPath: "/data"}},
+		},
+		corev1.Container{
+			Name: "reader",
+			Command: []string{"sh", "-c", `until [ -f /data/msg ]; do sleep 0.2; done; cat /data/msg; cat /host/in
+touch /host/x 2>/dev/null && echo host=writable || echo host=readonly
+echo made > /made/file
+grep ' /cache ' /proc/mounts; echo done; sleep 3600`},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "shared", MountPath: "/data"},
+				{Name: "host", MountPath: "/host", ReadOnly: true},
+				{Name: "made", MountPath: "/made"},
+				{Name: "cache", MountPath: "/cache"},
+			},
+		},
+	)
+	dirOrCreate := corev1.HostPathDirectoryOrCreate
+	p.Spec.Volumes = []corev1.Volume{
+		{Name: "shared", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: hostDir}}},
+		{Name: "made", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: created, Type: &dirOrCreate}}},
+		{Name: "cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+	}
+	if p, err = w.create(p); err != nil {
+		return err
+	}
+	if err := w.waitLog(p, "reader", 0, "done", 40*time.Second); err != nil {
+		return err
+	}
+	out := w.log(p, "reader", 0)
+	for _, want := range []struct{ text, why string }{
+		{"shared-" + token, "container reader reads what writer wrote to the emptyDir both mount at /data"},
+		{"from-host-" + token, "container reader reads the node's " + hostDir + "/in through the hostPath volume at /host"},
+		{"host=readonly", "the hostPath mount at /host is readOnly, so a write to it fails"},
+		{"tmpfs", "the emptyDir at /cache has medium Memory, so it is a tmpfs"},
+	} {
+		if !strings.Contains(out, want.text) {
+			return fmt.Errorf("%s; its output was:\n%s", want.why, tail(out))
+		}
+	}
+	if ok, err := nodeTest(ctx, "-f", created+"/file"); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("hostPath type DirectoryOrCreate should create %s on the node, and what reader wrote to /made should land in it", created)
+	}
+	emptyDir := fmt.Sprintf("%s/pods/%s/volumes/kubernetes.io~empty-dir/shared", w.root, p.UID)
+	if ok, err := nodeTest(ctx, "-f", emptyDir+"/msg"); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("the emptyDir shared lives in the pod's directory on the node, %s; there is no msg there", emptyDir)
+	}
+
+	if err := w.env.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+		return err
+	}
+	if err := w.gone(p, 20*time.Second, "the pod was deleted"); err != nil {
+		return err
+	}
+	podDir := fmt.Sprintf("%s/pods/%s", w.root, p.UID)
+	ctx2, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := kube.WaitFor(ctx2, "the pod's directory to be removed", func(ctx context.Context) (bool, error) {
+		ok, err := nodeTest(ctx, "-e", podDir)
+		return !ok, err
+	}); err != nil {
+		return fmt.Errorf("%w: %s still exists; an emptyDir is deleted with its pod", err, podDir)
+	}
+	if ok, err := nodeTest(ctx, "-f", hostDir+"/in"); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("%s/in is gone; a hostPath belongs to the node and outlives the pod", hostDir)
+	}
+	return nil
+}
+
+// stageConfigVolumes — ConfigMap and Secret volumes put an object's keys in
+// files: every key, or the items asked for at the paths asked for, with
+// the file modes asked for, Secrets on tmpfs, and the files following the
+// object when it changes.
+func stageConfigVolumes(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	cms := env.Client.CoreV1().ConfigMaps(env.Namespace)
+	token := randHex(4)
+	cm, err := cms.Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-config"},
+		Data:       map[string]string{"app.conf": "v1-" + token, "other": "x"},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+	if _, err := env.Client.CoreV1().Secrets(env.Namespace).Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-secret"},
+		Data:       map[string][]byte{"token": []byte("sek-" + token)},
+	}, metav1.CreateOptions{}); err != nil {
+		return err
+	}
+	p := w.pod("config", corev1.RestartPolicyNever, corev1.Container{
+		Name: "main",
+		Command: []string{"sh", "-c", `stat -L -c 'mode %a %n' /items/nested/renamed.conf /sec/token
+echo "secret=$(cat /sec/token)"; echo "other=$(cat /cfg/other)"
+grep -q ' /sec tmpfs ' /proc/mounts && echo sec=tmpfs
+echo "optional=$(ls /opt | wc -l)"
+while true; do echo "cfg=$(cat /cfg/app.conf)"; sleep 1; done`},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "cfg", MountPath: "/cfg"},
+			{Name: "items", MountPath: "/items"},
+			{Name: "sec", MountPath: "/sec"},
+			{Name: "opt", MountPath: "/opt"},
+		},
+	})
+	ref := func(name string) corev1.LocalObjectReference { return corev1.LocalObjectReference{Name: name} }
+	p.Spec.Volumes = []corev1.Volume{
+		{Name: "cfg", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: ref("app-config")}}},
+		{Name: "items", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: ref("app-config"),
+			Items:                []corev1.KeyToPath{{Key: "app.conf", Path: "nested/renamed.conf", Mode: ptr(int32(0o600))}},
+		}}},
+		{Name: "sec", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "app-secret", DefaultMode: ptr(int32(0o400))}}},
+		{Name: "opt", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: ref("absent"), Optional: ptr(true)}}},
+	}
+	if p, err = w.create(p); err != nil {
+		return err
+	}
+	missing := w.pod("missing", corev1.RestartPolicyNever, corev1.Container{
+		Name: "main", Command: []string{"sleep", "3600"},
+		VolumeMounts: []corev1.VolumeMount{{Name: "cfg", MountPath: "/cfg"}},
+	})
+	missing.Spec.Volumes = []corev1.Volume{{Name: "cfg", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: ref("absent")}}}}
+	if missing, err = w.create(missing); err != nil {
+		return err
+	}
+
+	if err := w.waitLog(p, "main", 0, "cfg=v1-"+token, 40*time.Second); err != nil {
+		return err
+	}
+	out := w.log(p, "main", 0)
+	for _, want := range []struct{ text, why string }{
+		{"mode 600 /items/nested/renamed.conf", "item app.conf is at path nested/renamed.conf with mode 0600"},
+		{"mode 400 /sec/token", "the Secret volume's defaultMode is 0400"},
+		{"secret=sek-" + token, "the Secret's key token is the file /sec/token"},
+		{"other=x", "a ConfigMap volume without items holds every key"},
+		{"sec=tmpfs", "a Secret volume is a tmpfs, so its contents never touch the node's disk"},
+		{"optional=0", "an optional ConfigMap that does not exist is an empty volume"},
+	} {
+		if !strings.Contains(out, want.text) {
+			return fmt.Errorf("%s; container main printed:\n%s", want.why, tail(out))
+		}
+	}
+
+	cm.Data["app.conf"] = "v2-" + token
+	if _, err := cms.Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		return err
+	}
+	if err := w.waitLog(p, "main", 0, "cfg=v2-"+token, 30*time.Second); err != nil {
+		return fmt.Errorf("the ConfigMap changed, and its volume follows it while the pod runs: %w", err)
+	}
+
+	_, err = w.waitPod("missing", "pod missing to wait for its ConfigMap", 5*time.Second, func(p *corev1.Pod) error {
+		cs := containerStatus(p, "main")
+		if cs == nil || cs.State.Waiting == nil || cs.State.Waiting.Reason != "ContainerCreating" {
+			return fmt.Errorf("a volume whose ConfigMap does not exist cannot be set up, so the container waits in ContainerCreating; status is %s", statusJSON(p))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if cs, err := w.containers(); err != nil {
+		return err
+	} else if len(of(cs, missing, "main")) != 0 {
+		return fmt.Errorf("pod missing's container was created though its volume could not be set up")
+	}
+	return nil
+}
+
+// review asks the API server who a token belongs to, for audience aud.
+func (w *work) review(token, aud string) (*authenticationv1.TokenReviewStatus, error) {
+	tr := &authenticationv1.TokenReview{Spec: authenticationv1.TokenReviewSpec{Token: token}}
+	if aud != "" {
+		tr.Spec.Audiences = []string{aud}
+	}
+	got, err := w.env.Client.AuthenticationV1().TokenReviews().Create(w.ctx, tr, metav1.CreateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("review the token: %w", err)
+	}
+	return &got.Status, nil
+}
+
+// stageServiceAccountToken — the kubelet fills projected volumes: the
+// kube-api-access volume admission adds to every pod, holding a token the
+// API server issued for this pod's service account and bound to the pod,
+// the cluster's CA and the pod's namespace; and a token for an audience of
+// the pod's choosing.
+func stageServiceAccountToken(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	const sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+	p := w.pod("token", corev1.RestartPolicyNever, corev1.Container{
+		Name: "main",
+		Command: []string{"sh", "-c", `echo "token=$(cat ` + sa + `/token)"
+echo "ns=$(cat ` + sa + `/namespace)"
+head -1 ` + sa + `/ca.crt
+echo "vault=$(cat /vault/token)"
+echo done; sleep 3600`},
+		VolumeMounts: []corev1.VolumeMount{{Name: "vault", MountPath: "/vault"}},
+	})
+	p.Spec.AutomountServiceAccountToken = nil
+	p.Spec.Volumes = []corev1.Volume{{Name: "vault", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+			Audience: "vault", ExpirationSeconds: ptr(int64(600)), Path: "token",
+		}}},
+	}}}}
+	// The namespace's default ServiceAccount is made by a controller, a
+	// moment after the namespace.
+	if err := kube.WaitFor(ctx, "ServiceAccount default", func(ctx context.Context) (bool, error) {
+		_, err := env.Client.CoreV1().ServiceAccounts(env.Namespace).Get(ctx, "default", metav1.GetOptions{})
+		return err == nil, nil
+	}); err != nil {
+		return err
+	}
+	if p, err = w.create(p); err != nil {
+		return err
+	}
+	if err := w.waitLog(p, "main", 0, "done", 40*time.Second); err != nil {
+		return err
+	}
+	out := envOf(w.log(p, "main", 0))
+	log := w.log(p, "main", 0)
+	if out["ns"] != env.Namespace {
+		return fmt.Errorf("%s/namespace holds %q; it is the pod's namespace, %s\ncontainer main printed:\n%s", sa, out["ns"], env.Namespace, tail(log))
+	}
+	if !strings.Contains(log, "-----BEGIN CERTIFICATE-----") {
+		return fmt.Errorf("%s/ca.crt should be the cluster CA from ConfigMap kube-root-ca.crt\ncontainer main printed:\n%s", sa, tail(log))
+	}
+	st, err := w.review(out["token"], "")
+	if err != nil {
+		return err
+	}
+	user := "system:serviceaccount:" + env.Namespace + ":default"
+	switch {
+	case !st.Authenticated:
+		return fmt.Errorf("the API server does not accept %s/token (%s); request it with the TokenRequest API for the pod's service account", sa, st.Error)
+	case st.User.Username != user:
+		return fmt.Errorf("%s/token authenticates as %s; it is the pod's service account, %s", sa, st.User.Username, user)
+	case !slices.Equal(st.User.Extra["authentication.kubernetes.io/pod-name"], []string{p.Name}):
+		return fmt.Errorf("%s/token is not bound to pod %s (its extra is %v); set the TokenRequest's boundObjectRef to the pod", sa, p.Name, st.User.Extra)
+	}
+	if st, err := w.review(out["vault"], "vault"); err != nil {
+		return err
+	} else if !st.Authenticated || !slices.Contains(st.Audiences, "vault") {
+		return fmt.Errorf("/vault/token is not a token for audience vault (authenticated %v, audiences %v, %s)", st.Authenticated, st.Audiences, st.Error)
+	}
+	return nil
+}
+
+// cgroupFile reads a cgroup v2 interface file of node pid's cgroup.
+func cgroupFile(ctx context.Context, pid int, name string) (string, error) {
+	res, err := node.Exec(ctx, 30*time.Second, "sh", "-c", `cat "/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/$1/cgroup)/$2"`, "cg", strconv.Itoa(pid), name)
+	if err != nil {
+		return "", err
+	}
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("read %s of pid %d's cgroup: %s", name, pid, res.Stderr)
+	}
+	return strings.TrimSpace(res.Stdout), nil
+}
+
+// stageResources — the kubelet admits a pod only if its requests fit what
+// the node has left, turns limits into the container's cgroup, and says so
+// when the kernel kills a container for going over its memory limit.
+func stageResources(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	res := func(limCPU, limMem, reqCPU string) corev1.ResourceRequirements {
+		r := corev1.ResourceRequirements{Limits: corev1.ResourceList{}, Requests: corev1.ResourceList{}}
+		if limCPU != "" {
+			r.Limits[corev1.ResourceCPU] = resource.MustParse(limCPU)
+		}
+		if limMem != "" {
+			r.Limits[corev1.ResourceMemory] = resource.MustParse(limMem)
+			r.Requests[corev1.ResourceMemory] = resource.MustParse(limMem)
+		}
+		if reqCPU != "" {
+			r.Requests[corev1.ResourceCPU] = resource.MustParse(reqCPU)
+		}
+		return r
+	}
+	limited, err := w.create(w.pod("limited", corev1.RestartPolicyNever, corev1.Container{
+		Name: "main", Command: []string{"sleep", "3600"}, Resources: res("500m", "64Mi", "100m"),
+	}))
+	if err != nil {
+		return err
+	}
+	oom, err := w.create(w.pod("oom", corev1.RestartPolicyNever, corev1.Container{
+		Name: "main", Command: []string{"sh", "-c", "dd if=/dev/zero of=/dev/null bs=64M count=1"}, Resources: res("", "16Mi", ""),
+	}))
+	if err != nil {
+		return err
+	}
+
+	c, err := w.running(limited, "main", 40*time.Second)
+	if err != nil {
+		return err
+	}
+	for _, want := range [][3]string{
+		{"memory.max", "67108864", "limits.memory 64Mi"},
+		{"cpu.max", "50000 100000", "limits.cpu 500m: 50ms of every 100ms"},
+	} {
+		got, err := cgroupFile(ctx, c.PID, want[0])
+		if err != nil {
+			return err
+		}
+		if got != want[1] {
+			return fmt.Errorf("container main of pod limited has %s %q in its cgroup; %s is %q", want[0], got, want[2], want[1])
+		}
+	}
+
+	p, err := w.phase("oom", corev1.PodFailed, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	if cs := containerStatus(p, "main"); cs == nil || cs.State.Terminated == nil || cs.State.Terminated.Reason != "OOMKilled" || cs.State.Terminated.ExitCode != 137 {
+		return fmt.Errorf("container main of pod oom went over its 16Mi limit and the kernel killed it, so it terminated with exitCode 137 and reason OOMKilled; status is %s", statusJSON(p))
+	}
+	_ = oom
+
+	// Ask for more CPU than the node has: the kubelet turns it away.
+	n, err := w.env.Client.CoreV1().Nodes().Get(ctx, w.name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	cpu := n.Status.Allocatable[corev1.ResourceCPU]
+	big := cpu.DeepCopy()
+	big.Add(resource.MustParse("1"))
+	tooBig := w.pod("toobig", corev1.RestartPolicyNever, corev1.Container{Name: "main", Command: []string{"sleep", "3600"}})
+	tooBig.Spec.Containers[0].Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: big}
+	if tooBig, err = w.create(tooBig); err != nil {
+		return err
+	}
+	p, err = w.phase("toobig", corev1.PodFailed, 20*time.Second)
+	if err != nil {
+		return fmt.Errorf("pod toobig requests %s CPUs on a node with %s: %w", big.String(), cpu.String(), err)
+	}
+	if p.Status.Reason != "OutOfcpu" || !strings.Contains(p.Status.Message, "cpu") {
+		return fmt.Errorf("pod toobig was rejected with reason %q message %q; the reason is OutOfcpu and the message says what did not fit", p.Status.Reason, p.Status.Message)
+	}
+	if cs, err := w.containers(); err != nil {
+		return err
+	} else if len(of(cs, tooBig, "main")) != 0 {
+		return fmt.Errorf("pod toobig was rejected, yet containerd holds a container for it")
+	}
+	return nil
+}
+
+func execProbe(period int32, threshold int32, cmd ...string) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: cmd}},
+		PeriodSeconds:    period,
+		FailureThreshold: threshold,
+	}
+}
+
+func httpProbe(port int, path string) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: path, Port: intstr.FromInt32(int32(port))}},
+		PeriodSeconds:    1,
+		FailureThreshold: 2,
+	}
+}
+
+// serve is a container command that serves index.html over HTTP on port.
+func serve(port int) []string {
+	return []string{"sh", "-c", fmt.Sprintf("mkdir -p /www && echo ok > /www/index.html && exec httpd -f -p %d -h /www", port)}
+}
+
+// restarts is container name's restartCount in pod p, -1 with no status.
+func restarts(p *corev1.Pod, name string) int32 {
+	if cs := containerStatus(p, name); cs != nil {
+		return cs.RestartCount
+	}
+	return -1
+}
+
+// stageLivenessProbe — the kubelet runs each container's liveness probe,
+// exec or HTTP, and kills a container that fails it enough times so it
+// runs again; a startup probe holds the liveness probe off until it passes,
+// and kills a container that never does.
+func stageLivenessProbe(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	port := 20000 + int(randByte())*20
+	pod := func(name string, c corev1.Container) *corev1.Pod {
+		c.Name = "main"
+		return w.pod(name, corev1.RestartPolicyAlways, c)
+	}
+	sleep := []string{"sleep", "3600"}
+	for _, p := range []*corev1.Pod{
+		pod("dies", corev1.Container{
+			Command:       []string{"sh", "-c", "touch /tmp/healthy; sleep 3; rm /tmp/healthy; sleep 3600"},
+			LivenessProbe: execProbe(1, 2, "cat", "/tmp/healthy"),
+		}),
+		pod("healthy", corev1.Container{Command: sleep, LivenessProbe: execProbe(1, 1, "true")}),
+		pod("slow-start", corev1.Container{
+			Command:       []string{"sh", "-c", "sleep 4; touch /tmp/started; sleep 3600"},
+			StartupProbe:  execProbe(1, 15, "cat", "/tmp/started"),
+			LivenessProbe: execProbe(1, 1, "cat", "/tmp/started"),
+		}),
+		pod("never-starts", corev1.Container{Command: sleep, StartupProbe: execProbe(1, 3, "false")}),
+		pod("http-ok", corev1.Container{Command: serve(port), LivenessProbe: httpProbe(port, "/index.html")}),
+		pod("http-bad", corev1.Container{Command: serve(port + 1), LivenessProbe: httpProbe(port+1, "/missing")}),
+	} {
+		if _, err := w.create(p); err != nil {
+			return err
+		}
+	}
+
+	// slow-start reports started only once its startup probe passes.
+	if _, err := w.waitPod("slow-start", "pod slow-start to run, not yet started", 30*time.Second, func(p *corev1.Pod) error {
+		cs := containerStatus(p, "main")
+		if cs == nil || cs.State.Running == nil || cs.Started == nil || *cs.Started {
+			return fmt.Errorf("while its startup probe fails, a running container reports started=false; status is %s", statusJSON(p))
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	for _, name := range []string{"dies", "never-starts", "http-bad"} {
+		why := map[string]string{
+			"dies":         "its liveness probe fails twice in a row from three seconds in, so the kubelet kills the container and it runs again",
+			"never-starts": "its startup probe fails three times, so the kubelet kills the container and it runs again",
+			"http-bad":     "its HTTP liveness probe gets 404, a failure, so the kubelet kills the container and it runs again",
+		}[name]
+		if _, err := w.waitPod(name, "pod "+name+" to restart", 40*time.Second, func(p *corev1.Pod) error {
+			if restarts(p, "main") < 1 {
+				return fmt.Errorf("%s; status is %s", why, statusJSON(p))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{"healthy", "slow-start", "http-ok"} {
+		p, err := w.env.Client.CoreV1().Pods(w.env.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		cs := containerStatus(p, "main")
+		switch {
+		case cs == nil || cs.State.Running == nil:
+			return fmt.Errorf("pod %s's container should be running: %s", name, statusJSON(p))
+		case cs.RestartCount != 0:
+			return fmt.Errorf("pod %s's container passes its probes, yet it restarted %d times", name, cs.RestartCount)
+		case cs.Started == nil || !*cs.Started:
+			return fmt.Errorf("pod %s's container should report started=true by now: %s", name, statusJSON(p))
+		}
+	}
+	return nil
+}
+
+// stageReadinessProbe — a readiness probe decides whether a running
+// container is ready, and so whether its pod is; failing it marks the
+// container not ready without restarting it.
+func stageReadinessProbe(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	port := 20000 + int(randByte())*20 + 10
+	flap := w.pod("flap", corev1.RestartPolicyAlways, corev1.Container{
+		Name:           "main",
+		Command:        []string{"sh", "-c", "sleep 3; touch /tmp/ready; sleep 6; rm /tmp/ready; sleep 3600"},
+		ReadinessProbe: execProbe(1, 1, "cat", "/tmp/ready"),
+	})
+	tcp := w.pod("tcp", corev1.RestartPolicyAlways, corev1.Container{
+		Name:    "main",
+		Command: serve(port),
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("web")}},
+			PeriodSeconds: 1,
+		},
+		Ports: []corev1.ContainerPort{{Name: "web", ContainerPort: int32(port)}},
+	})
+	for _, p := range []*corev1.Pod{flap, tcp} {
+		if _, err := w.create(p); err != nil {
+			return err
+		}
+	}
+	readiness := func(want bool, why string, timeout time.Duration) error {
+		_, err := w.waitPod("flap", fmt.Sprintf("pod flap to be ready=%v", want), timeout, func(p *corev1.Pod) error {
+			cs := containerStatus(p, "main")
+			wantCond := corev1.ConditionFalse
+			if want {
+				wantCond = corev1.ConditionTrue
+			}
+			switch {
+			case cs == nil || cs.State.Running == nil:
+				return fmt.Errorf("container main should be running: %s", statusJSON(p))
+			case cs.Ready != want || podCondition(p, corev1.PodReady) != wantCond || podCondition(p, corev1.ContainersReady) != wantCond:
+				return fmt.Errorf("%s, so container main is ready=%v and the pod's Ready and ContainersReady are %s; status is %s", why, want, wantCond, statusJSON(p))
+			}
+			return nil
+		})
+		return err
+	}
+	if err := readiness(false, "its readiness probe has not passed yet", 30*time.Second); err != nil {
+		return err
+	}
+	if err := readiness(true, "its readiness probe passes from three seconds in", 15*time.Second); err != nil {
+		return err
+	}
+	if err := readiness(false, "its readiness probe fails again from nine seconds in", 15*time.Second); err != nil {
+		return err
+	}
+	p, err := w.env.Client.CoreV1().Pods(w.env.Namespace).Get(ctx, "flap", metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if restarts(p, "main") != 0 {
+		return fmt.Errorf("pod flap restarted; failing a readiness probe never restarts a container")
+	}
+	_, err = w.waitPod("tcp", "pod tcp to be ready", 10*time.Second, func(p *corev1.Pod) error {
+		if cs := containerStatus(p, "main"); cs == nil || !cs.Ready {
+			return fmt.Errorf("its tcpSocket readiness probe on the named port web (%d) connects, so it is ready; status is %s", port, statusJSON(p))
+		}
+		return nil
+	})
+	return err
+}
+
+// stageLifecycleHooks — the kubelet runs a container's postStart hook as
+// soon as it starts, killing it if the hook fails, and its preStop hook
+// before the SIGTERM that stops it.
+func stageLifecycleHooks(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	say := func(what string) *corev1.LifecycleHandler {
+		return &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"sh", "-c", "echo " + what + " > /proc/1/fd/1"}}}
+	}
+	hooks := w.pod("hooks", corev1.RestartPolicyAlways, corev1.Container{
+		Name:      "main",
+		Command:   loop("echo got-term; exit 0"),
+		Lifecycle: &corev1.Lifecycle{PostStart: say("post-start"), PreStop: say("pre-stop")},
+	})
+	hooks.Spec.TerminationGracePeriodSeconds = ptr(int64(10))
+	badHook := w.pod("bad-hook", corev1.RestartPolicyAlways, corev1.Container{
+		Name:      "main",
+		Command:   []string{"sleep", "3600"},
+		Lifecycle: &corev1.Lifecycle{PostStart: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"false"}}}},
+	})
+	p, err := w.create(hooks)
+	if err != nil {
+		return err
+	}
+	if _, err := w.create(badHook); err != nil {
+		return err
+	}
+	if err := w.waitLog(p, "main", 0, "post-start", 40*time.Second); err != nil {
+		return fmt.Errorf("the postStart hook runs in the container once it has started: %w", err)
+	}
+	if err := w.env.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+		return err
+	}
+	if err := w.waitLog(p, "main", 0, "got-term", 15*time.Second); err != nil {
+		return err
+	}
+	out := w.log(p, "main", 0)
+	pre, term := strings.Index(out, "pre-stop"), strings.Index(out, "got-term")
+	if pre < 0 || pre > term {
+		return fmt.Errorf("the preStop hook runs, and finishes, before the container gets SIGTERM; its output was:\n%s", tail(out))
+	}
+	_, err = w.waitPod("bad-hook", "pod bad-hook to restart", 30*time.Second, func(p *corev1.Pod) error {
+		if restarts(p, "main") < 1 {
+			return fmt.Errorf("its postStart hook fails, so the kubelet kills the container and it runs again; status is %s", statusJSON(p))
+		}
+		return nil
+	})
+	return err
+}
+
+// mirrorAnnotation marks a mirror pod; its value is the static pod's UID.
+const mirrorAnnotation = "kubernetes.io/config.mirror"
+
+// stageStaticPod — the kubelet runs pods from manifest files in
+// --pod-manifest-path with no API server involved, and publishes each as a
+// mirror pod so the cluster can see it: one it recreates if deleted, and
+// takes down when the file goes.
+func stageStaticPod(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	manifest := w.root + "/manifests/web.yaml"
+	if err := node.WriteFile(ctx, manifest, []byte(fmt.Sprintf(`apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  namespace: %s
+spec:
+  hostNetwork: true
+  terminationGracePeriodSeconds: 2
+  containers:
+  - name: main
+    image: %s
+    command: ["sleep", "3600"]
+`, env.Namespace, image)), 0o644); err != nil {
+		return err
+	}
+	mirror := "web-" + w.name
+	m, err := w.waitPod(mirror, "mirror pod "+mirror, 40*time.Second, func(p *corev1.Pod) error {
+		switch {
+		case p.Annotations[mirrorAnnotation] == "":
+			return fmt.Errorf("pod %s has no %s annotation, so it is not a mirror pod", p.Name, mirrorAnnotation)
+		case p.Spec.NodeName != w.name:
+			return fmt.Errorf("mirror pod %s is bound to %q; it is the static pod of node %s", p.Name, p.Spec.NodeName, w.name)
+		case p.Status.Phase != corev1.PodRunning:
+			return fmt.Errorf("mirror pod %s is %q; it carries the static pod's status, Running", p.Name, p.Status.Phase)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("a manifest in --pod-manifest-path is a static pod named NAME-NODE, published as a mirror pod: %w", err)
+	}
+	if !slices.ContainsFunc(m.OwnerReferences, func(o metav1.OwnerReference) bool { return o.Kind == "Node" && o.Name == w.name }) {
+		return fmt.Errorf("mirror pod %s's ownerReferences are %v; the Node owns it", mirror, m.OwnerReferences)
+	}
+	static := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID(m.Annotations[mirrorAnnotation])}}
+	c, err := w.running(static, "main", 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("the static pod's containers are labelled with its own UID, the value of %s: %w", mirrorAnnotation, err)
+	}
+
+	// Deleting the mirror pod does not touch the static pod.
+	if err := w.env.Client.CoreV1().Pods(m.Namespace).Delete(ctx, mirror, metav1.DeleteOptions{}); err != nil {
+		return err
+	}
+	if _, err := w.waitPod(mirror, "mirror pod "+mirror+" to be recreated", 30*time.Second, func(p *corev1.Pod) error {
+		if p.UID == m.UID || p.DeletionTimestamp != nil {
+			return fmt.Errorf("the deleted mirror pod has not been replaced; the kubelet recreates it, since the static pod still runs")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if again, err := w.running(static, "main", 5*time.Second); err != nil {
+		return err
+	} else if again.ID != c.ID {
+		return fmt.Errorf("deleting the mirror pod restarted the static pod's container; the static pod is the file's, not the API's")
+	}
+
+	if _, err := node.Exec(ctx, 30*time.Second, "rm", "-f", manifest); err != nil {
+		return err
+	}
+	if err := w.stopped(static, 30*time.Second, "the manifest is gone, so the static pod stops"); err != nil {
+		return err
+	}
+	return w.gone(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: mirror, Namespace: m.Namespace}}, 20*time.Second, "the static pod stopped, so its mirror pod goes")
 }
