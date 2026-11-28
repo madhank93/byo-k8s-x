@@ -9,6 +9,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/madhank93/byo-k8s-x/internal/kube"
@@ -85,8 +86,11 @@ func (w *work) waitPod(name, what string, timeout time.Duration, ok func(*corev1
 			return false, err
 		}
 		p, err := w.env.Client.CoreV1().Pods(w.env.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			last = fmt.Errorf("there is no pod %s", name)
+			return false, nil
+		}
 		if err != nil {
-			last = err
 			return false, nil
 		}
 		got = p
@@ -435,4 +439,121 @@ func stagePodStatus(ctx context.Context, env *kube.Env, bin string) error {
 		return nil
 	})
 	return err
+}
+
+// gone waits for pod p to leave the API server.
+func (w *work) gone(p *corev1.Pod, timeout time.Duration, why string) error {
+	ctx, cancel := context.WithTimeout(w.ctx, timeout)
+	defer cancel()
+	err := kube.WaitFor(ctx, "pod "+p.Name+" to be deleted", func(ctx context.Context) (bool, error) {
+		if err := w.alive(); err != nil {
+			return false, err
+		}
+		_, err := w.env.Client.CoreV1().Pods(p.Namespace).Get(ctx, p.Name, metav1.GetOptions{})
+		return apierrors.IsNotFound(err), nil
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, why)
+	}
+	return nil
+}
+
+// stopped waits until pod p has no running task left in containerd.
+func (w *work) stopped(p *corev1.Pod, timeout time.Duration, why string) error {
+	ctx, cancel := context.WithTimeout(w.ctx, timeout)
+	defer cancel()
+	var seen []ctrContainer
+	err := kube.WaitFor(ctx, "pod "+p.Name+"'s containers to stop", func(ctx context.Context) (bool, error) {
+		cs, err := w.containers()
+		if err != nil {
+			return false, err
+		}
+		seen = nil
+		for _, c := range cs {
+			if c.Labels[labelPodUID] == string(p.UID) && c.Status == "RUNNING" {
+				seen = append(seen, c)
+			}
+		}
+		return len(seen) == 0, nil
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %s; still running: %s", err, why, describe(seen))
+	}
+	return nil
+}
+
+// loop is a container that runs until it is killed; on SIGTERM it says so
+// and exits, unless trap is empty, when it ignores SIGTERM.
+func loop(trap string) []string {
+	return []string{"sh", "-c", fmt.Sprintf(`trap '%s' TERM; echo up; while true; do sleep 0.2; done`, trap)}
+}
+
+// stageGracefulDelete — deleting a pod is a request to the kubelet: it
+// sends each container SIGTERM, waits out the grace period, kills what is
+// left, and only then deletes the pod for good. A pod deleted outright is
+// killed at once.
+func stageGracefulDelete(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	pods := w.env.Client.CoreV1().Pods(w.env.Namespace)
+
+	term := w.pod("term", corev1.RestartPolicyAlways, corev1.Container{Name: "main", Command: loop("echo got TERM; exit 0")})
+	term.Spec.TerminationGracePeriodSeconds = ptr(int64(60))
+	stubborn := w.pod("stubborn", corev1.RestartPolicyAlways, corev1.Container{Name: "main", Command: loop("")})
+	stubborn.Spec.TerminationGracePeriodSeconds = ptr(int64(4))
+	forced := w.pod("forced", corev1.RestartPolicyAlways, corev1.Container{Name: "main", Command: loop("")})
+	forced.Spec.TerminationGracePeriodSeconds = ptr(int64(60))
+	var created []*corev1.Pod
+	for _, p := range []*corev1.Pod{term, stubborn, forced} {
+		p, err := w.create(p)
+		if err != nil {
+			return err
+		}
+		created = append(created, p)
+	}
+	for _, p := range created {
+		if err := w.waitLog(p, "main", 0, "up", 40*time.Second); err != nil {
+			return err
+		}
+	}
+	term, stubborn, forced = created[0], created[1], created[2]
+
+	for _, p := range created[:2] {
+		if err := pods.Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+			return err
+		}
+	}
+	if err := w.waitLog(term, "main", 0, "got TERM", 10*time.Second); err != nil {
+		return fmt.Errorf("pod term was deleted, so its container gets SIGTERM: %w", err)
+	}
+	if err := w.gone(term, 15*time.Second, "its container exited on SIGTERM, so the kubelet deletes the pod then, not at the end of its 60-second grace period"); err != nil {
+		return err
+	}
+
+	// Two seconds into a four-second grace period, the container that
+	// ignores SIGTERM is still running and its pod still exists.
+	time.Sleep(2 * time.Second)
+	if _, err := pods.Get(ctx, stubborn.Name, metav1.GetOptions{}); err != nil {
+		return fmt.Errorf("pod stubborn is gone two seconds into its four-second grace period: %v; a container that ignores SIGTERM gets the whole period", err)
+	}
+	if _, err := w.running(stubborn, "main", 5*time.Second); err != nil {
+		return fmt.Errorf("two seconds into its four-second grace period: %w", err)
+	}
+	if err := w.stopped(stubborn, 10*time.Second, "the grace period is over, so the kubelet sends SIGKILL"); err != nil {
+		return err
+	}
+	if err := w.gone(stubborn, 10*time.Second, "its container has been killed, so the kubelet deletes the pod"); err != nil {
+		return err
+	}
+
+	if err := pods.Delete(ctx, forced.Name, metav1.DeleteOptions{GracePeriodSeconds: new(int64)}); err != nil {
+		return err
+	}
+	return w.stopped(forced, 10*time.Second, "pod forced was deleted with --grace-period=0 and is gone from the API, so the kubelet kills its container at once")
 }

@@ -51,6 +51,7 @@ func init() {
 	register(Stage{Slug: "node-lease", Run: stageNodeLease})
 	register(Stage{Slug: "run-container", Run: stageRunContainer})
 	register(Stage{Slug: "pod-status", Run: stagePodStatus})
+	register(Stage{Slug: "graceful-delete", Run: stageGracefulDelete})
 }
 
 // node is the worker the program runs in.

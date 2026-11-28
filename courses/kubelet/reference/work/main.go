@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,6 +28,7 @@ import (
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,6 +61,7 @@ type kubelet struct {
 	node   *corev1.Node
 	ctr    *client.Client
 	root   string
+	ip     string
 	pods   cache.Store
 
 	mu      sync.Mutex
@@ -107,6 +111,11 @@ func run() error {
 	}
 	k.node = node
 	k.readySince = metav1.Now()
+	m, err := readMachine()
+	if err != nil {
+		return err
+	}
+	k.ip = m.ip
 	fmt.Println("registered", k.name)
 	k.every(ctx, 10*time.Second, k.postStatus)
 	k.every(ctx, 10*time.Second, k.renewLease)
@@ -341,21 +350,31 @@ func (k *kubelet) housekeeping(ctx context.Context) error {
 		p := obj.(*corev1.Pod)
 		if !k.workers[p.UID] {
 			k.workers[p.UID] = true
-			go k.podWorker(ctx, p.UID, cache.MetaObjectToName(p).String())
+			w := &worker{uid: p.UID, key: cache.MetaObjectToName(p).String(), waiting: map[string]*corev1.ContainerStateWaiting{}}
+			go k.podWorker(ctx, w)
 		}
 	}
 	return nil
 }
 
+// worker is one pod's goroutine and what it remembers between syncs.
+type worker struct {
+	uid types.UID
+	key string
+	// waiting says why a container that should be running is not.
+	waiting map[string]*corev1.ContainerStateWaiting
+}
+
 // podWorker syncs one pod every second for as long as it exists.
-func (k *kubelet) podWorker(ctx context.Context, uid types.UID, key string) {
+func (k *kubelet) podWorker(ctx context.Context, w *worker) {
 	for ctx.Err() == nil {
-		obj, ok, _ := k.pods.GetByKey(key)
-		if !ok || obj.(*corev1.Pod).UID != uid {
+		obj, ok, _ := k.pods.GetByKey(w.key)
+		if !ok || obj.(*corev1.Pod).UID != w.uid {
+			k.removePod(ctx, w)
 			return
 		}
-		if err := k.syncPod(ctx, obj.(*corev1.Pod)); err != nil && ctx.Err() == nil {
-			fmt.Fprintf(os.Stderr, "error: sync pod %s: %v\n", key, err)
+		if err := k.syncPod(ctx, w, obj.(*corev1.Pod)); err != nil && ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "error: sync pod %s: %v\n", w.key, err)
 		}
 		select {
 		case <-ctx.Done():
@@ -364,48 +383,228 @@ func (k *kubelet) podWorker(ctx context.Context, uid types.UID, key string) {
 	}
 }
 
-// syncPod starts every container of p that has not been started.
-func (k *kubelet) syncPod(ctx context.Context, p *corev1.Pod) error {
-	running, err := k.podContainers(ctx, p.UID)
+// syncPod starts every container of p that has not been started, then
+// writes back the status containerd reports.
+func (k *kubelet) syncPod(ctx context.Context, w *worker, p *corev1.Pod) error {
+	if p.DeletionTimestamp != nil {
+		return k.terminate(ctx, p)
+	}
+	if terminal(p.Status.Phase) {
+		return nil
+	}
+	states, err := k.podContainers(ctx, p.UID)
 	if err != nil {
 		return err
 	}
 	for i := range p.Spec.Containers {
 		c := &p.Spec.Containers[i]
-		if _, ok := running[c.Name]; ok {
+		if states[c.Name] != nil {
 			continue
 		}
 		if err := k.startContainer(ctx, p, c); err != nil {
-			return fmt.Errorf("start container %s: %w", c.Name, err)
+			w.waiting[c.Name] = waitingFor(err)
+			fmt.Fprintf(os.Stderr, "error: start container %s of %s: %v\n", c.Name, w.key, err)
+			continue
 		}
+		delete(w.waiting, c.Name)
+	}
+	if states, err = k.podContainers(ctx, p.UID); err != nil {
+		return err
+	}
+	return k.writeStatus(ctx, p, k.podStatus(p, states, w))
+}
+
+// terminate stops a deleted pod's containers within its grace period, then
+// deletes the pod for good: the API server waits for the kubelet to say its
+// containers are gone.
+func (k *kubelet) terminate(ctx context.Context, p *corev1.Pod) error {
+	grace := int64(30)
+	if p.DeletionGracePeriodSeconds != nil {
+		grace = *p.DeletionGracePeriodSeconds
+	}
+	if err := k.stopContainers(ctx, p.UID, time.Duration(grace)*time.Second); err != nil {
+		return err
+	}
+	err := k.cs.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name, metav1.DeleteOptions{
+		GracePeriodSeconds: ptr(int64(0)),
+		Preconditions:      metav1.NewUIDPreconditions(string(p.UID)),
+	})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		return nil
+	}
+	return err
+}
+
+// stopContainers sends every running container of pod uid SIGTERM, and
+// SIGKILL to any still running when grace is up.
+func (k *kubelet) stopContainers(ctx context.Context, uid types.UID, grace time.Duration) error {
+	cs, err := k.ctr.Containers(ctx, fmt.Sprintf("labels.%q==%s", labelPodUID, uid))
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(grace)
+	var wg sync.WaitGroup
+	errs := make([]error, len(cs))
+	for i, c := range cs {
+		task, err := c.Task(ctx, nil)
+		if errdefs.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = stopTask(ctx, task, deadline)
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+func stopTask(ctx context.Context, task client.Task, deadline time.Time) error {
+	exited, err := task.Wait(ctx)
+	if err != nil {
+		return err
+	}
+	if err := task.Kill(ctx, syscall.SIGTERM); err != nil && !errdefs.IsNotFound(err) {
+		return err
+	}
+	select {
+	case <-exited:
+		return nil
+	case <-time.After(time.Until(deadline)):
+	}
+	if err := task.Kill(ctx, syscall.SIGKILL); err != nil && !errdefs.IsNotFound(err) {
+		return err
+	}
+	select {
+	case <-exited:
+	case <-ctx.Done():
 	}
 	return nil
 }
 
+// removePod kills and deletes every container of a pod that is gone from
+// the API server, and forgets it.
+func (k *kubelet) removePod(ctx context.Context, w *worker) {
+	cs, err := k.ctr.Containers(ctx, fmt.Sprintf("labels.%q==%s", labelPodUID, w.uid))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: remove pod %s: %v\n", w.key, err)
+	}
+	for _, c := range cs {
+		if task, err := c.Task(ctx, nil); err == nil {
+			task.Delete(ctx, client.WithProcessKill)
+		}
+		if err := c.Delete(ctx, client.WithSnapshotCleanup); err != nil {
+			fmt.Fprintf(os.Stderr, "error: remove container %s: %v\n", c.ID(), err)
+		}
+	}
+	ns, name, _ := strings.Cut(w.key, "/")
+	os.RemoveAll(filepath.Join(k.root, "logs", fmt.Sprintf("%s_%s_%s", ns, name, w.uid)))
+	k.mu.Lock()
+	delete(k.workers, w.uid)
+	k.mu.Unlock()
+}
+
+func terminal(phase corev1.PodPhase) bool {
+	return phase == corev1.PodSucceeded || phase == corev1.PodFailed
+}
+
+// pullError is an image that could not be had.
+type pullError struct{ error }
+
+func waitingFor(err error) *corev1.ContainerStateWaiting {
+	if _, ok := err.(pullError); ok {
+		return &corev1.ContainerStateWaiting{Reason: "ErrImagePull", Message: err.Error()}
+	}
+	return &corev1.ContainerStateWaiting{Reason: "CreateContainerError", Message: err.Error()}
+}
+
 // Labels tie a containerd container back to its pod, the way the CRI
-// labels its containers.
+// labels its containers, and keep what the kubelet learned about it.
 const (
 	labelPodUID       = "io.kubernetes.pod.uid"
 	labelPodName      = "io.kubernetes.pod.name"
 	labelPodNamespace = "io.kubernetes.pod.namespace"
 	labelContainer    = "io.kubernetes.container.name"
+	labelImageID      = "byok8s.dev/image-id"
+	labelStartedAt    = "byok8s.dev/started-at"
+	labelFinishedAt   = "byok8s.dev/finished-at"
+	labelExitCode     = "byok8s.dev/exit-code"
 )
 
-// podContainers is the containerd containers of pod uid, by container name.
-func (k *kubelet) podContainers(ctx context.Context, uid types.UID) (map[string]client.Container, error) {
+// ctrState is what one containerd container says about a run of a pod's
+// container.
+type ctrState struct {
+	id                string
+	imageID           string
+	running           bool
+	exitCode          int32
+	started, finished time.Time
+}
+
+// podContainers is the state of pod uid's containers in containerd, by
+// container name.
+func (k *kubelet) podContainers(ctx context.Context, uid types.UID) (map[string]*ctrState, error) {
 	cs, err := k.ctr.Containers(ctx, fmt.Sprintf("labels.%q==%s", labelPodUID, uid))
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]client.Container{}
+	out := map[string]*ctrState{}
 	for _, c := range cs {
 		labels, err := c.Labels(ctx)
 		if err != nil {
 			return nil, err
 		}
-		out[labels[labelContainer]] = c
+		st, err := k.inspect(ctx, c, labels)
+		if err != nil {
+			return nil, err
+		}
+		out[labels[labelContainer]] = st
 	}
 	return out, nil
+}
+
+// inspect reads a container's state. An exited task's status lives only as
+// long as the task, so its exit code and time move into the container's
+// labels and the task is deleted.
+func (k *kubelet) inspect(ctx context.Context, c client.Container, labels map[string]string) (*ctrState, error) {
+	st := &ctrState{id: c.ID(), imageID: labels[labelImageID]}
+	st.started, _ = time.Parse(time.RFC3339Nano, labels[labelStartedAt])
+	if code, ok := labels[labelExitCode]; ok {
+		n, _ := strconv.Atoi(code)
+		st.exitCode = int32(n)
+		st.finished, _ = time.Parse(time.RFC3339Nano, labels[labelFinishedAt])
+		return st, nil
+	}
+	task, err := c.Task(ctx, nil)
+	if errdefs.IsNotFound(err) {
+		// Created but never started: count it as a run that failed.
+		st.exitCode, st.finished = 128, st.started
+		return st, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	status, err := task.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if status.Status != client.Stopped {
+		st.running = true
+		return st, nil
+	}
+	st.exitCode, st.finished = int32(status.ExitStatus), status.ExitTime
+	if _, err := c.SetLabels(ctx, map[string]string{
+		labelExitCode:   strconv.Itoa(int(status.ExitStatus)),
+		labelFinishedAt: status.ExitTime.Format(time.RFC3339Nano),
+	}); err != nil {
+		return nil, err
+	}
+	_, err = task.Delete(ctx)
+	return st, err
 }
 
 // startContainer creates container c of pod p in containerd and starts it.
@@ -433,6 +632,7 @@ func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.C
 	if c.WorkingDir != "" {
 		opts = append(opts, oci.WithProcessCwd(c.WorkingDir))
 	}
+	named, _ := reference.ParseNormalizedNamed(img.Name())
 	ctr, err := k.ctr.NewContainer(ctx, id,
 		client.WithImage(img),
 		client.WithNewSnapshot(id, img),
@@ -441,6 +641,7 @@ func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.C
 			labelPodName:      p.Name,
 			labelPodNamespace: p.Namespace,
 			labelContainer:    c.Name,
+			labelImageID:      named.Name() + "@" + img.Target().Digest.String(),
 		}),
 		client.WithNewSpec(opts...),
 	)
@@ -451,7 +652,134 @@ func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.C
 	if err != nil {
 		return err
 	}
+	if _, err := ctr.SetLabels(ctx, map[string]string{labelStartedAt: time.Now().Format(time.RFC3339Nano)}); err != nil {
+		return err
+	}
 	return task.Start(ctx)
+}
+
+// podStatus is p's status as its containers' states make it.
+func (k *kubelet) podStatus(p *corev1.Pod, states map[string]*ctrState, w *worker) corev1.PodStatus {
+	s := *p.Status.DeepCopy()
+	s.HostIP, s.HostIPs = k.ip, []corev1.HostIP{{IP: k.ip}}
+	s.PodIP, s.PodIPs = k.ip, []corev1.PodIP{{IP: k.ip}}
+	if s.StartTime == nil {
+		s.StartTime = ptr(stamp(time.Now()))
+	}
+	s.ContainerStatuses = nil
+	for _, c := range p.Spec.Containers {
+		s.ContainerStatuses = append(s.ContainerStatuses, containerStatus(c, states[c.Name], w.waiting[c.Name]))
+	}
+	s.Phase = phase(p.Spec.RestartPolicy, s.ContainerStatuses)
+	ready := s.Phase == corev1.PodRunning
+	for _, cs := range s.ContainerStatuses {
+		ready = ready && cs.Ready
+	}
+	s.Conditions = setConditions(s.Conditions, map[corev1.PodConditionType]bool{
+		corev1.PodScheduled:    true,
+		corev1.PodInitialized:  true,
+		corev1.ContainersReady: ready,
+		corev1.PodReady:        ready,
+	})
+	return s
+}
+
+func containerStatus(c corev1.Container, st *ctrState, waiting *corev1.ContainerStateWaiting) corev1.ContainerStatus {
+	cs := corev1.ContainerStatus{Name: c.Name, Image: c.Image, Started: ptr(false)}
+	switch {
+	case st == nil:
+		if waiting == nil {
+			waiting = &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}
+		}
+		cs.State.Waiting = waiting
+		return cs
+	case st.running:
+		cs.State.Running = &corev1.ContainerStateRunning{StartedAt: stamp(st.started)}
+		cs.Ready, cs.Started = true, ptr(true)
+	default:
+		cs.State.Terminated = terminated(st)
+	}
+	cs.ContainerID, cs.ImageID = "containerd://"+st.id, st.imageID
+	return cs
+}
+
+func terminated(st *ctrState) *corev1.ContainerStateTerminated {
+	reason := "Completed"
+	if st.exitCode != 0 {
+		reason = "Error"
+	}
+	return &corev1.ContainerStateTerminated{
+		ExitCode:    st.exitCode,
+		Reason:      reason,
+		StartedAt:   stamp(st.started),
+		FinishedAt:  stamp(st.finished),
+		ContainerID: "containerd://" + st.id,
+	}
+}
+
+// phase follows the kubelet's rule: Pending while any container waits to
+// start, Running while any runs or will run again, and otherwise Succeeded
+// only if every container exited 0.
+func phase(policy corev1.RestartPolicy, statuses []corev1.ContainerStatus) corev1.PodPhase {
+	var waiting, running, stopped, succeeded int
+	for _, cs := range statuses {
+		switch {
+		case cs.State.Running != nil:
+			running++
+		case cs.State.Terminated != nil:
+			stopped++
+			if cs.State.Terminated.ExitCode == 0 {
+				succeeded++
+			}
+		default:
+			waiting++
+		}
+	}
+	switch {
+	case waiting > 0:
+		return corev1.PodPending
+	case running > 0, policy == corev1.RestartPolicyAlways:
+		return corev1.PodRunning
+	case policy == corev1.RestartPolicyOnFailure && succeeded < stopped:
+		return corev1.PodRunning
+	case succeeded == stopped:
+		return corev1.PodSucceeded
+	}
+	return corev1.PodFailed
+}
+
+// setConditions sets each condition's status, keeping its transition time
+// unless the status changed.
+func setConditions(old []corev1.PodCondition, want map[corev1.PodConditionType]bool) []corev1.PodCondition {
+	var out []corev1.PodCondition
+	for _, t := range []corev1.PodConditionType{corev1.PodScheduled, corev1.PodInitialized, corev1.ContainersReady, corev1.PodReady} {
+		c := corev1.PodCondition{Type: t, Status: corev1.ConditionFalse, LastTransitionTime: stamp(time.Now())}
+		if want[t] {
+			c.Status = corev1.ConditionTrue
+		}
+		for _, o := range old {
+			if o.Type == t && o.Status == c.Status {
+				c.LastTransitionTime = o.LastTransitionTime
+			}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// stamp is t as the API stores it, to the second, so a status that has not
+// changed compares equal to the one already written.
+func stamp(t time.Time) metav1.Time { return metav1.NewTime(t.Truncate(time.Second)) }
+
+// writeStatus writes s as p's status, unless it already is.
+func (k *kubelet) writeStatus(ctx context.Context, p *corev1.Pod, s corev1.PodStatus) error {
+	if equality.Semantic.DeepEqual(p.Status, s) {
+		return nil
+	}
+	q := p.DeepCopy()
+	q.Status = s
+	_, err := k.cs.CoreV1().Pods(p.Namespace).UpdateStatus(ctx, q, metav1.UpdateOptions{})
+	return err
 }
 
 // argv is what a container runs: command replaces the image's entrypoint and
@@ -470,11 +798,14 @@ func argv(entrypoint, cmd, command, args []string) []string {
 func (k *kubelet) image(ctx context.Context, ref string) (client.Image, error) {
 	named, err := reference.ParseDockerRef(ref)
 	if err != nil {
-		return nil, err
+		return nil, pullError{err}
 	}
 	img, err := k.ctr.GetImage(ctx, named.String())
 	if errdefs.IsNotFound(err) {
-		return k.ctr.Pull(ctx, named.String(), client.WithPullUnpack)
+		img, err = k.ctr.Pull(ctx, named.String(), client.WithPullUnpack)
+		if err != nil {
+			return nil, pullError{err}
+		}
 	}
 	return img, err
 }

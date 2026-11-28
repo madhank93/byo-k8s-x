@@ -18,3 +18,9 @@ stages:
   - slug: run-container
     name: Run a pod's containers
     difficulty: hard
+  - slug: pod-status
+    name: Report the pod back
+    difficulty: hard
+  - slug: graceful-delete
+    name: Stop a pod gracefully
+    difficulty: medium
