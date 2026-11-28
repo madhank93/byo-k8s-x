@@ -6,8 +6,10 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -27,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery/cached/memory"
@@ -552,6 +555,10 @@ func routes(st *store, cs *kubernetes.Clientset) http.Handler {
 	return mux
 }
 
+// tolerance is how far from 1.0 a ratio may be before it changes anything:
+// the real controller's default, which stops a noisy metric moving replicas.
+const tolerance = 0.1
+
 var autoscalersGVR = schema.GroupVersionResource{Group: "byok8s.dev", Version: "v1alpha1", Resource: "autoscalers"}
 
 // autoscaler reconciles Autoscalers: the spec and status of an autoscaling/v2
@@ -561,6 +568,34 @@ type autoscaler struct {
 	dyn    dynamic.Interface
 	mapper *restmapper.DeferredDiscoveryRESTMapper
 	ns     string
+	// past is what earlier syncs of each Autoscaler leave for the next, by UID.
+	past map[string]*history
+}
+
+// history is one Autoscaler's recent raw recommendations, and the scalings
+// it made, oldest first.
+type history struct {
+	recs   []timed
+	events []scaleEvent
+}
+
+type scaleEvent struct {
+	at       time.Time
+	from, to int32
+}
+
+type timed struct {
+	at time.Time
+	n  int32
+}
+
+func (a *autoscaler) history(uid string) *history {
+	h, ok := a.past[uid]
+	if !ok {
+		h = &history{}
+		a.past[uid] = h
+	}
+	return h
 }
 
 // autoscale syncs every Autoscaler in ns on a timer. A target's replicas change
@@ -572,7 +607,7 @@ func autoscale(cs *kubernetes.Clientset, cfg *rest.Config, ns string) error {
 	if err != nil {
 		return err
 	}
-	a := &autoscaler{cs: cs, dyn: dyn, ns: ns,
+	a := &autoscaler{cs: cs, dyn: dyn, ns: ns, past: map[string]*history{},
 		mapper: restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(cs.Discovery()))}
 	for ctx.Err() == nil {
 		list, err := dyn.Resource(autoscalersGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
@@ -598,12 +633,514 @@ func (a *autoscaler) sync(ctx context.Context, obj *unstructured.Unstructured) e
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &hpa); err != nil {
 		return err
 	}
-	scale, _, err := a.scale(ctx, hpa.Spec.ScaleTargetRef)
+	scale, gvr, err := a.scale(ctx, hpa.Spec.ScaleTargetRef)
 	if err != nil {
 		return err
 	}
-	hpa.Status.CurrentReplicas = scale.Status.Replicas
-	return a.writeStatus(ctx, obj, hpa.Status)
+	current := scale.Status.Replicas
+	hpa.Status.CurrentReplicas = current
+	sel, err := labels.Parse(scale.Status.Selector)
+	if err != nil {
+		return a.writeStatus(ctx, obj, hpa.Status, fmt.Errorf("target selector: %w", err))
+	}
+	desired, metrics, err := a.computeReplicas(ctx, &hpa, current, sel)
+	hpa.Status.CurrentMetrics = metrics
+	if err != nil {
+		// The last decision stands until the metrics can be read again.
+		return a.writeStatus(ctx, obj, hpa.Status, err)
+	}
+	desired = a.stabilize(&hpa, current, desired)
+	desired = a.limit(&hpa, current, desired)
+	desired = clamp(desired, minReplicas(&hpa), hpa.Spec.MaxReplicas)
+	hpa.Status.DesiredReplicas = desired
+	if from := scale.Spec.Replicas; desired != from {
+		if err := a.rescale(ctx, gvr, scale, desired); err != nil {
+			return a.writeStatus(ctx, obj, hpa.Status, err)
+		}
+		now := metav1.Now()
+		hpa.Status.LastScaleTime = &now
+		h := a.history(string(hpa.UID))
+		h.events = append(h.events, scaleEvent{now.Time, from, desired})
+		fmt.Printf("%s: scaled %s %s from %d to %d\n", hpa.Name, hpa.Spec.ScaleTargetRef.Kind, hpa.Spec.ScaleTargetRef.Name, from, desired)
+	}
+	return a.writeStatus(ctx, obj, hpa.Status, nil)
+}
+
+// rescale writes spec.replicas through the scale subresource, which is all
+// any scalable kind needs to be scaled.
+func (a *autoscaler) rescale(ctx context.Context, gvr schema.GroupVersionResource, s *autoscalingv1.Scale, replicas int32) error {
+	s.Spec.Replicas = replicas
+	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(s)
+	if err != nil {
+		return err
+	}
+	_, err = a.dyn.Resource(gvr).Namespace(a.ns).Update(ctx, &unstructured.Unstructured{Object: u}, metav1.UpdateOptions{}, "scale")
+	return err
+}
+
+// stabilize keeps current between the lowest recommendation made within the
+// scale-up window and the highest made within the scale-down window, so a
+// metric that dips or spikes for a moment moves nothing.
+func (a *autoscaler) stabilize(hpa *autoscalingv2.HorizontalPodAutoscaler, current, rec int32) int32 {
+	up, down := windows(hpa.Spec.Behavior)
+	h := a.history(string(hpa.UID))
+	now := time.Now()
+	h.recs = append(h.recs, timed{now, rec})
+	lo, hi := rec, rec
+	keep := h.recs[:0]
+	for _, r := range h.recs {
+		age := now.Sub(r.at)
+		if age > max(up, down) {
+			continue
+		}
+		keep = append(keep, r)
+		if age <= up {
+			lo = min(lo, r.n)
+		}
+		if age <= down {
+			hi = max(hi, r.n)
+		}
+	}
+	h.recs = keep
+	return clamp(current, lo, hi)
+}
+
+// limit applies the scaling policies: each allows a change per period, counted
+// from the replicas the target had when the period began, and selectPolicy
+// picks the most generous (Max), the least (Min), or none (Disabled).
+func (a *autoscaler) limit(hpa *autoscalingv2.HorizontalPodAutoscaler, current, desired int32) int32 {
+	h := a.history(string(hpa.UID))
+	// No policy period is longer than half an hour.
+	for len(h.events) > 0 && time.Since(h.events[0].at) > 30*time.Minute {
+		h.events = h.events[1:]
+	}
+	up, down := rules(hpa.Spec.Behavior)
+	switch {
+	case desired > current:
+		return min(desired, max(current, periodLimit(up, h.events, current, true)))
+	case desired < current:
+		return max(desired, min(current, periodLimit(down, h.events, current, false)))
+	}
+	return desired
+}
+
+func periodLimit(r *autoscalingv2.HPAScalingRules, events []scaleEvent, current int32, up bool) int32 {
+	sel := autoscalingv2.MaxChangePolicySelect
+	if r.SelectPolicy != nil {
+		sel = *r.SelectPolicy
+	}
+	if sel == autoscalingv2.DisabledPolicySelect {
+		return current
+	}
+	// The most generous limit is the highest going up and the lowest going down.
+	highest := (sel == autoscalingv2.MaxChangePolicySelect) == up
+	var out int32
+	for i, p := range r.Policies {
+		start := current
+		for _, e := range events {
+			if time.Since(e.at) <= time.Duration(p.PeriodSeconds)*time.Second {
+				start = e.from
+				break
+			}
+		}
+		var n int32
+		switch {
+		case p.Type == autoscalingv2.PodsScalingPolicy && up:
+			n = start + p.Value
+		case p.Type == autoscalingv2.PodsScalingPolicy:
+			n = start - p.Value
+		case up:
+			n = int32(math.Ceil(float64(start) * (1 + float64(p.Value)/100)))
+		default:
+			n = int32(float64(start) * (1 - float64(p.Value)/100))
+		}
+		if i == 0 || (highest && n > out) || (!highest && n < out) {
+			out = n
+		}
+	}
+	return out
+}
+
+// rules are the scaling policies, with the real controller's defaults for
+// any left unset.
+func rules(b *autoscalingv2.HorizontalPodAutoscalerBehavior) (up, down *autoscalingv2.HPAScalingRules) {
+	up = &autoscalingv2.HPAScalingRules{Policies: []autoscalingv2.HPAScalingPolicy{
+		{Type: autoscalingv2.PodsScalingPolicy, Value: 4, PeriodSeconds: 15},
+		{Type: autoscalingv2.PercentScalingPolicy, Value: 100, PeriodSeconds: 15}}}
+	down = &autoscalingv2.HPAScalingRules{Policies: []autoscalingv2.HPAScalingPolicy{
+		{Type: autoscalingv2.PercentScalingPolicy, Value: 100, PeriodSeconds: 15}}}
+	if b != nil && b.ScaleUp != nil {
+		up.SelectPolicy = b.ScaleUp.SelectPolicy
+		if len(b.ScaleUp.Policies) > 0 {
+			up.Policies = b.ScaleUp.Policies
+		}
+	}
+	if b != nil && b.ScaleDown != nil {
+		down.SelectPolicy = b.ScaleDown.SelectPolicy
+		if len(b.ScaleDown.Policies) > 0 {
+			down.Policies = b.ScaleDown.Policies
+		}
+	}
+	return up, down
+}
+
+// windows are the stabilization windows, with the real controller's defaults:
+// none for scaling up, five minutes for scaling down.
+func windows(b *autoscalingv2.HorizontalPodAutoscalerBehavior) (up, down time.Duration) {
+	up, down = 0, 300*time.Second
+	if b != nil && b.ScaleUp != nil && b.ScaleUp.StabilizationWindowSeconds != nil {
+		up = time.Duration(*b.ScaleUp.StabilizationWindowSeconds) * time.Second
+	}
+	if b != nil && b.ScaleDown != nil && b.ScaleDown.StabilizationWindowSeconds != nil {
+		down = time.Duration(*b.ScaleDown.StabilizationWindowSeconds) * time.Second
+	}
+	return up, down
+}
+
+func minReplicas(hpa *autoscalingv2.HorizontalPodAutoscaler) int32 {
+	if hpa.Spec.MinReplicas == nil {
+		return 1
+	}
+	return *hpa.Spec.MinReplicas
+}
+
+func clamp(n, lo, hi int32) int32 {
+	return max(lo, min(n, hi))
+}
+
+// computeReplicas asks every metric for a replica count and takes the largest.
+// A metric that cannot be read might have asked for more, so while one is
+// unknown the others may scale up but not down.
+func (a *autoscaler) computeReplicas(ctx context.Context, hpa *autoscalingv2.HorizontalPodAutoscaler, current int32, sel labels.Selector) (int32, []autoscalingv2.MetricStatus, error) {
+	var statuses []autoscalingv2.MetricStatus
+	var best int32
+	var errs []error
+	for _, m := range hpa.Spec.Metrics {
+		n, st, err := a.metricReplicas(ctx, m, current, sel)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("metric %s: %w", m.Type, err))
+			continue
+		}
+		statuses = append(statuses, st)
+		best = max(best, n)
+	}
+	if len(errs) == len(hpa.Spec.Metrics) || (len(errs) > 0 && best < current) {
+		return 0, statuses, errors.Join(errs...)
+	}
+	for _, err := range errs {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", hpa.Name, err)
+	}
+	return best, statuses, nil
+}
+
+func (a *autoscaler) metricReplicas(ctx context.Context, m autoscalingv2.MetricSpec, current int32, sel labels.Selector) (int32, autoscalingv2.MetricStatus, error) {
+	switch {
+	case m.Type == autoscalingv2.ResourceMetricSourceType && m.Resource != nil:
+		return a.resourceReplicas(ctx, m.Resource, current, sel)
+	case m.Type == autoscalingv2.PodsMetricSourceType && m.Pods != nil:
+		return a.podsReplicas(ctx, m.Pods, current, sel)
+	case m.Type == autoscalingv2.ObjectMetricSourceType && m.Object != nil:
+		return a.objectReplicas(ctx, m.Object, current, sel)
+	case m.Type == autoscalingv2.ExternalMetricSourceType && m.External != nil:
+		return a.externalReplicas(ctx, m.External, current, sel)
+	}
+	return 0, autoscalingv2.MetricStatus{}, fmt.Errorf("unsupported metric type %q", m.Type)
+}
+
+// resourceReplicas is utilization against requests: 100 × Σusage / Σrequests,
+// as an integer percent, then desired = ceil(ratio × pods).
+func (a *autoscaler) resourceReplicas(ctx context.Context, m *autoscalingv2.ResourceMetricSource, current int32, sel labels.Selector) (int32, autoscalingv2.MetricStatus, error) {
+	var st autoscalingv2.MetricStatus
+	if m.Target.Type != autoscalingv2.UtilizationMetricType || m.Target.AverageUtilization == nil {
+		return 0, st, fmt.Errorf("only a Utilization target is supported for %s", m.Name)
+	}
+	target := *m.Target.AverageUtilization
+	usage, err := a.podUsage(ctx, m.Name, sel)
+	if err != nil {
+		return 0, st, err
+	}
+	pods, err := a.cs.CoreV1().Pods(a.ns).List(ctx, metav1.ListOptions{LabelSelector: sel.String()})
+	if err != nil {
+		return 0, st, err
+	}
+	requests := map[string]int64{}
+	metrics := map[string]int64{}
+	var unready, missing []string
+	for _, p := range pods.Items {
+		// A pod on its way out, or already failed, says nothing about load.
+		if p.DeletionTimestamp != nil || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		req := podRequest(&p, m.Name)
+		if req == 0 {
+			return 0, st, fmt.Errorf("pod %s requests no %s, so it has no utilization", p.Name, m.Name)
+		}
+		requests[p.Name] = req
+		// A starting pod burns CPU it will not burn once it serves.
+		if p.Status.Phase == corev1.PodPending || (m.Name == corev1.ResourceCPU && !podReady(&p)) {
+			unready = append(unready, p.Name)
+			continue
+		}
+		if u, ok := usage[p.Name]; ok {
+			metrics[p.Name] = u
+		} else {
+			missing = append(missing, p.Name)
+		}
+	}
+	if len(metrics) == 0 {
+		return 0, st, fmt.Errorf("no %s metrics for the ready pods of %s", m.Name, sel)
+	}
+	ready := len(metrics)
+	util, ratio := utilization(metrics, requests, target)
+	st = autoscalingv2.MetricStatus{Type: autoscalingv2.ResourceMetricSourceType, Resource: &autoscalingv2.ResourceMetricStatus{
+		Name: m.Name, Current: autoscalingv2.MetricValueStatus{AverageUtilization: &util,
+			AverageValue: resource.NewMilliQuantity(sum(metrics)/int64(ready), resource.DecimalSI)}}}
+
+	scaleUpWithUnready := len(unready) > 0 && ratio > 1
+	if !scaleUpWithUnready && len(missing) == 0 {
+		if math.Abs(1-ratio) <= tolerance {
+			return current, st, nil
+		}
+		return int32(math.Ceil(ratio * float64(ready))), st, nil
+	}
+	// Assume the worst of every pod the ready ones cannot speak for: a missing
+	// pod is busy when they say scale down and idle when they say scale up, and
+	// an unready one is idle. If the answer still points the same way, act.
+	for _, name := range missing {
+		if ratio < 1 {
+			metrics[name] = requests[name]
+		} else {
+			metrics[name] = 0
+		}
+	}
+	if scaleUpWithUnready {
+		for _, name := range unready {
+			metrics[name] = 0
+		}
+	}
+	_, newRatio := utilization(metrics, requests, target)
+	if math.Abs(1-newRatio) <= tolerance || (ratio < 1 && newRatio > 1) || (ratio > 1 && newRatio < 1) {
+		return current, st, nil
+	}
+	n := int32(math.Ceil(newRatio * float64(len(metrics))))
+	if (newRatio < 1 && n > current) || (newRatio > 1 && n < current) {
+		return current, st, nil
+	}
+	return n, st, nil
+}
+
+// utilization is the integer percent of requests the pods in metrics use,
+// and its ratio to target.
+func utilization(metrics, requests map[string]int64, target int32) (int32, float64) {
+	var req int64
+	for name := range metrics {
+		req += requests[name]
+	}
+	util := int32(sum(metrics) * 100 / req)
+	return util, float64(util) / float64(target)
+}
+
+func sum(m map[string]int64) int64 {
+	var t int64
+	for _, v := range m {
+		t += v
+	}
+	return t
+}
+
+func podReady(p *corev1.Pod) bool {
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// podsReplicas averages a custom metric over the target's pods and compares
+// that with the target average.
+func (a *autoscaler) podsReplicas(ctx context.Context, m *autoscalingv2.PodsMetricSource, current int32, sel labels.Selector) (int32, autoscalingv2.MetricStatus, error) {
+	var st autoscalingv2.MetricStatus
+	if m.Target.AverageValue == nil {
+		return 0, st, fmt.Errorf("a Pods metric needs an averageValue target")
+	}
+	vals, err := a.metricValues(ctx, "/apis/custom.metrics.k8s.io/v1beta2/namespaces/"+a.ns+"/pods/*/"+m.Metric.Name, sel)
+	if err != nil {
+		return 0, st, err
+	}
+	avg := sumSlice(vals) / int64(len(vals))
+	st = autoscalingv2.MetricStatus{Type: autoscalingv2.PodsMetricSourceType, Pods: &autoscalingv2.PodsMetricStatus{
+		Metric: m.Metric, Current: autoscalingv2.MetricValueStatus{AverageValue: resource.NewMilliQuantity(avg, resource.DecimalSI)}}}
+	ratio := float64(avg) / float64(m.Target.AverageValue.MilliValue())
+	if math.Abs(1-ratio) <= tolerance {
+		return current, st, nil
+	}
+	return int32(math.Ceil(ratio * float64(len(vals)))), st, nil
+}
+
+// objectReplicas reads a metric describing one object, such as a Service.
+func (a *autoscaler) objectReplicas(ctx context.Context, m *autoscalingv2.ObjectMetricSource, current int32, sel labels.Selector) (int32, autoscalingv2.MetricStatus, error) {
+	var st autoscalingv2.MetricStatus
+	gv, err := schema.ParseGroupVersion(m.DescribedObject.APIVersion)
+	if err != nil {
+		return 0, st, err
+	}
+	mapping, err := a.mapper.RESTMapping(schema.GroupKind{Group: gv.Group, Kind: m.DescribedObject.Kind}, gv.Version)
+	if err != nil {
+		return 0, st, err
+	}
+	// The custom metrics API names a resource the way kubectl does: services,
+	// deployments.apps.
+	path := fmt.Sprintf("/apis/custom.metrics.k8s.io/v1beta2/namespaces/%s/%s/%s/%s",
+		a.ns, mapping.Resource.GroupResource(), m.DescribedObject.Name, m.Metric.Name)
+	vals, err := a.metricValues(ctx, path, labels.Everything())
+	if err != nil {
+		return 0, st, err
+	}
+	n, cur, err := a.valueReplicas(ctx, vals[0], m.Target, current, sel)
+	st = autoscalingv2.MetricStatus{Type: autoscalingv2.ObjectMetricSourceType, Object: &autoscalingv2.ObjectMetricStatus{
+		DescribedObject: m.DescribedObject, Metric: m.Metric, Current: cur}}
+	return n, st, err
+}
+
+// externalReplicas reads a metric about something outside the cluster. Its
+// selector picks the series, and every series it matches is added up.
+func (a *autoscaler) externalReplicas(ctx context.Context, m *autoscalingv2.ExternalMetricSource, current int32, sel labels.Selector) (int32, autoscalingv2.MetricStatus, error) {
+	var st autoscalingv2.MetricStatus
+	series := labels.Everything()
+	if m.Metric.Selector != nil {
+		var err error
+		if series, err = metav1.LabelSelectorAsSelector(m.Metric.Selector); err != nil {
+			return 0, st, err
+		}
+	}
+	vals, err := a.metricValues(ctx, "/apis/external.metrics.k8s.io/v1beta1/namespaces/"+a.ns+"/"+m.Metric.Name, series)
+	if err != nil {
+		return 0, st, err
+	}
+	n, cur, err := a.valueReplicas(ctx, sumSlice(vals), m.Target, current, sel)
+	st = autoscalingv2.MetricStatus{Type: autoscalingv2.ExternalMetricSourceType, External: &autoscalingv2.ExternalMetricStatus{
+		Metric: m.Metric, Current: cur}}
+	return n, st, err
+}
+
+// valueReplicas turns one number about the workload as a whole into replicas.
+// A Value target scales the ready pods by value/target; an AverageValue
+// target shares the value out, at the target per pod.
+func (a *autoscaler) valueReplicas(ctx context.Context, v int64, t autoscalingv2.MetricTarget, current int32, sel labels.Selector) (int32, autoscalingv2.MetricValueStatus, error) {
+	q := resource.NewMilliQuantity(v, resource.DecimalSI)
+	switch {
+	case t.Type == autoscalingv2.ValueMetricType && t.Value != nil:
+		cur := autoscalingv2.MetricValueStatus{Value: q}
+		ratio := float64(v) / float64(t.Value.MilliValue())
+		if math.Abs(1-ratio) <= tolerance {
+			return current, cur, nil
+		}
+		ready, err := a.readyPods(ctx, sel)
+		if err != nil {
+			return 0, cur, err
+		}
+		return int32(math.Ceil(ratio * float64(ready))), cur, nil
+	case t.Type == autoscalingv2.AverageValueMetricType && t.AverageValue != nil:
+		per := t.AverageValue.MilliValue()
+		cur := autoscalingv2.MetricValueStatus{AverageValue: resource.NewMilliQuantity(v/int64(max(current, 1)), resource.DecimalSI)}
+		if current > 0 && math.Abs(1-float64(v)/float64(per*int64(current))) <= tolerance {
+			return current, cur, nil
+		}
+		return int32(math.Ceil(float64(v) / float64(per))), cur, nil
+	}
+	return 0, autoscalingv2.MetricValueStatus{}, fmt.Errorf("target type %q needs its value set", t.Type)
+}
+
+func (a *autoscaler) readyPods(ctx context.Context, sel labels.Selector) (int, error) {
+	pods, err := a.cs.CoreV1().Pods(a.ns).List(ctx, metav1.ListOptions{LabelSelector: sel.String()})
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, p := range pods.Items {
+		if p.Status.Phase == corev1.PodRunning && p.DeletionTimestamp == nil && podReady(&p) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// metricValues reads a MetricValueList (custom metrics) or an
+// ExternalMetricValueList, which share the one field read here, in milli-units.
+// An empty list is an error: no metric is not the same as a metric of zero.
+func (a *autoscaler) metricValues(ctx context.Context, path string, sel labels.Selector) ([]int64, error) {
+	req := a.cs.Discovery().RESTClient().Get().AbsPath(path)
+	if !sel.Empty() {
+		req = req.Param("labelSelector", sel.String())
+	}
+	raw, err := req.DoRaw(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var list struct {
+		Items []struct {
+			Value resource.Quantity `json:"value"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, err
+	}
+	if len(list.Items) == 0 {
+		return nil, fmt.Errorf("no values at %s", path)
+	}
+	var out []int64
+	for _, it := range list.Items {
+		out = append(out, it.Value.MilliValue())
+	}
+	return out, nil
+}
+
+func sumSlice(vs []int64) int64 {
+	var t int64
+	for _, v := range vs {
+		t += v
+	}
+	return t
+}
+
+func podRequest(p *corev1.Pod, name corev1.ResourceName) int64 {
+	var sum int64
+	for _, c := range p.Spec.Containers {
+		if q, ok := c.Resources.Requests[name]; ok {
+			sum += q.MilliValue()
+		}
+	}
+	return sum
+}
+
+// podUsage reads metrics.k8s.io for the pods sel matches, in milli-units of
+// the named resource, summed over each pod's containers.
+func (a *autoscaler) podUsage(ctx context.Context, name corev1.ResourceName, sel labels.Selector) (map[string]int64, error) {
+	raw, err := a.cs.Discovery().RESTClient().Get().AbsPath("/apis/metrics.k8s.io/v1beta1/namespaces", a.ns, "pods").
+		Param("labelSelector", sel.String()).DoRaw(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var list struct {
+		Items []struct {
+			Metadata   struct{ Name string } `json:"metadata"`
+			Containers []struct {
+				Usage corev1.ResourceList `json:"usage"`
+			} `json:"containers"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, err
+	}
+	out := map[string]int64{}
+	for _, it := range list.Items {
+		for _, c := range it.Containers {
+			q := c.Usage[name]
+			out[it.Metadata.Name] += q.MilliValue()
+		}
+	}
+	return out, nil
 }
 
 // scale reads a target's scale subresource, which every scalable kind serves
@@ -631,14 +1168,18 @@ func (a *autoscaler) scale(ctx context.Context, ref autoscalingv2.CrossVersionOb
 	return &s, m.Resource, runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &s)
 }
 
-func (a *autoscaler) writeStatus(ctx context.Context, obj *unstructured.Unstructured, st autoscalingv2.HorizontalPodAutoscalerStatus) error {
+// writeStatus records st, and returns cause once it is recorded: a metric that
+// cannot be read still leaves the replicas and the metrics that could be.
+func (a *autoscaler) writeStatus(ctx context.Context, obj *unstructured.Unstructured, st autoscalingv2.HorizontalPodAutoscalerStatus, cause error) error {
 	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&st)
 	if err != nil {
 		return err
 	}
 	obj.Object["status"] = u
-	_, err = a.dyn.Resource(autoscalersGVR).Namespace(a.ns).UpdateStatus(ctx, obj, metav1.UpdateOptions{})
-	return err
+	if _, err = a.dyn.Resource(autoscalersGVR).Namespace(a.ns).UpdateStatus(ctx, obj, metav1.UpdateOptions{}); err != nil {
+		return err
+	}
+	return cause
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
