@@ -195,10 +195,13 @@ remaining namespaces, and the CRI a real kubelet can drive.
 `startup-probe` · `graceful-delete` · `lifecycle-hooks` · `eviction` ·
 `garbage-collection` · `logs-api` · `exec-api` · `cni-invoke`
 
-### `cni` — Build your own CNI plugin · 20 stages
+### [x] `cni` — Build your own CNI plugin · 20 stages
+
+A plugin the harness invokes as a container runtime would, grown from the
+protocol to a network containerd uses for a real pod.
 
 `plugin-contract` · `version` · `netns` · `veth` · `ipam-static` ·
-`ipam-persist` · `routes` · `bridge` · `addressing` · `sysctls` · `del` ·
+`ipam-persist` · `routes` · `bridge` · `result` · `sysctls` · `del` ·
 `check` · `conflist` · `portmap` · `bandwidth` · `hostport-cleanup` ·
 `node-routes` · `vxlan` · `netpol-lite` · `kubelet-drives-it`
 
