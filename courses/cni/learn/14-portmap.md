@@ -30,8 +30,8 @@ addresses are. Keep the rules in a table of your own:
 
 ```
 table ip byok8s-cni-portmap {
-  chain pre { type nat hook prerouting priority dstnat; }
-  chain out { type nat hook output priority dstnat; }
+  chain pre { type nat hook prerouting priority -100; }
+  chain out { type nat hook output priority -100; }
 }
 ```
 

@@ -818,10 +818,10 @@ func stagePortmap(w *work) error {
 		return err
 	}
 	c := end{node1, ns}
-	if _, err := w.dial(end{node1, ""}, c, ip, hp); err != nil {
+	if _, err := w.dialTo(end{node1, ""}, c, ip, hp, 8080); err != nil {
 		return fmt.Errorf("hostPort %d → containerPort 8080, from the node itself: %w", hp, err)
 	}
-	if _, err := w.dial(end{node2, ""}, c, ip, hp); err != nil {
+	if _, err := w.dialTo(end{node2, ""}, c, ip, hp, 8080); err != nil {
 		return fmt.Errorf("hostPort %d → containerPort 8080, from another node: %w", hp, err)
 	}
 	return nil
@@ -913,10 +913,10 @@ func stageHostportCleanup(w *work) error {
 			return fmt.Errorf("byok8s-portmap DEL of x (no prevResult, attempt %d): %w", i+1, err)
 		}
 	}
-	if err := w.blocked(end{node1, ""}, end{node1, x.ns}, ip, x.hp, fmt.Sprintf("x's mapping of hostPort %d was deleted", x.hp)); err != nil {
-		return err
+	if _, err := w.dialTo(end{node1, ""}, end{node1, x.ns}, ip, x.hp, 8080); err == nil {
+		return fmt.Errorf("hostPort %d still reaches x after x's mapping was deleted", x.hp)
 	}
-	if _, err := w.dial(end{node1, ""}, end{node1, y.ns}, ip, y.hp); err != nil {
+	if _, err := w.dialTo(end{node1, ""}, end{node1, y.ns}, ip, y.hp, 8080); err != nil {
 		return fmt.Errorf("deleting x's mapping must leave y's: %w", err)
 	}
 	return nil
@@ -1089,7 +1089,11 @@ func stageNetpolLite(w *work) error {
 	if err := w.blocked(at("a"), at("d"), ip("d"), port(), "d is in red and took the address b had in blue; DEL must take b's address out of blue"); err != nil {
 		return err
 	}
-	if _, err := w.dial(at("c"), at("d"), ip("d"), port()); err != nil {
+	if err := w.blocked(at("d"), at("a"), ip("a"), port(), "d is in red, though it has the address b had in blue; DEL must take b's address out of blue"); err != nil {
+		return err
+	}
+	// d dials, not c: c may still have b's MAC cached for the address d took.
+	if _, err := w.dial(at("d"), at("c"), ip("c"), port()); err != nil {
 		return fmt.Errorf("c and d are both in namespace red: %w", err)
 	}
 	return nil

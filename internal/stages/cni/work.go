@@ -70,18 +70,15 @@ const prefix = "bk8s"
 // range, so nothing here collides with a real pod.
 const podRange = "10.217.0.0/16"
 
-// harnessTables exempts traffic between the course's addresses from
-// connection tracking. kind masquerades anything leaving a node for outside
-// its own pod range, and bridged traffic passes iptables here, so without it
-// a container would see every peer as the gateway.
+// harnessTables keeps kind from masquerading traffic between the course's
+// addresses, which it does to anything leaving for outside its own pod
+// range; containers would see every peer as the gateway. A no-op SNAT in an
+// earlier nat chain claims the connection's binding first, and conntrack
+// stays on so forwarded ports can still be un-NATed on the way back.
 var harnessTables = `table ip byok8s-cni-harness {
-  chain pre {
-    type filter hook prerouting priority raw;
-    ip saddr ` + podRange + ` ip daddr ` + podRange + ` notrack
-  }
-  chain out {
-    type filter hook output priority raw;
-    ip saddr ` + podRange + ` ip daddr ` + podRange + ` notrack
+  chain post {
+    type nat hook postrouting priority srcnat - 10;
+    ip saddr ` + podRange + ` ip daddr ` + podRange + ` snat to ip saddr
   }
 }
 `
@@ -404,6 +401,12 @@ func (e end) String() string {
 // dial connects from one end to ip:port, where a server listens in the other,
 // and returns the source address the server saw.
 func (w *work) dial(from, to end, ip string, port int) (string, error) {
+	return w.dialTo(from, to, ip, port, port)
+}
+
+// dialTo is dial with the server on its own port, for a connection that is
+// forwarded from port to srvPort on the way.
+func (w *work) dialTo(from, to end, ip string, port, srvPort int) (string, error) {
 	tok := "tok-" + randHex(3)
 	var (
 		srv    *runner.Result
@@ -413,7 +416,7 @@ func (w *work) dial(from, to end, ip string, port int) (string, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		srv, srvErr = to.node.Exec(w.ctx, 20*time.Second, to.argv("python3", baseDir+"/harness/serve.py", fmt.Sprint(port), "8", tok)...)
+		srv, srvErr = to.node.Exec(w.ctx, 20*time.Second, to.argv("python3", baseDir+"/harness/serve.py", fmt.Sprint(srvPort), "8", tok)...)
 	}()
 	time.Sleep(300 * time.Millisecond)
 	cli, err := from.node.Exec(w.ctx, 20*time.Second, from.argv("python3", baseDir+"/harness/dial.py", ip, fmt.Sprint(port), "5")...)

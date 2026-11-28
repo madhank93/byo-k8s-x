@@ -24,16 +24,20 @@ One workable layout:
 
 ```
 table bridge byok8s-cni-netpol {
-  map dst { type ipv4_addr : verdict; }    container → jump its namespace
+  map owners { type ipv4_addr : verdict; } container → jump its namespace
   set ns-blue { type ipv4_addr; }           members of blue
-  chain fwd { type filter hook forward priority 0; ip daddr vmap @dst }
+  chain isolate { type filter hook forward priority 0;
+                  ct state established,related accept
+                  ip daddr vmap @owners }
   chain ns-blue { ip saddr != @ns-blue drop }
 }
 ```
 
-ADD adds the container's address to its namespace's set and to `dst`. DEL
-must take it out again: the next container to lease that address may be in
-another namespace, and must not inherit the old one's peers.
+Replies pass, as NetworkPolicy allows them: accept `established` before the
+policy. ADD adds the container's address to its namespace's set and to
+`owners`. DEL must take it out again: the next container to lease that
+address may be in another namespace, and must not inherit the old one's
+peers.
 
 ## Go APIs
 
