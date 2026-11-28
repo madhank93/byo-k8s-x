@@ -1775,3 +1775,85 @@ func stageEviction(ctx context.Context, env *kube.Env, bin string) error {
 	}
 	return nil
 }
+
+// podLogs is what the API server's pods/log subresource returns, which it
+// fetches from the kubelet named in the Node's daemonEndpoints.
+func (w *work) podLogs(name string, opts *corev1.PodLogOptions) (string, error) {
+	b, err := w.env.Client.CoreV1().Pods(w.env.Namespace).GetLogs(name, opts).DoRaw(w.ctx)
+	return string(b), err
+}
+
+// stageLogsAPI — the kubelet serves its containers' logs over HTTPS, where
+// the API server finds it through the Node's daemonEndpoints, so kubectl
+// logs works: the current run, the previous one, and the last few lines.
+func stageLogsAPI(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	if _, err := w.waitNode("Node "+w.name+" to publish its kubelet port", 30*time.Second, func(n *corev1.Node) error {
+		if got := n.Status.DaemonEndpoints.KubeletEndpoint.Port; got != int32(w.port) {
+			return fmt.Errorf("status.daemonEndpoints.kubeletEndpoint.port is %d; the kubelet serves on --port %d, and the API server finds it there", got, w.port)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	token := randHex(4)
+	if _, err := w.create(w.pod("count", corev1.RestartPolicyAlways, corev1.Container{
+		Name: "main", Command: []string{"sh", "-c", "for i in 1 2 3 4 5; do echo " + token + "-$i; done; sleep 3600"},
+	})); err != nil {
+		return err
+	}
+	if _, err := w.create(w.pod("crash", corev1.RestartPolicyAlways, corev1.Container{
+		Name: "main", Command: []string{"sh", "-c", `echo "run $(cat /proc/sys/kernel/random/uuid)"; exit 1`},
+	})); err != nil {
+		return err
+	}
+
+	var got string
+	ctx2, cancel := context.WithTimeout(ctx, 40*time.Second)
+	defer cancel()
+	var last error
+	if err := kube.WaitFor(ctx2, "kubectl logs count", func(ctx context.Context) (bool, error) {
+		got, last = w.podLogs("count", &corev1.PodLogOptions{Container: "main"})
+		return last == nil && strings.Contains(got, token+"-5"), nil
+	}); err != nil {
+		return fmt.Errorf("%w: the API server asks the kubelet for GET /containerLogs/NAMESPACE/POD/CONTAINER; got %q, %v", err, got, last)
+	}
+	for i := 1; i <= 5; i++ {
+		if !strings.Contains(got, fmt.Sprintf("%s-%d\n", token, i)) {
+			return fmt.Errorf("the logs of pod count should hold all five lines; got:\n%s", got)
+		}
+	}
+	if got, err := w.podLogs("count", &corev1.PodLogOptions{Container: "main", TailLines: ptr(int64(2))}); err != nil {
+		return err
+	} else if got != fmt.Sprintf("%s-4\n%s-5\n", token, token) {
+		return fmt.Errorf("with tailLines=2 the logs are the last two lines, %s-4 and %s-5; got %q", token, token, got)
+	}
+
+	if _, err := w.waitPod("crash", "pod crash to restart", 30*time.Second, func(p *corev1.Pod) error {
+		if restarts(p, "main") < 1 {
+			return fmt.Errorf("its container exits 1, so it runs again")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	cur, err := w.podLogs("crash", &corev1.PodLogOptions{Container: "main"})
+	if err != nil {
+		return err
+	}
+	prev, err := w.podLogs("crash", &corev1.PodLogOptions{Container: "main", Previous: true})
+	if err != nil {
+		return fmt.Errorf("kubectl logs --previous: %w", err)
+	}
+	if !strings.HasPrefix(cur, "run ") || !strings.HasPrefix(prev, "run ") || cur == prev {
+		return fmt.Errorf("pod crash's logs are %q and with previous=true %q; previous is the run before the current one, which logged a different uuid", cur, prev)
+	}
+	return nil
+}

@@ -5,6 +5,9 @@
 // through runner.Node, as a second kubelet on that machine. It registers a
 // Node of its own under a name the stage picks, so the worker's real kubelet
 // and node are never touched, and the stage deletes that Node when it ends.
+// Its pods run in a containerd namespace named for that Node, never k8s.io:
+// the real kubelet kills CRI sandboxes it did not create, and never looks
+// outside CRI. Every stage removes that namespace when it ends.
 package kubelet
 
 import (
@@ -65,6 +68,7 @@ func init() {
 	register(Stage{Slug: "static-pod", Run: stageStaticPod})
 	register(Stage{Slug: "reconcile", Run: stageReconcile})
 	register(Stage{Slug: "eviction", Run: stageEviction})
+	register(Stage{Slug: "logs-api", Run: stageLogsAPI})
 }
 
 // node is the worker the program runs in.

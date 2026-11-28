@@ -39,3 +39,30 @@ stages:
   - slug: config-volumes
     name: Project ConfigMaps and Secrets into files
     difficulty: medium
+  - slug: service-account-token
+    name: Mount the pod's service account token
+    difficulty: medium
+  - slug: resources
+    name: Admit what fits, limit what runs
+    difficulty: hard
+  - slug: liveness-probe
+    name: Restart what stops answering
+    difficulty: hard
+  - slug: readiness-probe
+    name: Say when a container is ready
+    difficulty: medium
+  - slug: lifecycle-hooks
+    name: Run lifecycle hooks
+    difficulty: medium
+  - slug: static-pod
+    name: Run static pods from files
+    difficulty: hard
+  - slug: reconcile
+    name: Pick up where it left off
+    difficulty: medium
+  - slug: eviction
+    name: Evict what outgrows its limit
+    difficulty: medium
+  - slug: logs-api
+    name: Serve kubectl logs
+    difficulty: hard
