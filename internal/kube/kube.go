@@ -142,7 +142,7 @@ func reset(ctx context.Context, cs kubernetes.Interface, cfg *rest.Config, ns st
 	return nil
 }
 
-// sweepGraderAPIs deletes grader APIServices that are unavailable and older
+// sweepGraderAPIs deletes course APIServices that are unavailable and older
 // than any check keeps one, so a killed run cannot wedge namespace deletion
 // for whatever runs next. A live one is Available within seconds of creation.
 func sweepGraderAPIs(ctx context.Context, cfg *rest.Config) error {
@@ -151,11 +151,17 @@ func sweepGraderAPIs(ctx context.Context, cfg *rest.Config) error {
 		return fmt.Errorf("dynamic client: %w", err)
 	}
 	r := dyn.Resource(schema.GroupVersionResource{Group: "apiregistration.k8s.io", Version: "v1", Resource: "apiservices"})
-	list, err := r.List(ctx, metav1.ListOptions{LabelSelector: GraderAPILabel})
+	list, err := r.List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("list grader APIServices: %w", err)
+		return fmt.Errorf("list APIServices: %w", err)
 	}
 	for _, a := range list.Items {
+		// A learner's own server registers itself without the label, but
+		// always behind a Service in a stage namespace.
+		svcNS, _, _ := unstructured.NestedString(a.Object, "spec", "service", "namespace")
+		if _, ok := a.GetLabels()[GraderAPILabel]; !ok && !strings.HasPrefix(svcNS, "bko-") {
+			continue
+		}
 		if time.Since(a.GetCreationTimestamp().Time) < 20*time.Second || apiAvailable(a.Object) {
 			continue
 		}

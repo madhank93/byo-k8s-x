@@ -242,9 +242,9 @@ Host processes again. Independent of tiers 2 and 3 — take them whenever.
 `node-info` · `ephemeral-inline` · `snapshot-create` · `snapshot-restore` ·
 `clone` · `capacity` · `idempotency` · `sidecars-drive-it`
 
-### `hpa` — Build your own metrics server and HPA · 18 stages
+### [x] `hpa` — Build your own metrics server and HPA · 18 stages
 
-`summary-api` · `cadvisor-parse` · `pod-aggregation` · `apiservice` ·
+`summary-api` · `resource-metrics` · `pod-aggregation` · `apiservice` ·
 `pod-metrics` · `node-metrics` · `kubectl-top` · `hpa-watch` ·
 `scaling-formula` · `tolerance` · `readiness-window` · `missing-metrics` ·
 `scale-subresource` · `stabilization` · `behavior-policies` ·

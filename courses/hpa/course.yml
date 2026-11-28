@@ -1,0 +1,61 @@
+slug: hpa
+name: Build your own metrics server and HPA
+language: go
+entrypoint: main.go
+# Pod metrics are gathered from every node, so a stage puts pods on two.
+workers: 2
+stages:
+  - slug: summary-api
+    name: Ask a kubelet what its pods use
+    difficulty: easy
+  - slug: resource-metrics
+    name: Turn counters into rates
+    difficulty: medium
+  - slug: pod-aggregation
+    name: One number per pod, from every node
+    difficulty: medium
+  - slug: apiservice
+    name: Join the API server as metrics.k8s.io
+    difficulty: hard
+  - slug: pod-metrics
+    name: Serve PodMetrics
+    difficulty: medium
+  - slug: node-metrics
+    name: Serve NodeMetrics
+    difficulty: easy
+  - slug: kubectl-top
+    name: Let kubectl top drive it
+    difficulty: medium
+  - slug: hpa-watch
+    name: Watch autoscalers, read the scale
+    difficulty: medium
+  - slug: scaling-formula
+    name: The scaling formula
+    difficulty: medium
+  - slug: tolerance
+    name: Leave small differences alone
+    difficulty: easy
+  - slug: readiness-window
+    name: Do not trust a pod that is not ready
+    difficulty: hard
+  - slug: missing-metrics
+    name: Assume the worst about missing pods
+    difficulty: hard
+  - slug: scale-subresource
+    name: Scale anything with a scale
+    difficulty: medium
+  - slug: stabilization
+    name: Hold the highest recent recommendation
+    difficulty: medium
+  - slug: behavior-policies
+    name: Limit how fast it grows
+    difficulty: hard
+  - slug: custom-metrics
+    name: Scale on a metric of your own
+    difficulty: medium
+  - slug: external-metrics
+    name: Scale on something outside the cluster
+    difficulty: medium
+  - slug: multi-metric
+    name: Several metrics, one answer
+    difficulty: medium

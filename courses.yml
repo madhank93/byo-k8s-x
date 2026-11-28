@@ -83,7 +83,7 @@ entries:
 
   - slug: hpa
     name: Build your own metrics server and HPA
-    status: planned
+    status: shipped
     tier: the ecosystem
     blurb: Scrape the kubelet, serve metrics.k8s.io, then do the scaling maths.
 
