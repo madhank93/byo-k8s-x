@@ -121,18 +121,18 @@ func newWork(ctx context.Context, env *kube.Env, slug, bin string) (*work, error
 	if err := w.clean(); err != nil {
 		return nil, err
 	}
+	// One exec per node: under load each docker exec costs seconds.
+	setup := fmt.Sprintf("mkdir -p %[1]s/harness %[2]s\n", baseDir, w.dir)
+	for path, body := range map[string]string{
+		baseDir + "/harness/serve.py":   serveScript,
+		baseDir + "/harness/dial.py":    dialScript,
+		baseDir + "/harness/tables.nft": harnessTables,
+	} {
+		setup += fmt.Sprintf("cat > %s <<'BK8S_EOF'\n%sBK8S_EOF\n", path, body)
+	}
+	setup += "nft -f " + baseDir + "/harness/tables.nft\n"
 	for _, n := range []runner.Node{node1, node2} {
-		for path, body := range map[string]string{
-			baseDir + "/harness/serve.py":   serveScript,
-			baseDir + "/harness/dial.py":    dialScript,
-			baseDir + "/harness/tables.nft": harnessTables,
-			w.dir + "/.keep":                "",
-		} {
-			if err := n.WriteFile(ctx, path, []byte(body), 0o644); err != nil {
-				return nil, err
-			}
-		}
-		if _, err := w.sh(n, "nft -f "+baseDir+"/harness/tables.nft"); err != nil {
+		if _, err := w.sh(n, setup); err != nil {
 			return nil, err
 		}
 	}
