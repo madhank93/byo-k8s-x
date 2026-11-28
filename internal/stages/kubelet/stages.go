@@ -148,7 +148,12 @@ func removeNode(ctx context.Context, env *kube.Env, name string) {
 		}
 	}
 	cs.CoordinationV1().Leases("kube-node-lease").Delete(ctx, name, metav1.DeleteOptions{})
-	cs.CoreV1().Nodes().Delete(ctx, name, metav1.DeleteOptions{})
+	// A Node left behind breaks other courses that visit every Node (hpa's
+	// scraper), so keep at it until it is really gone.
+	kube.WaitFor(ctx, "Node "+name+" to be deleted", func(ctx context.Context) (bool, error) {
+		err := cs.CoreV1().Nodes().Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: new(int64)})
+		return apierrors.IsNotFound(err), nil
+	})
 	node.Exec(ctx, 60*time.Second, "sh", "-c", teardown, "teardown", name)
 	node.Exec(ctx, 30*time.Second, "rm", "-rf", "/var/lib/byok8s-kubelet/"+name)
 }

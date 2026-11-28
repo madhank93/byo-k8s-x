@@ -41,14 +41,19 @@ func (w *work) seed() error {
 ctr -n %[1]s images ls -q | grep -qx %[2]s || ctr -n %[1]s images pull --platform %[3]s %[2]s >/dev/null
 ctr -n %[1]s images export --platform %[3]s - %[2]s | ctr -n %[4]s images import --platform %[3]s - >/dev/null`,
 		imageCache, imageRef, arch, w.name)
-	res, err := node.Exec(w.ctx, 60*time.Second, "sh", "-c", script)
-	if err != nil {
-		return err
+	// The export can lose a race with containerd's garbage collector, so a
+	// failed seed is tried again.
+	var res *runner.Result
+	for range 3 {
+		if res, err = node.Exec(w.ctx, 60*time.Second, "sh", "-c", script); err != nil {
+			return err
+		}
+		if res.ExitCode == 0 {
+			return nil
+		}
+		time.Sleep(time.Second)
 	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("seed %s into containerd namespace %s: %s", imageRef, w.name, res.Stderr)
-	}
-	return nil
+	return fmt.Errorf("seed %s into containerd namespace %s: %s", imageRef, w.name, res.Stderr)
 }
 
 // pod is a pod bound straight to the program's Node, in the host's network
