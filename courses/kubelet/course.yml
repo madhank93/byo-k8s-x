@@ -30,3 +30,6 @@ stages:
   - slug: init-containers
     name: Run init containers first
     difficulty: medium
+  - slug: env
+    name: Give containers their environment
+    difficulty: medium

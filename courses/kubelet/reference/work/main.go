@@ -14,6 +14,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -62,7 +64,9 @@ type kubelet struct {
 	ctr    *client.Client
 	root   string
 	ip     string
-	pods   cache.Store
+	// capacity is what the node reports it has.
+	capacity corev1.ResourceList
+	pods     cache.Store
 
 	mu      sync.Mutex
 	workers map[types.UID]bool
@@ -119,6 +123,11 @@ func run() error {
 		return err
 	}
 	k.ip = m.ip
+	k.capacity = corev1.ResourceList{
+		corev1.ResourceCPU:    *resource.NewQuantity(int64(runtime.NumCPU()), resource.DecimalSI),
+		corev1.ResourceMemory: *resource.NewQuantity(m.memBytes, resource.BinarySI),
+		corev1.ResourcePods:   *resource.NewQuantity(110, resource.DecimalSI),
+	}
 	fmt.Println("registered", k.name)
 	k.every(ctx, 10*time.Second, k.postStatus)
 	k.every(ctx, 10*time.Second, k.renewLease)
@@ -587,6 +596,9 @@ func waitingFor(err error) *corev1.ContainerStateWaiting {
 	if _, ok := err.(pullError); ok {
 		return &corev1.ContainerStateWaiting{Reason: "ErrImagePull", Message: err.Error()}
 	}
+	if _, ok := err.(configError); ok {
+		return &corev1.ContainerStateWaiting{Reason: "CreateContainerConfigError", Message: err.Error()}
+	}
 	return &corev1.ContainerStateWaiting{Reason: "CreateContainerError", Message: err.Error()}
 }
 
@@ -699,6 +711,10 @@ func (k *kubelet) inspect(ctx context.Context, c client.Container, labels map[st
 
 // startContainer creates container c of pod p in containerd and starts it.
 func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.Container, restart int) error {
+	env, vars, err := k.containerEnv(ctx, p, c)
+	if err != nil {
+		return err
+	}
 	img, err := k.image(ctx, c.Image)
 	if err != nil {
 		return err
@@ -714,7 +730,8 @@ func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.C
 	id := randomID()
 	opts := []oci.SpecOpts{
 		oci.WithImageConfig(img),
-		oci.WithProcessArgs(argv(cfg.Config.Entrypoint, cfg.Config.Cmd, c.Command, c.Args)...),
+		oci.WithProcessArgs(argv(cfg.Config.Entrypoint, cfg.Config.Cmd, expandAll(c.Command, vars), expandAll(c.Args, vars))...),
+		oci.WithEnv(env),
 		oci.WithHostNamespace(specs.NetworkNamespace),
 		oci.WithHostHostsFile,
 		oci.WithHostResolvconf,
@@ -931,4 +948,204 @@ func randomID() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// configError is a container whose spec names config that cannot be had.
+type configError struct{ error }
+
+// containerEnv is c's environment, in order: envFrom, then env, each value
+// with the $(VAR) references to variables before it expanded.
+func (k *kubelet) containerEnv(ctx context.Context, p *corev1.Pod, c *corev1.Container) ([]string, map[string]string, error) {
+	vars := map[string]string{}
+	var order []string
+	set := func(name, value string) {
+		if _, ok := vars[name]; !ok {
+			order = append(order, name)
+		}
+		vars[name] = value
+	}
+	for _, from := range c.EnvFrom {
+		data, err := k.envFromSource(ctx, p.Namespace, from)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, key := range slices.Sorted(maps.Keys(data)) {
+			set(from.Prefix+key, data[key])
+		}
+	}
+	for _, e := range c.Env {
+		if e.ValueFrom == nil {
+			set(e.Name, expand(e.Value, vars))
+			continue
+		}
+		v, ok, err := k.envValue(ctx, p, c, e.ValueFrom)
+		if err != nil {
+			return nil, nil, configError{fmt.Errorf("env %s: %w", e.Name, err)}
+		}
+		if ok {
+			set(e.Name, v)
+		}
+	}
+	env := make([]string, 0, len(order))
+	for _, name := range order {
+		env = append(env, name+"="+vars[name])
+	}
+	return env, vars, nil
+}
+
+func (k *kubelet) envFromSource(ctx context.Context, ns string, from corev1.EnvFromSource) (map[string]string, error) {
+	switch {
+	case from.ConfigMapRef != nil:
+		cm, err := k.cs.CoreV1().ConfigMaps(ns).Get(ctx, from.ConfigMapRef.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) && ptrTrue(from.ConfigMapRef.Optional) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, configError{err}
+		}
+		return cm.Data, nil
+	case from.SecretRef != nil:
+		s, err := k.cs.CoreV1().Secrets(ns).Get(ctx, from.SecretRef.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) && ptrTrue(from.SecretRef.Optional) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, configError{err}
+		}
+		data := map[string]string{}
+		for key, v := range s.Data {
+			data[key] = string(v)
+		}
+		return data, nil
+	}
+	return nil, nil
+}
+
+// envValue resolves a valueFrom; ok is false for an optional source that
+// is missing, which sets nothing.
+func (k *kubelet) envValue(ctx context.Context, p *corev1.Pod, c *corev1.Container, src *corev1.EnvVarSource) (v string, ok bool, err error) {
+	switch {
+	case src.FieldRef != nil:
+		v, err = k.podField(p, src.FieldRef.FieldPath)
+		return v, err == nil, err
+	case src.ResourceFieldRef != nil:
+		v, err = k.resourceField(c, src.ResourceFieldRef)
+		return v, err == nil, err
+	case src.ConfigMapKeyRef != nil:
+		r := src.ConfigMapKeyRef
+		cm, err := k.cs.CoreV1().ConfigMaps(p.Namespace).Get(ctx, r.Name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) && ptrTrue(r.Optional) {
+				return "", false, nil
+			}
+			return "", false, err
+		}
+		v, ok = cm.Data[r.Key]
+		if !ok && !ptrTrue(r.Optional) {
+			return "", false, fmt.Errorf("ConfigMap %s has no key %s", r.Name, r.Key)
+		}
+		return v, ok, nil
+	case src.SecretKeyRef != nil:
+		r := src.SecretKeyRef
+		s, err := k.cs.CoreV1().Secrets(p.Namespace).Get(ctx, r.Name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) && ptrTrue(r.Optional) {
+				return "", false, nil
+			}
+			return "", false, err
+		}
+		b, ok := s.Data[r.Key]
+		if !ok && !ptrTrue(r.Optional) {
+			return "", false, fmt.Errorf("Secret %s has no key %s", r.Name, r.Key)
+		}
+		return string(b), ok, nil
+	}
+	return "", false, nil
+}
+
+// podField is the downward API: a field of the pod, by its path.
+func (k *kubelet) podField(p *corev1.Pod, path string) (string, error) {
+	if key, ok := strings.CutPrefix(path, "metadata.labels['"); ok {
+		return p.Labels[strings.TrimSuffix(key, "']")], nil
+	}
+	if key, ok := strings.CutPrefix(path, "metadata.annotations['"); ok {
+		return p.Annotations[strings.TrimSuffix(key, "']")], nil
+	}
+	switch path {
+	case "metadata.name":
+		return p.Name, nil
+	case "metadata.namespace":
+		return p.Namespace, nil
+	case "metadata.uid":
+		return string(p.UID), nil
+	case "spec.nodeName":
+		return p.Spec.NodeName, nil
+	case "spec.serviceAccountName":
+		return p.Spec.ServiceAccountName, nil
+	case "status.hostIP", "status.podIP":
+		return k.ip, nil
+	}
+	return "", fmt.Errorf("unsupported fieldPath %s", path)
+}
+
+// resourceField is a container's request or limit, in units of the
+// divisor, rounded up; a limit that is unset is the node's capacity.
+func (k *kubelet) resourceField(c *corev1.Container, r *corev1.ResourceFieldSelector) (string, error) {
+	kind, name, _ := strings.Cut(r.Resource, ".")
+	list := c.Resources.Limits
+	if kind == "requests" {
+		list = c.Resources.Requests
+	}
+	q, ok := list[corev1.ResourceName(name)]
+	if !ok {
+		q = k.capacity[corev1.ResourceName(name)]
+	}
+	divisor := r.Divisor
+	if divisor.IsZero() {
+		divisor = resource.MustParse("1")
+	}
+	return strconv.FormatInt(int64(math.Ceil(float64(q.MilliValue())/float64(divisor.MilliValue()))), 10), nil
+}
+
+func ptrTrue(b *bool) bool { return b != nil && *b }
+
+// expand replaces $(NAME) with the variable's value when it is defined and
+// leaves it as written when not; $$ is a literal $.
+func expand(s string, vars map[string]string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '$' || i+1 == len(s) {
+			b.WriteByte(s[i])
+			continue
+		}
+		switch s[i+1] {
+		case '$':
+			b.WriteByte('$')
+			i++
+		case '(':
+			end := strings.IndexByte(s[i+2:], ')')
+			if end < 0 {
+				b.WriteByte('$')
+				continue
+			}
+			name := s[i+2 : i+2+end]
+			if v, ok := vars[name]; ok {
+				b.WriteString(v)
+			} else {
+				b.WriteString(s[i : i+3+end])
+			}
+			i += 2 + end
+		default:
+			b.WriteByte('$')
+		}
+	}
+	return b.String()
+}
+
+func expandAll(args []string, vars map[string]string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = expand(a, vars)
+	}
+	return out
 }
