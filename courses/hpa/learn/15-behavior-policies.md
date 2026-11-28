@@ -49,6 +49,16 @@ Apply the limit after stabilization and before clamping to
 is `min(desired, max(current, limit))`.
 </details>
 
+<details><summary>Approach</summary>
+
+Record a scaling event (time, replicas before, replicas after) each time you
+write `/scale`, and keep half an hour of them, since no period is longer.
+For each policy, its period's start is the "before" of the oldest event
+inside the period, or `currentReplicas` if there is none. Work out each
+policy's limit from its start, pick one by `selectPolicy`, and cap the
+recommendation with it.
+</details>
+
 ## Further reading
 
 - [Scaling policies](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#scaling-policies)

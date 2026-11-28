@@ -608,7 +608,9 @@ func (a *autoscaler) sync(ctx context.Context, obj *unstructured.Unstructured) e
 	if err != nil {
 		return err
 	}
-	current := scale.Status.Replicas
+	// Current is the replicas asked for, not those running yet, so a scaling
+	// still rolling out is not decided again from a half-started count.
+	current := scale.Spec.Replicas
 	hpa.Status.CurrentReplicas = current
 	sel, err := labels.Parse(scale.Status.Selector)
 	if err != nil {

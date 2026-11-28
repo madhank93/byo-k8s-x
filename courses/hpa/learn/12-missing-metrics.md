@@ -37,6 +37,17 @@ the metrics list. Build that set in the same loop that sorts pods into ready
 and unready.
 </details>
 
+<details><summary>Approach</summary>
+
+The second pass now has two inputs: missing pods filled with their request
+or with zero, depending on the first ratio, and unready pods filled with
+zero when scaling up. Recompute, then apply the two guards in order. First,
+the new ratio inside the tolerance or on the other side of 1.0 keeps
+`currentReplicas`. Second, a count that moved against the ratio's direction
+keeps it too. Count the pods for `ceil(newRatio × n)` from the filled-in map,
+not from the ready pods.
+</details>
+
 ## Further reading
 
 - [Algorithm details](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#algorithm-details)

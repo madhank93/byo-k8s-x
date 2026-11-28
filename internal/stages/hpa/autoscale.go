@@ -222,9 +222,16 @@ func (r *rig) workload(ctx context.Context, name string, replicas int, ready fun
 	return names, nil
 }
 
+// setWorkloadReplicas sets a Workload's spec.replicas, which its scale reports
+// as the replicas wanted and an autoscaler starts from, and its status.
 func (r *rig) setWorkloadReplicas(ctx context.Context, name string, replicas int) error {
-	patch := fmt.Sprintf(`{"status":{"replicas":%d,"selector":"app=%s"}}`, replicas, name)
-	_, err := r.dyn.Resource(workloadGVR).Namespace(r.env.Namespace).Patch(ctx, name, types.MergePatchType, []byte(patch), metav1.PatchOptions{}, "status")
+	wl := r.dyn.Resource(workloadGVR).Namespace(r.env.Namespace)
+	spec := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
+	if _, err := wl.Patch(ctx, name, types.MergePatchType, []byte(spec), metav1.PatchOptions{}); err != nil {
+		return err
+	}
+	status := fmt.Sprintf(`{"status":{"replicas":%d,"selector":"app=%s"}}`, replicas, name)
+	_, err := wl.Patch(ctx, name, types.MergePatchType, []byte(status), metav1.PatchOptions{}, "status")
 	return err
 }
 
@@ -441,7 +448,8 @@ func stageTolerance(ctx context.Context, env *kube.Env, bin string) error {
 }
 
 // stageReadinessWindow — for CPU, an unready pod's usage is not evidence: it
-// is dropped, and when the rest say scale up it counts as zero.
+// is dropped, and when the rest say scale up it counts as zero. The hold is
+// graded first, while spec.replicas is still the 4 it must hold at.
 func stageReadinessWindow(ctx context.Context, env *kube.Env, bin string) error {
 	r, stop, err := startRig(ctx, env, bin)
 	if err != nil {
@@ -461,15 +469,15 @@ func stageReadinessWindow(ctx context.Context, env *kube.Env, bin string) error 
 			return ready, true
 		}
 	}
-	r.metrics.setCPU(load(20, 75))
+	r.metrics.setCPU(load(50, 75))
 	if err := r.toWorkload(ctx, "web", "web", 1, 10, pinned, cpuMetric(50)); err != nil {
 		return err
 	}
-	if err := r.expect(ctx, "web", 40, 2, "two ready pods at 40%; the two unready ones spinning at 150% are starting up, not serving, and are left out"); err != nil {
+	if err := r.expect(ctx, "web", 100, 4, "the ready pods at 100% say scale up; counting the unready pods as idle brings the ratio to 1.0, so nothing changes"); err != nil {
 		return err
 	}
-	r.metrics.setCPU(load(50, 75))
-	return r.expect(ctx, "web", 100, 4, "the ready pods at 100% say scale up; counting the unready pods as idle brings the ratio to 1.0, so nothing changes")
+	r.metrics.setCPU(load(20, 75))
+	return r.expect(ctx, "web", 40, 2, "two ready pods at 40%; the two unready ones spinning at 150% are starting up, not serving, and are left out")
 }
 
 // stageMissingMetrics — a pod with no metrics is assumed to be at 100% of its
@@ -603,7 +611,7 @@ func stageStabilization(ctx context.Context, env *kube.Env, bin string) error {
 	}); err != nil {
 		return err
 	}
-	if err := r.holds(ctx, "web", 8*time.Second, "the load fell seconds ago and a 20s scale-down window still holds a recommendation of 8, so desiredReplicas must not drop below the current 4", func(s hpaStatus) bool {
+	if err := r.holds(ctx, "web", 8*time.Second, "the load fell seconds ago and a 20s scale-down window still holds a recommendation of 8, so desiredReplicas must not drop below 4", func(s hpaStatus) bool {
 		return s.DesiredReplicas != nil && *s.DesiredReplicas >= 4
 	}); err != nil {
 		return err
@@ -789,7 +797,7 @@ func stageMultiMetric(ctx context.Context, env *kube.Env, bin string) error {
 	}); err != nil {
 		return err
 	}
-	return r.holds(ctx, "web", 8*time.Second, "requests_per_second cannot be read, and cpu alone says scale down to 1 — with a metric unknown, a scale-down is not safe, so desiredReplicas must not fall below the current 4", func(s hpaStatus) bool {
+	return r.holds(ctx, "web", 8*time.Second, "requests_per_second cannot be read, and cpu alone says scale down to 1 — with a metric unknown, a scale-down is not safe, so desiredReplicas must not fall", func(s hpaStatus) bool {
 		return s.DesiredReplicas != nil && *s.DesiredReplicas >= 4
 	})
 }

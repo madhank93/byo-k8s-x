@@ -34,8 +34,12 @@ GET /apis/apps/v1/namespaces/<ns>/deployments/api/scale
 
 So the autoscaler never has to know what a Deployment is. It turns
 `apiVersion` + `kind` into a resource with a RESTMapper, then reads `/scale`.
-`status.replicas` is how many replicas exist now. That number becomes the
-Autoscaler's `status.currentReplicas`.
+`spec.replicas` is how many replicas the target has been asked for. That
+number becomes the Autoscaler's `status.currentReplicas`, and every decision
+starts from it. `status.replicas`, the count running now, lags behind after
+every scaling. Deciding from it would see a scale-up still rolling out as
+too few pods, and ask for them again. This is what the real controller does
+too.
 
 A target's replica count changes without its Autoscaler changing, so a watch
 on Autoscalers alone never notices. The real controller resyncs every

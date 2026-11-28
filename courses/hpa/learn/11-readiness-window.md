@@ -49,6 +49,16 @@ Keep the usage in a map by pod name, and the requests in another. Setting
 function again is the whole second pass.
 </details>
 
+<details><summary>Approach</summary>
+
+One loop over the target's pods builds three things: requests by pod name,
+usage by pod name for the ready pods, and a list of unready names. Work the
+ratio out from the usage map and decide. Only when the decision is to scale
+up with unready pods present do you add zeros and decide again. Guard
+against a reversal: if the second ratio falls to 1.0 or below, keep
+`currentReplicas`.
+</details>
+
 ## Further reading
 
 - [Algorithm details](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#algorithm-details)
