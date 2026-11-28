@@ -440,10 +440,26 @@ func stageResult(w *work) error {
 // stageSysctls — sysctls from the config are set inside the container's
 // netns, never the node's, and only net.* ones are accepted.
 func stageSysctls(w *work) error {
-	before, err := w.sh(node1, "sysctl -n net.ipv4.ip_unprivileged_port_start kernel.domainname")
+	const keys = "net.ipv4.ip_unprivileged_port_start net.ipv4.ping_group_range kernel.domainname"
+	before, err := w.sh(node1, "sysctl -n "+keys)
 	if err != nil {
 		return err
 	}
+	// A plugin that writes the node's sysctls instead of the container's
+	// changes them for every pod on a shared node, so put them back.
+	saved, err := w.sh(node1, "sysctl "+keys)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		var args []string
+		for _, l := range strings.Split(strings.TrimSpace(saved), "\n") {
+			if k, v, ok := strings.Cut(l, " = "); ok {
+				args = append(args, "'"+k+"="+strings.ReplaceAll(v, "\t", " ")+"'")
+			}
+		}
+		w.sh(node1, "sysctl -q -w "+strings.Join(args, " "))
+	}()
 	_, ns, err := w.add(node1, "c", w.conf(map[string]any{
 		"bridge": w.bridge(), "ipam": w.pool(w.subnet()),
 		"sysctl": map[string]any{"net.ipv4.ip_unprivileged_port_start": "80", "net.ipv4.ping_group_range": "0 1000"},
@@ -471,7 +487,7 @@ func stageSysctls(w *work) error {
 	if err := wantCNIError(res, 0, "kernel.domainname is not a network sysctl"); err != nil {
 		return err
 	}
-	after, err := w.sh(node1, "sysctl -n net.ipv4.ip_unprivileged_port_start kernel.domainname")
+	after, err := w.sh(node1, "sysctl -n "+keys)
 	if err != nil {
 		return err
 	}
