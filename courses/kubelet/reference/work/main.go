@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"maps"
 	"math"
 	"net"
@@ -375,6 +377,9 @@ type worker struct {
 	key string
 	// waiting says why a container that should be running is not.
 	waiting map[string]*corev1.ContainerStateWaiting
+	// paths is where this sync set up the pod's volumes, or volErr why not.
+	paths  map[string]string
+	volErr error
 }
 
 // podWorker syncs one pod every second for as long as it exists.
@@ -408,6 +413,9 @@ func (k *kubelet) syncPod(ctx context.Context, w *worker, p *corev1.Pod) error {
 	if err != nil {
 		return err
 	}
+	// Volumes are set up on every sync, so ConfigMap and Secret files
+	// follow their objects.
+	w.paths, w.volErr = k.volumes(ctx, p)
 	initialized, failed := initDone(p, states)
 	if !initialized && !failed {
 		// Init containers run one at a time: the first not yet done.
@@ -448,7 +456,11 @@ func (k *kubelet) ensure(ctx context.Context, w *worker, p *corev1.Pod, c *corev
 			return
 		}
 	}
-	if err := k.startContainer(ctx, p, c, restart); err != nil {
+	if w.volErr != nil {
+		w.waiting[c.Name] = waitingFor(w.volErr)
+		return
+	}
+	if err := k.startContainer(ctx, p, c, restart, w.paths); err != nil {
 		w.waiting[c.Name] = waitingFor(err)
 		fmt.Fprintf(os.Stderr, "error: start container %s of %s: %v\n", c.Name, w.key, err)
 		return
@@ -599,6 +611,9 @@ func waitingFor(err error) *corev1.ContainerStateWaiting {
 	if _, ok := err.(pullError); ok {
 		return &corev1.ContainerStateWaiting{Reason: "ErrImagePull", Message: err.Error()}
 	}
+	if _, ok := err.(volumeError); ok {
+		return &corev1.ContainerStateWaiting{Reason: "ContainerCreating", Message: err.Error()}
+	}
 	if _, ok := err.(configError); ok {
 		return &corev1.ContainerStateWaiting{Reason: "CreateContainerConfigError", Message: err.Error()}
 	}
@@ -713,12 +728,8 @@ func (k *kubelet) inspect(ctx context.Context, c client.Container, labels map[st
 }
 
 // startContainer creates container c of pod p in containerd and starts it.
-func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.Container, restart int) error {
+func (k *kubelet) startContainer(ctx context.Context, p *corev1.Pod, c *corev1.Container, restart int, paths map[string]string) error {
 	env, vars, err := k.containerEnv(ctx, p, c)
-	if err != nil {
-		return err
-	}
-	paths, err := k.volumes(p)
 	if err != nil {
 		return err
 	}
@@ -1168,7 +1179,7 @@ func (k *kubelet) podDir(uid types.UID) string {
 }
 
 // volumes makes p's volumes on the node and returns where each one is.
-func (k *kubelet) volumes(p *corev1.Pod) (map[string]string, error) {
+func (k *kubelet) volumes(ctx context.Context, p *corev1.Pod) (map[string]string, error) {
 	paths := map[string]string{}
 	for _, v := range p.Spec.Volumes {
 		switch {
@@ -1181,6 +1192,34 @@ func (k *kubelet) volumes(p *corev1.Pod) (map[string]string, error) {
 				if err := syscall.Mount("tmpfs", dir, "tmpfs", 0, ""); err != nil {
 					return nil, fmt.Errorf("mount tmpfs for volume %s: %w", v.Name, err)
 				}
+			}
+			paths[v.Name] = dir
+		case v.ConfigMap != nil:
+			dir := filepath.Join(k.podDir(p.UID), "volumes", "kubernetes.io~configmap", v.Name)
+			files, err := k.configMapFiles(ctx, p.Namespace, v.ConfigMap)
+			if err != nil {
+				return nil, volumeError{fmt.Errorf("volume %s: %w", v.Name, err)}
+			}
+			if err := writeFiles(dir, files); err != nil {
+				return nil, err
+			}
+			paths[v.Name] = dir
+		case v.Secret != nil:
+			dir := filepath.Join(k.podDir(p.UID), "volumes", "kubernetes.io~secret", v.Name)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return nil, err
+			}
+			if !mounted(dir) {
+				if err := syscall.Mount("tmpfs", dir, "tmpfs", 0, ""); err != nil {
+					return nil, fmt.Errorf("mount tmpfs for volume %s: %w", v.Name, err)
+				}
+			}
+			files, err := k.secretFiles(ctx, p.Namespace, v.Secret)
+			if err != nil {
+				return nil, volumeError{fmt.Errorf("volume %s: %w", v.Name, err)}
+			}
+			if err := writeFiles(dir, files); err != nil {
+				return nil, err
 			}
 			paths[v.Name] = dir
 		case v.HostPath != nil:
@@ -1238,4 +1277,109 @@ func (k *kubelet) removeVolumes(uid types.UID) error {
 		}
 	}
 	return os.RemoveAll(k.podDir(uid))
+}
+
+// volumeError is a volume that cannot be set up yet.
+type volumeError struct{ error }
+
+// file is one file of a ConfigMap or Secret volume.
+type file struct {
+	data []byte
+	mode os.FileMode
+}
+
+func (k *kubelet) configMapFiles(ctx context.Context, ns string, src *corev1.ConfigMapVolumeSource) (map[string]file, error) {
+	cm, err := k.cs.CoreV1().ConfigMaps(ns).Get(ctx, src.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) && ptrTrue(src.Optional) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	data := map[string][]byte{}
+	for key, v := range cm.Data {
+		data[key] = []byte(v)
+	}
+	maps.Copy(data, cm.BinaryData)
+	return keyFiles(data, src.Items, src.DefaultMode)
+}
+
+func (k *kubelet) secretFiles(ctx context.Context, ns string, src *corev1.SecretVolumeSource) (map[string]file, error) {
+	s, err := k.cs.CoreV1().Secrets(ns).Get(ctx, src.SecretName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) && ptrTrue(src.Optional) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return keyFiles(s.Data, src.Items, src.DefaultMode)
+}
+
+// keyFiles lays an object's keys out as files: every key under its own
+// name, or only the items, each at its path.
+func keyFiles(data map[string][]byte, items []corev1.KeyToPath, defaultMode *int32) (map[string]file, error) {
+	mode := os.FileMode(0o644)
+	if defaultMode != nil {
+		mode = os.FileMode(*defaultMode)
+	}
+	out := map[string]file{}
+	if len(items) == 0 {
+		for key, v := range data {
+			out[key] = file{v, mode}
+		}
+		return out, nil
+	}
+	for _, it := range items {
+		v, ok := data[it.Key]
+		if !ok {
+			return nil, fmt.Errorf("no key %s", it.Key)
+		}
+		m := mode
+		if it.Mode != nil {
+			m = os.FileMode(*it.Mode)
+		}
+		out[it.Path] = file{v, m}
+	}
+	return out, nil
+}
+
+// writeFiles makes dir hold exactly files. Each is written to a temporary
+// name and renamed into place, so a reader never sees half a file.
+// ponytail: per-file swaps; the real kubelet swaps a ..data symlink so all
+// files change at once.
+func writeFiles(dir string, files map[string]file) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for name, f := range files {
+		path := filepath.Join(dir, name)
+		if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, f.data) {
+			if st, err := os.Stat(path); err == nil && st.Mode().Perm() == f.mode {
+				continue
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, f.data, f.mode); err != nil {
+			return err
+		}
+		if err := os.Chmod(tmp, f.mode); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			return err
+		}
+	}
+	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, path)
+		if _, ok := files[rel]; !ok {
+			return os.Remove(path)
+		}
+		return nil
+	})
 }

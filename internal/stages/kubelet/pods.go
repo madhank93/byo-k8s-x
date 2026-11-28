@@ -1634,3 +1634,144 @@ spec:
 	}
 	return w.gone(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: mirror, Namespace: m.Namespace}}, 20*time.Second, "the static pod stopped, so its mirror pod goes")
 }
+
+// stageReconcile — the kubelet's state is containerd's, not its own memory:
+// stopping it leaves its pods running, and a restarted kubelet adopts the
+// containers of pods that still exist and removes those whose pods are
+// gone.
+func stageReconcile(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	keep, err := w.create(w.pod("keep", corev1.RestartPolicyAlways, corev1.Container{Name: "main", Command: []string{"sleep", "3600"}}))
+	if err != nil {
+		return err
+	}
+	orphan, err := w.create(w.pod("orphan", corev1.RestartPolicyAlways, corev1.Container{Name: "main", Command: []string{"sleep", "3600"}}))
+	if err != nil {
+		return err
+	}
+	if _, err := w.phase("keep", corev1.PodRunning, 40*time.Second); err != nil {
+		return err
+	}
+	c, err := w.running(keep, "main", 10*time.Second)
+	if err != nil {
+		return err
+	}
+	if _, err := w.running(orphan, "main", 10*time.Second); err != nil {
+		return err
+	}
+
+	w.p.Stop(10 * time.Second)
+	if again, err := w.running(keep, "main", 3*time.Second); err != nil || again.ID != c.ID {
+		return fmt.Errorf("the kubelet was stopped and took pod keep's container with it; a kubelet's pods outlive it")
+	}
+	if err := w.env.Client.CoreV1().Pods(orphan.Namespace).Delete(ctx, orphan.Name, metav1.DeleteOptions{GracePeriodSeconds: new(int64)}); err != nil {
+		return err
+	}
+	if err := w.launch(); err != nil {
+		return err
+	}
+
+	ctx2, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	var left []ctrContainer
+	if err := kube.WaitFor(ctx2, "the orphan's container to be removed", func(ctx context.Context) (bool, error) {
+		if err := w.alive(); err != nil {
+			return false, err
+		}
+		cs, err := w.containers()
+		if err != nil {
+			return false, err
+		}
+		left = of(cs, orphan, "main")
+		return len(left) == 0, nil
+	}); err != nil {
+		return fmt.Errorf("%w: pod orphan was deleted while the kubelet was down, so the restarted kubelet finds its container with no pod and removes it; containerd still holds %s", err, describe(left))
+	}
+	if again, err := w.running(keep, "main", 5*time.Second); err != nil {
+		return err
+	} else if again.ID != c.ID {
+		return fmt.Errorf("pod keep's container was replaced after the restart; a running container of a pod that still exists is adopted as it is")
+	}
+	p, err := w.env.Client.CoreV1().Pods(keep.Namespace).Get(ctx, keep.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if p.Status.Phase != corev1.PodRunning || restarts(p, "main") != 0 || containerStatus(p, "main").ContainerID != "containerd://"+c.ID {
+		return fmt.Errorf("after the restart pod keep should still be Running, on the same container, with no restarts; status is %s", statusJSON(p))
+	}
+	return nil
+}
+
+// stageEviction — the kubelet evicts a pod whose emptyDir outgrows its
+// sizeLimit: its containers are killed, nothing restarts them, and the pod
+// stays behind, Failed with reason Evicted, to say why.
+func stageEviction(ctx context.Context, env *kube.Env, bin string) error {
+	w, err := start(ctx, env, bin)
+	if err != nil {
+		return err
+	}
+	defer w.close()
+	if err := w.seed(); err != nil {
+		return err
+	}
+	scratch := func(name, limit string, mb int) *corev1.Pod {
+		p := w.pod(name, corev1.RestartPolicyAlways, corev1.Container{
+			Name:         "main",
+			Command:      []string{"sh", "-c", fmt.Sprintf("dd if=/dev/zero of=/data/f bs=1M count=%d; sleep 3600", mb)},
+			VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
+		})
+		size := resource.MustParse(limit)
+		p.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &size}}}}
+		return p
+	}
+	hog, err := w.create(scratch("hog", "1Mi", 4))
+	if err != nil {
+		return err
+	}
+	if _, err := w.create(scratch("fine", "10Mi", 1)); err != nil {
+		return err
+	}
+	p, err := w.phase("hog", corev1.PodFailed, 40*time.Second)
+	if err != nil {
+		return fmt.Errorf("pod hog writes 4MiB to an emptyDir with sizeLimit 1Mi, so the kubelet evicts it: %w", err)
+	}
+	switch {
+	case p.Status.Reason != "Evicted":
+		return fmt.Errorf("pod hog failed with reason %q; an evicted pod's reason is Evicted", p.Status.Reason)
+	case !strings.Contains(p.Status.Message, "data"):
+		return fmt.Errorf("pod hog's message is %q; it should name the volume, data, that went over its limit", p.Status.Message)
+	case podCondition(p, corev1.DisruptionTarget) != corev1.ConditionTrue:
+		return fmt.Errorf("an evicted pod carries condition DisruptionTarget=True (reason TerminationByKubelet); status is %s", statusJSON(p))
+	}
+	if err := w.stopped(hog, 15*time.Second, "pod hog was evicted, so its containers are killed"); err != nil {
+		return err
+	}
+	time.Sleep(3 * time.Second)
+	p, err = w.env.Client.CoreV1().Pods(hog.Namespace).Get(ctx, hog.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("pod hog is gone (%v); an evicted pod stays, Failed, until someone deletes it", err)
+	}
+	if p.Status.Phase != corev1.PodFailed || restarts(p, "main") != 0 {
+		return fmt.Errorf("an evicted pod is done: nothing restarts it, whatever its restartPolicy; status is %s", statusJSON(p))
+	}
+	if cs, err := w.containers(); err != nil {
+		return err
+	} else if c := of(cs, hog, "main"); len(c) != 1 || c[0].Status == "RUNNING" {
+		return fmt.Errorf("pod hog's container should have been killed and not run again; containerd holds %s", describe(c))
+	}
+	p, err = w.env.Client.CoreV1().Pods(hog.Namespace).Get(ctx, "fine", metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if p.Status.Phase != corev1.PodRunning {
+		return fmt.Errorf("pod fine stays inside its 10Mi limit and should still be Running; status is %s", statusJSON(p))
+	}
+	return nil
+}

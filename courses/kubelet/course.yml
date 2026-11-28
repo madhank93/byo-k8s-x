@@ -36,3 +36,6 @@ stages:
   - slug: volumes
     name: Mount emptyDir and hostPath volumes
     difficulty: medium
+  - slug: config-volumes
+    name: Project ConfigMaps and Secrets into files
+    difficulty: medium

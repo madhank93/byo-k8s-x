@@ -63,6 +63,8 @@ func init() {
 	register(Stage{Slug: "readiness-probe", Run: stageReadinessProbe})
 	register(Stage{Slug: "lifecycle-hooks", Run: stageLifecycleHooks})
 	register(Stage{Slug: "static-pod", Run: stageStaticPod})
+	register(Stage{Slug: "reconcile", Run: stageReconcile})
+	register(Stage{Slug: "eviction", Run: stageEviction})
 }
 
 // node is the worker the program runs in.
