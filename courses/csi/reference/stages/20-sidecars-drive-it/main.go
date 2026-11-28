@@ -462,9 +462,9 @@ func (d *driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	if v.FsType == "" {
-		err = bindOnce(d.dataPath(v.ID), req.StagingTargetPath, false)
+		err = bindOnce(d.dataPath(v.ID), req.StagingTargetPath, false, mountFlags(req.VolumeCapability))
 	} else {
-		err = d.mountImage(v, req.StagingTargetPath)
+		err = d.mountImage(v, req.StagingTargetPath, mountFlags(req.VolumeCapability))
 	}
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
@@ -475,7 +475,7 @@ func (d *driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 // mountImage attaches the volume's image as a loop device and mounts its
 // filesystem at path, making the filesystem first if the image has none.
 // mount's loop option sets autoclear, so the last unmount detaches the device.
-func (d *driver) mountImage(v *volume, path string) error {
+func (d *driver) mountImage(v *volume, path string, flags []string) error {
 	if ok, err := mounted(path); err != nil || ok {
 		return err
 	}
@@ -490,7 +490,7 @@ func (d *driver) mountImage(v *volume, path string) error {
 	} else if err != nil {
 		return fmt.Errorf("blkid %s: %w", img, err)
 	}
-	if out, err := exec.Command("mount", "-t", v.FsType, "-o", "loop", img, path).CombinedOutput(); err != nil {
+	if out, err := exec.Command("mount", "-t", v.FsType, "-o", strings.Join(append([]string{"loop"}, flags...), ","), img, path).CombinedOutput(); err != nil {
 		return fmt.Errorf("mount %s: %w: %s", img, err, out)
 	}
 	return nil
@@ -498,7 +498,7 @@ func (d *driver) mountImage(v *volume, path string) error {
 
 // bindOnce bind-mounts src at dst unless something is mounted there already,
 // so a retried call does not stack a second mount.
-func bindOnce(src, dst string, readonly bool) error {
+func bindOnce(src, dst string, readonly bool, flags []string) error {
 	if ok, err := mounted(dst); err != nil || ok {
 		return err
 	}
@@ -506,13 +506,23 @@ func bindOnce(src, dst string, readonly bool) error {
 		return fmt.Errorf("bind %s at %s: %w", src, dst, err)
 	}
 	if readonly {
-		// A bind mount takes its source's flags; read-only needs a remount.
-		if err := syscall.Mount("", dst, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY, ""); err != nil {
+		flags = append(flags, "ro")
+	}
+	if len(flags) > 0 {
+		// A bind mount takes its source's flags; its own need a remount.
+		opts := "remount,bind," + strings.Join(flags, ",")
+		if out, err := exec.Command("mount", "-o", opts, dst).CombinedOutput(); err != nil {
 			syscall.Unmount(dst, 0)
-			return fmt.Errorf("remount %s read-only: %w", dst, err)
+			return fmt.Errorf("mount -o %s %s: %w: %s", opts, dst, err, out)
 		}
 	}
 	return nil
+}
+
+// mountFlags are the mount options the CO asks for, such as a
+// StorageClass's mountOptions.
+func mountFlags(c *csi.VolumeCapability) []string {
+	return slices.Clone(c.GetMount().GetMountFlags())
 }
 
 // mounted is whether anything is mounted exactly on path.
@@ -553,7 +563,7 @@ func (d *driver) NodePublishVolume(_ context.Context, req *csi.NodePublishVolume
 	if err := os.MkdirAll(req.TargetPath, 0o755); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	if err := bindOnce(req.StagingTargetPath, req.TargetPath, req.Readonly); err != nil {
+	if err := bindOnce(req.StagingTargetPath, req.TargetPath, req.Readonly, mountFlags(req.VolumeCapability)); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &csi.NodePublishVolumeResponse{}, nil
@@ -745,7 +755,7 @@ func (d *driver) publishEphemeral(req *csi.NodePublishVolumeRequest) (*csi.NodeP
 	if err := os.MkdirAll(req.TargetPath, 0o755); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	if err := bindOnce(d.dataPath(v.ID), req.TargetPath, req.Readonly); err != nil {
+	if err := bindOnce(d.dataPath(v.ID), req.TargetPath, req.Readonly, mountFlags(req.VolumeCapability)); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &csi.NodePublishVolumeResponse{}, nil

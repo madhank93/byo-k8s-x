@@ -250,6 +250,8 @@ func stageSidecars(ctx context.Context, env *kube.Env, bin string) error {
 		Provisioner:       w.name,
 		VolumeBindingMode: &wffc,
 		ReclaimPolicy:     &del,
+		// The kubelet passes these to the driver as mount_flags.
+		MountOptions: []string{"noexec"},
 	}
 	scs := env.Client.StorageV1().StorageClasses()
 	if _, err := scs.Create(ctx, sc, metav1.CreateOptions{}); err != nil {
@@ -298,6 +300,13 @@ func stageSidecars(ctx context.Context, env *kube.Env, bin string) error {
 	mnt := volumeMount(app, pv.Name)
 	if err := w.wantMounted(mnt, "the pod's volume"); err != nil {
 		return err
+	}
+	opts, err := w.sh("findmnt -rn -o OPTIONS -M " + mnt)
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(strings.Split(strings.TrimSpace(opts), ","), "noexec") {
+		return fmt.Errorf("the pod's volume is mounted %s; the StorageClass's mountOptions are [noexec], which reach the driver as the capability's mount_flags", strings.TrimSpace(opts))
 	}
 	if err := waitFile(w, mnt+"/hello", marker); err != nil {
 		return err

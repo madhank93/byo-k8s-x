@@ -23,13 +23,19 @@ Kubernetes:
 5. Deleting the pod unpublishes and unstages; deleting the claim makes the
    provisioner call `DeleteVolume` and remove the PersistentVolume.
 
-Nothing here is new to your driver. What is new is that every call comes from
-real Kubernetes code, with the arguments and retries it really uses — the
-point of a spec is that a driver written against it works with a CO it has
-never met.
+Almost nothing here is new to your driver. What is new is that every call
+comes from real Kubernetes code, with the arguments and retries it really
+uses — the point of a spec is that a driver written against it works with a
+CO it has never met.
 
-This stage: a pod with a claim of your StorageClass runs, writes, and leaves
-nothing behind when it and its claim are deleted.
+The one new argument: the StorageClass sets `mountOptions: [noexec]`. The
+PersistentVolume inherits them, and the kubelet sends them on every stage and
+publish as the capability's `mount_flags`. A driver that drops them mounts
+the volume with options nobody asked for.
+
+This stage: honour `mount_flags`, and a pod with a claim of your
+StorageClass runs, writes, and leaves nothing behind when it and its claim
+are deleted.
 
 ## Hints
 
@@ -38,6 +44,14 @@ nothing behind when it and its claim are deleted.
 When a pod is stuck in `ContainerCreating`, `kubectl describe pod` shows the
 kubelet's mount errors, and the provisioner's log shows what `CreateVolume`
 was sent and answered.
+</details>
+
+<details><summary>Approach</summary>
+
+`syscall.Mount` takes flags as bits and options as a string, and a name like
+`noexec` has to be translated into one or the other. `mount -o
+remount,bind,noexec,ro DST` does that parsing for you, so a bind mount can
+take the CO's flags and `readonly` in one remount.
 </details>
 
 ## Further reading
