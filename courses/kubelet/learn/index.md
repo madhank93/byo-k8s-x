@@ -1,6 +1,6 @@
 ---
 title: Build your own kubelet — primer
-concepts: [kubelet, Node, node lease, CRI, pod lifecycle]
+concepts: [kubelet, Node, node lease, containerd, pod lifecycle]
 ---
 
 ## What a kubelet actually does
@@ -11,11 +11,13 @@ where the control plane stops. On every node a **kubelet** picks up from
 there: it tells the cluster the machine exists, watches for the pods bound to
 it, asks the container runtime to run them, and writes back what happened.
 
-So a kubelet faces two ways. Upward it is an API client like any controller —
+So a kubelet faces two ways. Upward it is an API client like any controller:
 it owns a Node object, a Lease, and the status of every pod on its node.
-Downward it drives the container runtime over CRI, the gRPC interface
-containerd and CRI-O both serve. This course builds both halves, in that
-order: first the node's place in the cluster, then the pods.
+Downward it drives the container runtime. A real kubelet speaks CRI, the gRPC
+interface that containerd and CRI-O both serve. This course drives containerd
+through its own Go client instead, for a reason explained below. It builds
+both halves, in that order: first the node's place in the cluster, then the
+pods.
 
 ## Where your program runs
 
@@ -25,10 +27,17 @@ it. Each stage starts yours as the kubelet for a Node of its own, with a name
 the stage picks:
 
 ```
-app --kubeconfig PATH --hostname-override NAME --register-with-taints KEY=VALUE:EFFECT
+app --kubeconfig PATH --hostname-override NAME --register-with-taints KEY=VALUE:EFFECT \
+    --root-dir DIR --containerd-namespace NS --pod-manifest-path DIR --port N
 ```
 
-The flags are the real kubelet's. The kubeconfig reaches the API server over
+The command line is the same in every stage, so accept all the flags from the
+start, even the ones you do not use yet. Most are the real kubelet's.
+`--containerd-namespace` is this course's own. The worker's real kubelet
+kills every CRI sandbox it did not create itself, so your pods live in a
+containerd namespace of their own (never `k8s.io`), where it never looks.
+Pods keep their logs and volumes under `--root-dir`. `--port` is where you
+serve the kubelet API, since the real kubelet already holds 10250. The kubeconfig reaches the API server over
 the kind network. The taint keeps the scheduler from sending other pods to a
 node that only lives for one stage; the stage deletes the Node when it ends.
 
@@ -38,10 +47,19 @@ nothing will ever run.
 
 ## The shape of the course
 
-One long-running program. Stages 1–3 make the Node real: registered,
-reporting the machine, and alive through its lease. The pod half comes after
-— watch the pods bound to you, run them through CRI, and report their status
-back.
+One long-running program that shuts down cleanly on SIGTERM and leaves its
+pods running when it does. Stages 1–3 make the Node real: registered,
+reporting the machine, and alive through its lease. Stages 4–8 run pods: watch
+the ones bound to you, start their containers in containerd, report status,
+stop them gracefully, restart what exits, and run init containers first.
+Stages 9–13 give containers what the spec promises: environment, volumes,
+ConfigMaps and Secrets as files, a service account token, and resource
+limits. Stages 14–20 are the kubelet's own judgement: probes, lifecycle
+hooks, static pods, recovering after a restart, eviction, and serving
+`kubectl logs`.
+
+Every pod in this course is `hostNetwork: true`. Giving pods networks of
+their own is the cni course's job.
 
 ## Two things worth knowing before you start
 
