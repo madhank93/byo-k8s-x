@@ -1212,9 +1212,13 @@ func stageIdempotency(ctx context.Context, env *kube.Env, bin string) error {
 	if err != nil {
 		return err
 	}
+	// An ext4 volume, so each stage runs blkid, mkfs and mount: long enough
+	// for unserialised calls to overlap.
+	race := createReq("pvc-race", 64*mi)
+	race.VolumeCapabilities = []*csipb.VolumeCapability{mountCap("ext4")}
 	ids := make(chan string, n)
 	errs := concurrently(n, func() error {
-		v, err := w.create(createReq("pvc-race", mi))
+		v, err := w.create(race)
 		if err == nil {
 			ids <- v.VolumeId
 		}
@@ -1246,7 +1250,7 @@ func stageIdempotency(ctx context.Context, env *kube.Env, bin string) error {
 	errs = concurrently(n, func() error {
 		c, cancel := w.call()
 		defer cancel()
-		_, err := w.nd.NodeStageVolume(c, &csipb.NodeStageVolumeRequest{VolumeId: id, StagingTargetPath: staging, VolumeCapability: mountCap("")})
+		_, err := w.nd.NodeStageVolume(c, &csipb.NodeStageVolumeRequest{VolumeId: id, StagingTargetPath: staging, VolumeCapability: mountCap("ext4")})
 		return err
 	})
 	if err := allOK(errs, "NodeStageVolume sent 8 times at once"); err != nil {
@@ -1262,7 +1266,7 @@ func stageIdempotency(ctx context.Context, env *kube.Env, bin string) error {
 	errs = concurrently(n, func() error {
 		c, cancel := w.call()
 		defer cancel()
-		_, err := w.nd.NodePublishVolume(c, &csipb.NodePublishVolumeRequest{VolumeId: id, StagingTargetPath: staging, TargetPath: target, VolumeCapability: mountCap("")})
+		_, err := w.nd.NodePublishVolume(c, &csipb.NodePublishVolumeRequest{VolumeId: id, StagingTargetPath: staging, TargetPath: target, VolumeCapability: mountCap("ext4")})
 		return err
 	})
 	if err := allOK(errs, "NodePublishVolume sent 8 times at once"); err != nil {
